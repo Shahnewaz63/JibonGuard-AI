@@ -1,8 +1,6 @@
-__pycache__/
 node_modules/
 dist/
 .env
-*.py[cod]
 jibonguard.sqlite3
 jibonguard.sqlite3-shm
 jibonguard.sqlite3-wal
