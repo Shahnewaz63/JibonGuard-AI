@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="refresh" content="0;url=http://127.0.0.1:8000/dashboard.html">
+  <title>Opening JibonGuard AI</title>
+</head>
+<body>
+  <p>Opening the Node.js and React dashboard. If it does not open, run <code>npm start</code> in the JibonGuard AI folder.</p>
+  <p><a id="app-link" href="http://127.0.0.1:8000/dashboard.html">Open the React dashboard</a></p>
+  <script>
+    const destination = new URL('http://127.0.0.1:8000/dashboard.html');
+    destination.search = location.search;
+    destination.hash = location.hash;
+    location.replace(destination.href);
+  </script>
+</body>
+</html>
