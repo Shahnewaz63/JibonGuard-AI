@@ -267,3 +267,9 @@ html[data-theme=dark] .hero-art{background:radial-gradient(ellipse at 52% 48%,#2
 @media (max-width: 760px) {
   .site-form-page .site-map iframe { height: 48vh; min-height: 300px; }
 }
+
+.icon-text { display: inline-flex; align-items: center; gap: 5px; }
+.site-pin svg, .break-icon svg { display: block; width: 16px; height: 16px; }
+.editor-close svg { display: block; width: 18px; height: 18px; }
+.automation-page { display: grid; gap: 12px; }
+.automation-page .form-two { align-items: start; }
