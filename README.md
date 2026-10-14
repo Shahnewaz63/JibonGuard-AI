@@ -39,6 +39,7 @@ npm start
 - Gemini dashboard chat and weather-informed break scheduling when `GEMINI_API_KEY` is configured.
 - Per-site AI alert automation with deterministic safety floors, consent-aware SMS/optional voice dispatch, auditable decisions, and a dry-run simulator.
 - React light/dark theme control and responsive organization dashboard.
+- Additive feature-suite foundation: versioned database migration, organization feature switches, shared Gemini-call metadata auditing, system-health and manual official-advisory views, and tested pure modules for triage rules, nowcast fallback, CAP parsing, and deterministic report facts.
 
 ## Configuration
 
@@ -59,6 +60,12 @@ Organizations can enable automation from **AI automation** in the dashboard. The
 Configure the master switch and defaults with `ALERT_AUTOMATION_ENABLED`, `ALERT_HEAT_TRIGGER_C`, `ALERT_RAIN_LEAD_MINUTES`, `ALERT_RAIN_PROBABILITY`, `ALERT_COOLDOWN_MINUTES`, `ALERT_DAILY_CAP`, `ALERT_QUIET_START`, `ALERT_QUIET_END`, `ALERT_AUTOMATION_INTERVAL_MS`, and the `AI_ALERTS_*` variables in `.env`. Organization-level overrides are saved by the dashboard. Voice dispatch is adapter-based; configure an HTTPS `VOICE_GATEWAY_URL` and `VOICE_GATEWAY_API_KEY` to use a voice provider. Without it, voice-only messages fall back to SMS.
 
 The automation settings page includes a simulator for temperature, rain ETA, and time-of-day scenarios. It does not enqueue or send. Run the rule and guardrail tests with `npm test`. Where this project has no WBGT measurement, apparent temperature is used as a labeled proxy; official heatwave feeds and worker acknowledgement tracking are not currently connected. All Bangla automation templates are marked for native-speaker review. Alert records support safety follow-up and must not be used to rank or punish workers for taking breaks.
+
+### Feature-suite implementation status
+
+The feature-suite work is in progress. The current branch adds an idempotent additive migration, safe-off environment switches, organization settings, manual advisory entry/listing, an authenticated system-health view, reusable AI/job helpers, and unit tests for core rules. It does **not** yet provide an operational nowcast training/evaluation pipeline, automatic prediction loop or evidence dashboard; the constrained break-plan optimizer and approval/SMS lifecycle; inbound triage, health-consent and check-in workflow; scheduled daily/weekly report generation; or automatic CAP polling and advisory alert dispatch. Do not enable these switches for production until those workflows, validation, and human reviews are complete. No nowcast evaluation score is claimed.
+
+Use `docs/AUDIT.md` for the source audit, `docs/DECISIONS.md` for implementation choices, `docs/OFFICIAL_FEEDS.md` for source findings, and `docs/TRIAGE_SAFETY.md` for first-aid review notes. `.env.example` lists the proposed feature switches; blank/false defaults keep optional AI and incomplete scheduled workflows off.
 
 ## Production deployment
 

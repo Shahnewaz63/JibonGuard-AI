@@ -83,6 +83,7 @@ test('AI cannot skip an existing floor alert, and the prompt omits names and pho
   const configWithAi={...config,aiEnabled:true,apiKey:'test-key',model:'test-model',retryCount:0,timeoutMs:1000};
   await callAlertAi([protectedContext],configWithAi,async(_url,options)=>{sentPrompt=options.body;return {ok:true,json:async()=>({candidates:[{content:{parts:[{text:'{"decisions":[]}'}]}}]})};});
   assert.doesNotMatch(sentPrompt,/Private Name|\+8801700000000/);
+  assert.doesNotMatch(sentPrompt,/worker_1/);
 });
 
 test('identical team SMS is grouped; an unavailable voice-only channel falls back to SMS',async()=>{

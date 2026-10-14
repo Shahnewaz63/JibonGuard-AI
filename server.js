@@ -9,6 +9,9 @@ import { loadAlertConfig } from './server/alerts/config.js';
 import { decideAlerts } from './server/alerts/index.js';
 import { renderAlertTemplate } from './server/alerts/templates.js';
 import { dispatchAlertGroups } from './server/alerts/gateway.js';
+import { runMigrations } from './server/db/migrations.js';
+import { createJobRunner } from './server/jobs/runner.js';
+import { advisoryMatchesSite, officialHeatFloor } from './server/advisories/cap.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 for (const line of (existsSync(path.join(__dirname, '.env')) ? readFileSync(path.join(__dirname, '.env'), 'utf8') : '').split(/\r?\n/)) {
@@ -73,6 +76,8 @@ for (const [table, column, declaration] of [
   const columns = db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name);
   if (!columns.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`);
 }
+runMigrations(db, { databasePath: DB_PATH, development: !IS_PRODUCTION });
+const jobRunner = createJobRunner({ db });
 db.prepare("UPDATE sms_messages SET emergency_status='historic' WHERE direction='received' AND emergency_status=''").run();
 for (const row of db.prepare("SELECT DISTINCT organization_id,site FROM workers WHERE trim(site)<>'' AND site_id IS NULL").all()) {
   let site = db.prepare('SELECT id FROM sites WHERE organization_id=? AND name=? COLLATE NOCASE').get(row.organization_id, row.site);
@@ -172,12 +177,62 @@ app.get('/api/auth/csrf', (req, res) => {
   res.set('Cache-Control', 'no-store').json({ csrf_token: csrf.value });
 });
 app.get('/api/health', (_req, res) => res.set('Cache-Control', 'no-store').json({ ok: true, service: 'jibonguard-api' }));
+const FEATURE_MASTERS = Object.freeze({ nowcast: process.env.NOWCAST_ENABLED === 'true', breakPlanner: process.env.SMART_BREAK_SCHEDULER_ENABLED === 'true', triage: process.env.TRIAGE_ENABLED === 'true', aiTriage: process.env.AI_TRIAGE_ENABLED === 'true', reports: process.env.AI_SAFETY_REPORTS_ENABLED === 'true', officialAdvisories: process.env.OFFICIAL_ADVISORIES_ENABLED !== 'false' });
+const featureDefaults = Object.freeze({ nowcast: false, breakPlanner: false, triage: false, aiTriage: false, reports: false, officialAdvisories: false });
+function orgFeatures(organizationId) {
+  let saved = {};
+  try { saved = JSON.parse(db.prepare('SELECT settings_json FROM org_ai_features WHERE organization_id=?').get(organizationId)?.settings_json || '{}'); } catch { /* fail closed to defaults */ }
+  return Object.fromEntries(Object.entries(featureDefaults).map(([key, fallback]) => [key, FEATURE_MASTERS[key] && saved[key] === true || FEATURE_MASTERS[key] && saved[key] === undefined && fallback]));
+}
+app.get('/api/features', requireUser, (req, res) => res.set('Cache-Control', 'no-store').json({ features: orgFeatures(req.user.organization_id), masters: FEATURE_MASTERS }));
+app.put('/api/features', csrfAndOrigin, requireUser, (req, res) => {
+  const input = req.body?.features;
+  const allowed = Object.keys(featureDefaults);
+  if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !allowed.includes(key)) || Object.values(input).some(value => typeof value !== 'boolean')) return sendError(res, 400, 'Choose valid organization feature settings.');
+  if (!rateAllowed(req, 'feature-settings', 10, 3600)) return sendError(res, 429, 'Settings are being changed too quickly.');
+  const previous = orgFeatures(req.user.organization_id);
+  const requested = Object.fromEntries(allowed.map(key => [key, Object.hasOwn(input, key) ? input[key] : previous[key]]));
+  const effective = Object.fromEntries(allowed.map(key => [key, FEATURE_MASTERS[key] && requested[key]]));
+  db.prepare('INSERT INTO org_ai_features(organization_id,settings_json,updated_at) VALUES(?,?,?) ON CONFLICT(organization_id) DO UPDATE SET settings_json=excluded.settings_json,updated_at=excluded.updated_at').run(req.user.organization_id, JSON.stringify(requested), now());
+  res.json({ features: effective, masters: FEATURE_MASTERS });
+});
+app.get('/api/system/health', requireUser, (req, res) => {
+  const org = req.user.organization_id;
+  const jobs = db.prepare('SELECT job_key,status,started_at,finished_at,error_code FROM job_runs WHERE organization_id=? OR organization_id IS NULL ORDER BY started_at DESC LIMIT 30').all(org);
+  const feed = db.prepare('SELECT feed_key,last_success_at,last_error,items_fetched,updated_at FROM official_feed_status ORDER BY feed_key').all();
+  const aiCalls = db.prepare('SELECT feature,prompt_version,ok,fallback,latency_ms,created_at FROM ai_calls WHERE organization_id=? ORDER BY created_at DESC LIMIT 20').all(org);
+  res.set('Cache-Control', 'no-store').json({ features: orgFeatures(org), jobs, feeds: feed, ai_calls: aiCalls });
+});
+app.get('/api/advisories', requireUser, (req, res) => {
+  const org = req.user.organization_id, stamp = now();
+  const advisories = db.prepare('SELECT id,source,external_id,hazard,severity,areas_json,issued_at,valid_from,valid_to,headline,body,source_url,created_at FROM official_advisories WHERE organization_id=? ORDER BY valid_from DESC LIMIT 200').all(org).map(row => ({ ...row, areas: JSON.parse(row.areas_json), active: row.valid_from <= stamp && row.valid_to > stamp }));
+  const sites = db.prepare('SELECT id,name,address,division,district FROM sites WHERE organization_id=?').all(org);
+  const matches = advisories.filter(item => item.active).flatMap(advisory => sites.filter(site => advisoryMatchesSite(advisory, site)).map(site => ({ advisory_id: advisory.id, site_id: site.id, site: site.name, heat_floor: advisory.hazard.includes('heat') ? officialHeatFloor(advisory.severity) : null })));
+  res.set('Cache-Control', 'no-store').json({ advisories, matches });
+});
+app.post('/api/advisories', csrfAndOrigin, requireUser, (req, res) => {
+  const org = req.user.organization_id, d = req.body || {};
+  if (!FEATURE_MASTERS.officialAdvisories) return sendError(res, 503, 'Official advisory entry is disabled by the server master switch.');
+  if (!orgFeatures(org).officialAdvisories) return sendError(res, 403, 'Enable official advisories in the organization feature settings first.');
+  if (!rateAllowed(req, 'advisory-entry', 20, 3600)) return sendError(res, 429, 'Official advisory entry is being used too quickly.');
+  const source = String(d.source || '').trim().slice(0, 100), sourceUrl = String(d.source_url || '').trim().slice(0, 1000), hazard = String(d.hazard || '').trim().toLowerCase(), severity = String(d.severity || '').trim().toLowerCase();
+  const areas = Array.isArray(d.areas) ? [...new Set(d.areas.map(item => String(item).trim()).filter(Boolean))].slice(0, 30) : [];
+  const issuedAt = Date.parse(d.issued_at), validFrom = Date.parse(d.valid_from), validTo = Date.parse(d.valid_to), headline = String(d.headline || '').trim().slice(0, 240), body = String(d.body || '').trim().slice(0, 4000);
+  if (!source || !/^https:\/\//i.test(sourceUrl) || !['heatwave', 'rain', 'lightning', 'cyclone', 'other'].includes(hazard) || !['mild', 'moderate', 'severe', 'very_severe'].includes(severity) || !areas.length || !Number.isFinite(issuedAt) || !Number.isFinite(validFrom) || !Number.isFinite(validTo) || validTo <= validFrom || validTo < now() * 1000 || !headline) return sendError(res, 400, 'Provide a source URL, hazard, severity, affected areas, headline, and valid time range.');
+  const externalId = String(d.external_id || '').trim().slice(0, 200) || null, id = token(12), raw = JSON.stringify({ manual: true }), contentHash = createHash('sha256').update(JSON.stringify({ source, hazard, severity, areas, issuedAt, validFrom, validTo, headline, body })).digest('hex');
+  const duplicate = db.prepare('SELECT id FROM official_advisories WHERE organization_id=? AND content_hash=?').get(org, contentHash);
+  if (duplicate) return res.status(200).json({ id: duplicate.id, duplicate: true });
+  try {
+    db.prepare('INSERT INTO official_advisories(id,organization_id,source,external_id,content_hash,hazard,severity,areas_json,issued_at,valid_from,valid_to,headline,body,source_url,raw_json,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id, org, source, externalId, contentHash, hazard, severity, JSON.stringify(areas), Math.floor(issuedAt / 1000), Math.floor(validFrom / 1000), Math.floor(validTo / 1000), headline, body, sourceUrl, raw, now(), req.user.id);
+  } catch (error) { if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return sendError(res, 409, 'An advisory with this source ID already exists.'); throw error; }
+  res.status(201).json({ id, duplicate: false });
+});
 app.get('/api/auth/me', requireUser, (req, res) => res.set('Cache-Control', 'no-store').json({ authenticated: true, user: req.user }));
 app.get('/api/workers', requireUser, (req, res) => {
   const workers = db.prepare(`SELECT w.*,COALESCE((SELECT action FROM worker_consent_events e WHERE e.worker_id=w.id ORDER BY e.changed_at DESC,e.rowid DESC LIMIT 1),'pending') AS consent_status FROM workers w WHERE organization_id=? ORDER BY name COLLATE NOCASE`).all(req.user.organization_id);
   res.json({ workers });
 });
-app.get('/api/sites', requireUser, (req, res) => res.json({ sites: db.prepare('SELECT id,name,address,latitude,longitude,shade_available,water_available,rest_area,created_at,updated_at FROM sites WHERE organization_id=? ORDER BY name COLLATE NOCASE').all(req.user.organization_id) }));
+app.get('/api/sites', requireUser, (req, res) => res.json({ sites: db.prepare('SELECT id,name,address,latitude,longitude,division,district,emergency_contact_phone,shade_available,water_available,rest_area,created_at,updated_at FROM sites WHERE organization_id=? ORDER BY name COLLATE NOCASE').all(req.user.organization_id) }));
 app.get('/api/breaks', requireUser, (req, res) => {
   const date = String(req.query.date || '');
   if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) return sendError(res, 400, 'Enter a valid date.');
@@ -192,7 +247,7 @@ function sanitizeAlertSettings(input,base=defaultAlertSettings()){
   const clock=value=>/^([01]\d|2[0-3]):[0-5]\d$/.test(String(value||''))?String(value):null;
   return {enabled:input.enabled===true,aiEnabled:input.aiEnabled===true,baseHeatTriggerC:n(input.baseHeatTriggerC,base.baseHeatTriggerC,28,42),workloadOffsets:offsets,rainLeadMinutes:n(input.rainLeadMinutes,base.rainLeadMinutes,15,360),rainProbability:n(input.rainProbability,base.rainProbability,1,100),cooldownMinutes:n(input.cooldownMinutes,base.cooldownMinutes,1,1440),dailyCap:n(input.dailyCap,base.dailyCap,1,100),quietHours:{start:clock(input.quietHours?.start)||base.quietHours.start,end:clock(input.quietHours?.end)||base.quietHours.end}};
 }
-function runtimeAlertConfig(settings){return {...ALERT_CONFIG,...settings,enabled:ALERT_CONFIG.enabled&&settings.enabled,aiEnabled:ALERT_CONFIG.aiEnabled&&settings.aiEnabled,apiKey:GEMINI_API_KEY,model:ALERT_CONFIG.model};}
+function runtimeAlertConfig(settings){return {...ALERT_CONFIG,...settings,enabled:ALERT_CONFIG.enabled&&settings.enabled,aiEnabled:ALERT_CONFIG.aiEnabled&&settings.aiEnabled,apiKey:GEMINI_API_KEY,model:ALERT_CONFIG.model,db,organizationId:null};}
 app.get('/api/alerts/settings',requireUser,(req,res)=>res.set('Cache-Control','no-store').json({settings:alertSettingsFor(req.user.organization_id),aiAvailable:Boolean(ALERT_CONFIG.aiEnabled&&GEMINI_API_KEY),automationAvailable:ALERT_CONFIG.enabled}));
 app.put('/api/alerts/settings',csrfAndOrigin,requireUser,(req,res)=>{
   const current=alertSettingsFor(req.user.organization_id),settings=sanitizeAlertSettings(req.body,current),org=req.user.organization_id;
@@ -211,6 +266,7 @@ app.post('/api/alerts/simulate',csrfAndOrigin,requireUser,async(req,res)=>{
   const site=db.prepare('SELECT * FROM sites WHERE id=? AND organization_id=?').get(siteId,req.user.organization_id);if(!site)return sendError(res,404,'Worksite not found.');if(site.latitude==null||site.longitude==null)return sendError(res,422,'Add coordinates to this worksite before simulating weather alerts.');
   const config=runtimeAlertConfig(alertSettingsFor(req.user.organization_id)),contexts=await buildAlertContexts(site,req.user.organization_id,config,{simulation:{temperatureC,rainEtaMinutes:rainEtaRaw===''?null:Number(rainEtaRaw),timeOfDay}});
   const aiClient=async(items,cfg)=>{if(!cfg.aiEnabled||!rateAllowed(req,'alert-simulation',4,3600))return {decisions:[],status:'disabled'};const {callAlertAi}=await import('./server/alerts/ai.js');return callAlertAi(items,cfg);};
+  config.organizationId=req.user.organization_id;
   const result=await decideAlerts(contexts,{config,aiClient,getHistory:workerId=>{const count=db.prepare("SELECT COUNT(*) AS n FROM automated_alerts WHERE organization_id=? AND worker_id=? AND created_at>=? AND status IN ('sent','queued','scheduled')").get(req.user.organization_id,workerId,now()-86400).n;return {sentToday:count,lastByType:{}};}});
   const names=new Map(db.prepare('SELECT id,name FROM workers WHERE organization_id=? AND site_id=?').all(req.user.organization_id,siteId).map(worker=>[worker.id,worker.name]));
   res.json({aiStatus:result.aiStatus,weatherDelayed:contexts.some(item=>item.weather.weatherDelayed),decisions:result.decisions.map(item=>({workerId:item.workerId,workerName:names.get(item.workerId)||'Worker',action:item.final_status,alertType:item.alert_type,channel:item.channel,sendAt:item.send_at||null,reason:item.reason,message:item.message,floor:item.floor}))});
@@ -397,7 +453,9 @@ function workerValues(data, organizationId) {
 function siteValues(data) {
   const name = String(data.name || '').trim(), address = String(data.address || '').trim(), latitudeRaw = String(data.latitude ?? '').trim(), longitudeRaw = String(data.longitude ?? '').trim(), latitude = Number(latitudeRaw), longitude = Number(longitudeRaw);
   if (!name || name.length > 120 || address.length > 240 || !latitudeRaw || !longitudeRaw || !Number.isFinite(latitude) || !Number.isFinite(longitude) || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null;
-  return { name, address, latitude, longitude, shadeAvailable: data.shade_available === 'on' || data.shade_available === true || data.shade_available === 1, waterAvailable: data.water_available === 'on' || data.water_available === true || data.water_available === 1, restArea: data.rest_area === 'on' || data.rest_area === true || data.rest_area === 1 };
+  const division = String(data.division || '').trim().slice(0, 80), district = String(data.district || '').trim().slice(0, 80), emergencyContactPhone = normalizePhone(data.emergency_contact_phone || '');
+  if (data.emergency_contact_phone && !emergencyContactPhone) return null;
+  return { name, address, latitude, longitude, division, district, emergencyContactPhone, shadeAvailable: data.shade_available === 'on' || data.shade_available === true || data.shade_available === 1, waterAvailable: data.water_available === 'on' || data.water_available === true || data.water_available === 1, restArea: data.rest_area === 'on' || data.rest_area === true || data.rest_area === 1 };
 }
 function addWorker(data, org, stamp = now()) {
   const values = workerValues(data, org);
@@ -460,19 +518,19 @@ app.post('/api/sites', csrfAndOrigin, requireUser, (req, res) => {
   if (!values) return sendError(res, 400, 'Enter a site name, address (optional), and valid latitude/longitude for weather.');
   const id = token(12), stamp = now();
   try {
-    db.prepare('INSERT INTO sites(id,organization_id,name,address,latitude,longitude,shade_available,water_available,rest_area,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(id, req.user.organization_id, values.name, values.address, values.latitude, values.longitude,values.shadeAvailable?1:0,values.waterAvailable?1:0,values.restArea?1:0, stamp, stamp);
-    res.status(201).json({ site: db.prepare('SELECT id,name,address,latitude,longitude,shade_available,water_available,rest_area,created_at,updated_at FROM sites WHERE id=?').get(id) });
+    db.prepare('INSERT INTO sites(id,organization_id,name,address,latitude,longitude,division,district,emergency_contact_phone,shade_available,water_available,rest_area,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id, req.user.organization_id, values.name, values.address, values.latitude, values.longitude,values.division,values.district,values.emergencyContactPhone,values.shadeAvailable?1:0,values.waterAvailable?1:0,values.restArea?1:0, stamp, stamp);
+    res.status(201).json({ site: db.prepare('SELECT id,name,address,latitude,longitude,division,district,emergency_contact_phone,shade_available,water_available,rest_area,created_at,updated_at FROM sites WHERE id=?').get(id) });
   } catch (error) { sendError(res, error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 409 : 400, 'A site with this name already exists in your organization.'); }
 });
 app.put('/api/sites', csrfAndOrigin, requireUser, (req, res) => {
   const id = String(req.query.id || ''), values = siteValues(req.body);
   if (!values) return sendError(res, 400, 'Enter a site name, address (optional), and valid latitude/longitude for weather.');
   try {
-    const result = db.prepare('UPDATE sites SET name=?,address=?,latitude=?,longitude=?,shade_available=?,water_available=?,rest_area=?,updated_at=? WHERE id=? AND organization_id=?').run(values.name, values.address, values.latitude, values.longitude,values.shadeAvailable?1:0,values.waterAvailable?1:0,values.restArea?1:0, now(), id, req.user.organization_id);
+    const result = db.prepare('UPDATE sites SET name=?,address=?,latitude=?,longitude=?,division=?,district=?,emergency_contact_phone=?,shade_available=?,water_available=?,rest_area=?,updated_at=? WHERE id=? AND organization_id=?').run(values.name, values.address, values.latitude, values.longitude,values.division,values.district,values.emergencyContactPhone,values.shadeAvailable?1:0,values.waterAvailable?1:0,values.restArea?1:0, now(), id, req.user.organization_id);
     if (!result.changes) return sendError(res, 404, 'Site not found.');
     db.prepare('UPDATE workers SET site=? WHERE site_id=? AND organization_id=?').run(values.name, id, req.user.organization_id);
     WEATHER_CACHE.delete(id);
-    res.json({ site: db.prepare('SELECT id,name,address,latitude,longitude,shade_available,water_available,rest_area,created_at,updated_at FROM sites WHERE id=?').get(id) });
+    res.json({ site: db.prepare('SELECT id,name,address,latitude,longitude,division,district,emergency_contact_phone,shade_available,water_available,rest_area,created_at,updated_at FROM sites WHERE id=?').get(id) });
   } catch (error) { sendError(res, error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 409 : 400, 'A site with this name already exists in your organization.'); }
 });
 app.delete('/api/sites', csrfAndOrigin, requireUser, (req, res) => {
@@ -662,10 +720,10 @@ async function dispatchAlertQueue(){
   return groups.length;
 }
 let alertSchedulerRunning=false;
-async function runAlertAutomation(){
+async function runAlertAutomationTick(){
   if(alertSchedulerRunning)return;alertSchedulerRunning=true;
   try{for(const organization of db.prepare('SELECT id FROM organizations').all()){
-    const settings=alertSettingsFor(organization.id),config=runtimeAlertConfig(settings);if(!config.enabled)continue;
+    const settings=alertSettingsFor(organization.id),config=runtimeAlertConfig(settings);config.organizationId=organization.id;if(!config.enabled)continue;
     const sites=db.prepare('SELECT * FROM sites WHERE organization_id=? AND latitude IS NOT NULL AND longitude IS NOT NULL ORDER BY id').all(organization.id);
     for(const site of sites)try{
       const contexts=await buildAlertContexts(site,organization.id,config);if(!contexts.length)continue;
@@ -676,6 +734,8 @@ async function runAlertAutomation(){
     }catch(error){console.error(`Alert automation failed for site ${site.id}: ${error.message}`);}
   }await dispatchAlertQueue();}catch(error){console.error(`Alert automation cycle failed: ${error.message}`);}finally{alertSchedulerRunning=false;}
 }
+jobRunner.register('alert_automation', runAlertAutomationTick, { jitterMs: 20000 });
+async function runAlertAutomation(){ await jobRunner.execute('alert_automation'); }
 async function sendTextBeeMessages(entries,messageTemplate) {
   const apiKey=(process.env.TEXTBEE_API_KEY||process.env.TEXTBEE_DEV_API||'').trim();
   const base=(process.env.TEXTBEE_BASE_URL||'https://api.textbee.dev/api/v1').replace(/\/$/,'');

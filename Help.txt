@@ -1,0 +1,16 @@
+push commad 
+git add .
+git commit -m "(any comment )"
+git push
+
+
+pull command
+git pull origin main
+npm start
+
+
+
+problems:
+
+
+
