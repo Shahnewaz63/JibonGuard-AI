@@ -20,6 +20,7 @@ import { calculateSmsSegments } from './server/billing/smsSegments.js';
 import { rebuildUsageRollups } from './server/billing/rollups.js';
 import { checkFeatureAccess, checkResourceLimit, checkUsageDispatch } from './server/billing/entitlements.js';
 import { canTransitionSubscription } from './server/billing/subscriptionState.js';
+import { processBillingLifecycle } from './server/billing/lifecycle.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 for (const line of (existsSync(path.join(__dirname, '.env')) ? readFileSync(path.join(__dirname, '.env'), 'utf8') : '').split(/\r?\n/)) {
@@ -105,7 +106,9 @@ runMigrations(db, { databasePath: DB_PATH, development: !IS_PRODUCTION });
 const jobRunner = createJobRunner({ db });
 const metering = createMeteringService(db, { logger: console, defaultCurrency: 'BDT' });
 const USAGE_ROLLUP_INTERVAL_MS=Math.max(60000,Number(process.env.BILLING_ROLLUP_INTERVAL_MS||86400000));
+const BILLING_LIFECYCLE_INTERVAL_MS=Math.max(60000,Number(process.env.BILLING_LIFECYCLE_INTERVAL_MS||3600000));
 jobRunner.register('usage_rollups',()=>rebuildUsageRollups(db));
+jobRunner.register('billing_lifecycle',()=>runBillingLifecycle());
 db.prepare("UPDATE sms_messages SET emergency_status='historic' WHERE direction='received' AND emergency_status=''").run();
 for (const row of db.prepare("SELECT DISTINCT organization_id,site FROM workers WHERE trim(site)<>'' AND site_id IS NULL").all()) {
   let site = db.prepare('SELECT id FROM sites WHERE organization_id=? AND name=? COLLATE NOCASE').get(row.organization_id, row.site);
@@ -515,6 +518,11 @@ function createPlanInvoice({organizationId,subscriptionId,planName,amountMinor,c
   db.prepare("INSERT INTO invoices(id,organization_id,subscription_id,invoice_number,status,currency,subtotal_minor,tax_minor,total_minor,issued_at,due_at,billing_details_json,created_at) VALUES(?,?,?,?,'open',?,?,?,?,?,?,?,?)").run(id,organizationId,subscriptionId,number,currency,amountMinor,tax,total,stamp,stamp+7*86400,JSON.stringify(db.prepare('SELECT legal_name,address,tax_id FROM organization_billing_details WHERE organization_id=?').get(organizationId)||{}),stamp);
   db.prepare('INSERT INTO invoice_lines(id,invoice_id,description,line_type,quantity,unit_amount_minor,amount_minor,metadata_json) VALUES(?,?,?,?,?,?,?,?)').run(token(16),id,`${planName} subscription`, 'plan_fee',1,amountMinor,amountMinor,JSON.stringify({subscription_id:subscriptionId}));
   return id;
+}
+function runBillingLifecycle(stamp=now()){
+  const outcome=processBillingLifecycle(db,{now:stamp,gracePeriodDays:Number(billingSetting('grace_period_days',7)),idFactory:()=>token(16),createInvoice:input=>createPlanInvoice(input)});
+  for(const item of outcome.results)if(item.error)console.error(`Billing lifecycle failed for subscription ${item.subscription_id} (${item.error})`);
+  return outcome;
 }
 app.get('/api/billing',requireUser,(req,res)=>{
   const org=req.user.organization_id,subscription=db.prepare("SELECT s.*,p.name AS plan_name FROM subscriptions s JOIN plans p ON p.id=s.plan_id WHERE s.organization_id=? ORDER BY s.created_at DESC LIMIT 1").get(org);
@@ -1748,6 +1756,8 @@ app.listen(PORT, HOST, () => {
   const breakSmsPoll=setInterval(()=>void dispatchScheduledBreakSms(),15000);breakSmsPoll.unref();
   const rollupFirstRun=setTimeout(()=>void jobRunner.execute('usage_rollups'),8000);rollupFirstRun.unref();
   const rollupPoll=setInterval(()=>void jobRunner.execute('usage_rollups'),USAGE_ROLLUP_INTERVAL_MS);rollupPoll.unref();
+  const billingFirstRun=setTimeout(()=>void jobRunner.execute('billing_lifecycle'),12000);billingFirstRun.unref();
+  const billingPoll=setInterval(()=>void jobRunner.execute('billing_lifecycle'),BILLING_LIFECYCLE_INTERVAL_MS);billingPoll.unref();
 });
 
 

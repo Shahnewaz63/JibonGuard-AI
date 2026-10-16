@@ -44,8 +44,9 @@
 - Added active-plan public pricing data and `/pricing`; signup accepts an explicitly selected active plan. Paid signups receive an open plan invoice and begin in `past_due`; trial plans begin in `trialing`; nontrial zero-price plans begin active. Signups without a selected plan receive the configured default plan.
 - Added organization billing summary, usage meters, billing details, invoices, payment-reference submission, cancellation scheduling/reactivation, and print-to-PDF invoice view. Admin APIs now create subscriptions and invoices, review manual payments, change subscription state, and configure core billing settings with audit records.
 - Manual payment approval marks an invoice paid and activates the associated subscription. Invoice numbers increment inside the same transaction as invoice creation. Manual transaction references have a unique index. No online gateway is implemented.
-- Renewal, trial reminder, dunning, cancellation-at-period-end, refunds, coupons, and scheduled invoice jobs remain unimplemented. Billing settings currently have an API but no dedicated admin settings screen. Subscription upgrade/downgrade is also pending.
-- Phase 4 partial verification on Node v26.7.0: `npm test` passes 29/29; `npm run build` passes. No live database or payment provider was exercised.
+- Added a locked scheduled lifecycle task with fake-clock coverage. It issues one renewal invoice at period close, transitions paid plans to `past_due`, applies the configured grace period, suspends overdue accounts, renews zero-price plans, and honors period-end cancellation. Admin payment approval renews the paid period.
+- Trial-ending reminders, email notifications, overage computation, refunds, coupons, and upgrade/downgrade remain unimplemented. No live database or payment provider was exercised.
+- Phase 4 partial verification on Node v26.7.0: `npm test` passes 31/31; `npm run build` passes.
 
 ## 2026-10-17 — Phase 5 billing administration (partial)
 
@@ -65,7 +66,7 @@
 - Phase 1: foundation delivered; remaining items include admin account management UI/API, QR enrollment, admin password reset, stronger re-auth action wiring, and security review.
 - Phase 2: major existing SMS, AI, weather, geocoding, and email provider paths are wired; voice usage and provider delivery reconciliation remain open.
 - Phase 3: core feature gates and worker/site caps are wired. Preflight quota enforcement across every provider dispatch remains incomplete.
-- Phase 4: manual billing path is partial. Online gateway, scheduled billing lifecycle, refunds/coupons and the billing settings UI remain incomplete.
+- Phase 4: manual billing path and core renewal/dunning state changes are partial. Online gateway, trial reminders, email notifications, refunds/coupons and upgrade/downgrade remain incomplete.
 - Phase 8: core current-period sums are implemented. Multi-currency normalization and advanced analytics remain outstanding.
 - Later work remains: remaining admin modules, deletion workflows, smoke/seed tools, and complete operating docs.
 
