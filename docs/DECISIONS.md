@@ -46,6 +46,12 @@
 - Renewal, trial reminder, dunning, cancellation-at-period-end, refunds, coupons, and scheduled invoice jobs remain unimplemented. Billing settings currently have an API but no dedicated admin settings screen. Subscription upgrade/downgrade is also pending.
 - Phase 4 partial verification on Node v26.7.0: `npm test` passes 29/29; `npm run build` passes. No live database or payment provider was exercised.
 
+## 2026-10-17 — Phase 5 billing administration (partial)
+
+- Added admin navigation and read-only tables for subscriptions, invoices, and payments, with approve/reject controls for pending manual payments. Added a super-admin billing settings screen for currency, tax basis points, invoice prefix/sequence, grace period, safety exemption, and payment instructions.
+- Admin APIs remain the source of authority and audit all settings, invoice, payment, and subscription changes. The broader admin modules (global workers/sites/alerts/messages, full organization detail, coupon/rate/expense editing, health, notices, user management, and deletion tools) remain outstanding.
+- Phase 5 partial verification on Node v26.7.0: `npm test` passes 29/29; `npm run build` passes.
+
 ### Status
 
 - Phase 0: audit documented; the active SQLite file was not opened. A truly read-only live schema inventory is still required.

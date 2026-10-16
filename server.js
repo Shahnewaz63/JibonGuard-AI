@@ -584,7 +584,7 @@ app.patch('/api/admin/subscriptions/:id/status',adminCsrfAndOrigin,requireAdmin,
   const target=String(req.body.status||''),reason=String(req.body.reason||'').trim().slice(0,500);if(!reason)return sendError(res,422,'Include a reason for the subscription status change.');
   if(!canTransitionSubscription(current.status,target))return sendError(res,409,`Subscription cannot transition from ${current.status} to ${target}.`);
   const stamp=now();db.exec('BEGIN IMMEDIATE');try{
-    db.prepare('UPDATE subscriptions SET status=?,updated_at=?,grace_end=? WHERE id=?').run(target,stamp,target==='past_due'?stamp+7*86400:null,current.id);
+    db.prepare('UPDATE subscriptions SET status=?,updated_at=?,grace_end=? WHERE id=?').run(target,stamp,target==='past_due'?stamp+Number(billingSetting('grace_period_days',7))*86400:null,current.id);
     db.prepare('INSERT INTO subscription_events(id,subscription_id,organization_id,event_type,from_status,to_status,reason,created_at) VALUES(?,?,?,?,?,?,?,?)').run(token(16),current.id,current.organization_id,'status_changed',current.status,target,reason,stamp);
     writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'subscription.status_changed',targetType:'subscription',targetId:current.id,ip:req.ip||'',userAgent:req.get('user-agent')||'',before:{status:current.status},after:{status:target},reason,now:stamp});db.exec('COMMIT');
   }catch(error){db.exec('ROLLBACK');throw error;}
