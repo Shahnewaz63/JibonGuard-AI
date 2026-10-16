@@ -204,7 +204,7 @@ const adminSessionUser = req => {
   if (!opaque) return null;
   const stamp = now();
   db.prepare('DELETE FROM admin_sessions WHERE expires_at<?').run(stamp);
-  return db.prepare(`SELECT a.id,a.email,a.role,a.totp_enabled,s.expires_at,s.reauth_at
+  return db.prepare(`SELECT a.id,a.email,a.role,a.totp_enabled,a.totp_required,s.expires_at,s.reauth_at
     FROM admin_sessions s JOIN admin_users a ON a.id=s.admin_id
     WHERE s.token_hash=? AND s.expires_at>=? AND a.disabled_at IS NULL`).get(hashToken(opaque), stamp) || null;
 };
@@ -230,7 +230,7 @@ const loadAdmin = (req,res,next,{allowPendingTotp=false}={}) => {
   if(!adminIpAllowed(req))return sendError(res,403,'Admin access is not allowed from this network.');
   req.admin=adminSessionUser(req);
   if(!req.admin)return sendError(res,401,'Admin sign-in is required.');
-  if(!req.admin.totp_enabled&&!allowPendingTotp)return res.status(403).json({error:'Complete admin two-factor setup to continue.',requiresTotpSetup:true});
+  if(req.admin.totp_required&&!req.admin.totp_enabled&&!allowPendingTotp)return res.status(403).json({error:'Complete admin two-factor setup to continue.',requiresTotpSetup:true});
   next();
 };
 const requireAdmin=(req,res,next)=>loadAdmin(req,res,next);
@@ -272,6 +272,25 @@ app.get('/api/admin/auth/csrf',(req,res)=>{
   if(value!==existing)res.cookie(ADMIN_CSRF_COOKIE,value,cookieOptions(false,ADMIN_SESSION_LIFETIME));
   res.set('Cache-Control','no-store').json({csrf_token:value});
 });
+app.post('/api/admin/auth/signup',adminCsrfAndOrigin,async(req,res)=>{
+  if(!adminIpAllowed(req))return sendError(res,403,'Admin access is not allowed from this network.');
+  if(!rateAllowed(req,'admin-signup',5,3600))return sendError(res,429,'Too many admin sign-up attempts. Try again later.');
+  const configuredKey=String(process.env.ADMIN_SIGNUP_KEY||''),providedKey=typeof req.body.private_key==='string'?req.body.private_key:'';
+  if(configuredKey.length<32)return sendError(res,503,'Admin sign-up is disabled. Configure a private ADMIN_SIGNUP_KEY of at least 32 characters on the server.');
+  const expectedKey=createHash('sha256').update(configuredKey).digest(),actualKey=createHash('sha256').update(providedKey).digest();
+  if(!providedKey||!timingSafeEqual(expectedKey,actualKey))return sendError(res,401,'The private key was not accepted.');
+  const email=String(req.body.email||'').trim().toLowerCase(),password=req.body.password;
+  if(email.length>254||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||typeof password!=='string'||password.length<PASSWORD_MIN||password.length>128)return sendError(res,400,`Enter a valid email and a password between ${PASSWORD_MIN} and 128 characters.`);
+  if(db.prepare('SELECT 1 FROM admin_users WHERE email=? COLLATE NOCASE').get(email))return sendError(res,409,'An admin account already uses this email.');
+  const id=token(18),stamp=now(),{passwordHash,passwordSalt}=await hashPassword(password);
+  try{
+    db.exec('BEGIN IMMEDIATE');
+    db.prepare("INSERT INTO admin_users(id,email,password_hash,password_salt,role,totp_required,created_at,updated_at) VALUES(?,?,?,?,'super_admin',0,?,?)").run(id,email,passwordHash,passwordSalt,stamp,stamp);
+    writeAdminAudit(db,{adminId:id,role:'super_admin',action:'admin.signup_created',targetType:'admin_user',targetId:id,ip:req.ip||'',userAgent:req.get('user-agent')||'',after:{email},now:stamp});
+    db.exec('COMMIT');
+  }catch(error){try{db.exec('ROLLBACK');}catch{}if(error.code==='SQLITE_CONSTRAINT_UNIQUE')return sendError(res,409,'An admin account already uses this email.');throw error;}
+  res.status(201).set('Cache-Control','no-store').json({created:true,message:'Admin account created. Sign in with your email and password.'});
+});
 app.post('/api/admin/auth/login',adminCsrfAndOrigin,async(req,res)=>{
   if(!adminIpAllowed(req))return sendError(res,403,'Admin access is not allowed from this network.');
   if(!rateAllowed(req,'admin-login',8,900))return sendError(res,429,'Too many admin sign-in attempts. Try again later.');
@@ -293,17 +312,17 @@ app.post('/api/admin/auth/login',adminCsrfAndOrigin,async(req,res)=>{
   }
   db.prepare('INSERT INTO admin_login_attempts(id,email,ip,success,created_at) VALUES(?,?,?,?,?)').run(token(16),email,address,valid?1:0,stamp);
   if(!valid)return sendError(res,401,'Email, password, or two-factor code was not accepted.');
-  const opaque=token(32),lifetime=admin.totp_enabled?ADMIN_SESSION_LIFETIME:600;
+  const opaque=token(32),lifetime=admin.totp_enabled||!admin.totp_required?ADMIN_SESSION_LIFETIME:600;
   db.prepare('INSERT INTO admin_sessions(token_hash,admin_id,created_at,expires_at,ip,user_agent,reauth_at) VALUES(?,?,?,?,?,?,?)').run(hashToken(opaque),admin.id,stamp,stamp+lifetime,address,String(req.get('user-agent')||'').slice(0,300),null);
   writeAdminAudit(db,{adminId:admin.id,role:admin.role,action:'admin.login',targetType:'admin_user',targetId:admin.id,ip:address,userAgent:req.get('user-agent')||'',after:{success:true,recoveryCode:usedRecovery},now:stamp});
   res.cookie(ADMIN_SESSION_COOKIE,opaque,cookieOptions(true,lifetime));
-  res.set('Cache-Control','no-store').json({authenticated:true,requiresTotpSetup:!admin.totp_enabled,admin:{id:admin.id,email:admin.email,role:admin.role}});
+  res.set('Cache-Control','no-store').json({authenticated:true,requiresTotpSetup:Boolean(admin.totp_required&&!admin.totp_enabled),admin:{id:admin.id,email:admin.email,role:admin.role}});
 });
 app.get('/api/admin/auth/me',(req,res)=>{
   if(!adminIpAllowed(req))return sendError(res,403,'Admin access is not allowed from this network.');
   const admin=adminSessionUser(req);
   if(!admin)return sendError(res,401,'Admin sign-in is required.');
-  res.set('Cache-Control','no-store').json({authenticated:true,requiresTotpSetup:!admin.totp_enabled,admin:{id:admin.id,email:admin.email,role:admin.role}});
+  res.set('Cache-Control','no-store').json({authenticated:true,requiresTotpSetup:Boolean(admin.totp_required&&!admin.totp_enabled),admin:{id:admin.id,email:admin.email,role:admin.role}});
 });
 app.get('/api/admin/auth/totp/setup',requireAdminSetup,(req,res)=>{
   if(req.admin.totp_enabled)return sendError(res,409,'Two-factor authentication is already enabled.');

@@ -40,7 +40,7 @@ function ThemeButton() {
 }
 function Header({ dashboard = false, user, onLogout }) {
   if (dashboard) return <header className="dash-top"><button className="mobile-menu" aria-label="Open menu" onClick={() => document.body.classList.toggle('menu-open')}><Icon name="menu" size={19}/></button><a className="dash-top-brand" href="/dashboard.html"><img src={brandMark} alt=""/> JibonGuard <b>AI</b></a><div className="top-right"><ThemeButton /><a className="subtle-link" href="/account.html">Account</a><button className="subtle-link" onClick={onLogout}>Sign out</button><span className="top-avatar">{initials(user?.full_name)}</span></div></header>;
-  return <header className="site-top"><Brand /><nav><a href="/#how">How it works</a><a href="/#features">Features</a><a href="/pricing">Pricing</a></nav><div className="top-actions"><ThemeButton /><a className="quiet-link" href="/login.html">Log in</a><a className="button primary small" href="/signup.html">Create account <span>→</span></a></div></header>;
+  return <header className="site-top"><Brand /><nav><a href="/#how">How it works</a><a href="/#features">Features</a><a href="/pricing">Pricing</a></nav><div className="top-actions"><ThemeButton /><details className="site-account-menu"><summary className="site-account-trigger">Admin</summary><div className="site-account-popover"><strong>Account access</strong><a className="site-account-admin" href="/admin">Admin sign in</a><small>Admin accounts are provisioned securely by the platform owner.</small><hr /><a href="/login.html">Organization sign in</a><a href="/signup.html">Create organization account</a></div></details></div></header>;
 }
 
 function Home() {

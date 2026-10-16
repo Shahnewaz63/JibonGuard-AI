@@ -132,6 +132,11 @@ const migrations = [
     name: 'manual_payment_reference_idempotency',
     sql: `CREATE UNIQUE INDEX IF NOT EXISTS payments_manual_reference_unique_idx ON payments(transaction_ref) WHERE adapter='manual' AND transaction_ref<>'';`,
   },
+  {
+    version: 7,
+    name: 'admin_totp_requirement',
+    sql: `ALTER TABLE admin_users ADD COLUMN totp_required INTEGER NOT NULL DEFAULT 1;`,
+  },
 ];
 
 export function runMigrations(db, { databasePath, development = true, clock = () => Math.floor(Date.now() / 1000) } = {}) {

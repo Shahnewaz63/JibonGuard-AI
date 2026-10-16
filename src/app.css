@@ -556,3 +556,17 @@ html[data-theme=dark] .chat-user { background: #347b4b; color: #fff; }
 .invoice-totals { width: min(320px,100%); margin: 24px 0 0 auto; }
 .invoice-totals p { display: flex; justify-content: space-between; padding: 7px 0; border-bottom: 1px solid #edf0ed; }
 @media print { .invoice-page { min-height: auto; padding: 0; background: #fff; } .invoice-actions { display:none; } .invoice-paper { max-width:none; min-height:auto; padding:24px; box-shadow:none; } }
+
+.site-account-menu { position: relative; }
+.site-account-trigger { min-height: 34px; padding: 0 13px; display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); cursor: pointer; font-size: 12px; font-weight: 700; list-style: none; }
+.site-account-trigger::-webkit-details-marker { display: none; }
+.site-account-trigger:hover,.site-account-menu[open] .site-account-trigger { border-color: var(--green); color: var(--green); }
+.site-account-trigger:focus-visible,.site-account-popover a:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.site-account-popover { position: absolute; top: calc(100% + 9px); right: 0; z-index: 40; width: 232px; padding: 13px; display: grid; gap: 5px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); box-shadow: 0 12px 32px #17251b20; }
+.site-account-popover strong { padding: 2px 8px 6px; color: var(--ink); font-size: 12px; }
+.site-account-popover a { padding: 8px; border-radius: 6px; color: var(--muted); font-size: 11px; font-weight: 650; }
+.site-account-popover a:hover { background: var(--wash); color: var(--green); }
+.site-account-popover .site-account-admin { color: var(--green); }
+.site-account-popover small { padding: 0 8px 5px; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.site-account-popover hr { width: 100%; margin: 3px 0; border: 0; border-top: 1px solid var(--line); }
+@media(max-width:760px) { .site-account-trigger { min-height: 32px; padding-inline: 11px; } }
