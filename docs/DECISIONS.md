@@ -52,6 +52,12 @@
 - Admin APIs remain the source of authority and audit all settings, invoice, payment, and subscription changes. The broader admin modules (global workers/sites/alerts/messages, full organization detail, coupon/rate/expense editing, health, notices, user management, and deletion tools) remain outstanding.
 - Phase 5 partial verification on Node v26.7.0: `npm test` passes 29/29; `npm run build` passes.
 
+## 2026-10-17 — Phase 8 analytics (partial)
+
+- Added backend revenue/cost/profit summaries from invoice, payment, refund, metered usage, subscription, and expense records. Yearly subscriptions are converted to monthly-equivalent MRR. Added an audited expense ledger and admin screens for summary and expense entry/deletion.
+- Analytics currently sums currencies together; set and use one billing currency before relying on combined totals. Date-range comparison, CSV exports, churn/retention cohorts, projections, and alerts are not implemented. Expense editing exists in the API but not yet in the UI.
+- Phase 8 partial verification on Node v26.7.0: `npm test` passes 29/29; `npm run build` passes.
+
 ### Status
 
 - Phase 0: audit documented; the active SQLite file was not opened. A truly read-only live schema inventory is still required.
@@ -59,7 +65,8 @@
 - Phase 2: major existing SMS, AI, weather, geocoding, and email provider paths are wired; voice usage and provider delivery reconciliation remain open.
 - Phase 3: core feature gates and worker/site caps are wired. Preflight quota enforcement across every provider dispatch remains incomplete.
 - Phase 4: manual billing path is partial. Online gateway, scheduled billing lifecycle, refunds/coupons and the billing settings UI remain incomplete.
-- Later work remains: remaining admin modules, deletion workflows, analytics, smoke/seed tools, and complete operating docs.
+- Phase 8: core current-period sums are implemented. Multi-currency normalization and advanced analytics remain outstanding.
+- Later work remains: remaining admin modules, deletion workflows, smoke/seed tools, and complete operating docs.
 
 ## 2026-10-14 — Initial audit and scope
 
