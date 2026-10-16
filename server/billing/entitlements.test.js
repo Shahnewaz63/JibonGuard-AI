@@ -34,7 +34,8 @@ test('usage dispatch respects block policy and safety exemption',()=>{
   db.prepare("UPDATE plan_limits SET value=1,unlimited=0 WHERE plan_id='legacy-default' AND limit_key='sms_segments_month'").run();
   db.prepare("UPDATE plan_overage_settings SET policy='block' WHERE plan_id='legacy-default'").run();
   const subscription=db.prepare("SELECT current_period_start,current_period_end FROM subscriptions WHERE organization_id='org-1'").get();
-  db.prepare("INSERT INTO usage_events(id,organization_id,event_type,quantity,unit,currency,created_at) VALUES('u1','org-1','sms_outbound',1,'segment','BDT',?)").run(subscription.current_period_start+1);
+  db.prepare("INSERT INTO usage_events(id,organization_id,event_type,quantity,unit,status,currency,created_at) VALUES('u1','org-1','sms_outbound',1,'segment','queued','BDT',?)").run(subscription.current_period_start+1);
+  db.prepare("INSERT INTO usage_events(id,organization_id,event_type,quantity,unit,status,currency,created_at) VALUES('u2','org-1','sms_outbound',20,'segment','failed','BDT',?)").run(subscription.current_period_start+2);
   assert.equal(checkUsageDispatch(db,{organizationId:'org-1',eventType:'sms_outbound',quantity:1}).allowed,false);
   assert.equal(checkUsageDispatch(db,{organizationId:'org-1',eventType:'sms_outbound',quantity:10,category:'emergency'}).safetyExemptApplied,true);
   db.close();

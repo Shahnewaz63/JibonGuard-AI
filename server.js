@@ -18,7 +18,7 @@ import { FEATURE_KEYS } from './server/billing/features.js';
 import { createMeteringService, estimateGeminiTokens } from './server/billing/metering.js';
 import { calculateSmsSegments } from './server/billing/smsSegments.js';
 import { rebuildUsageRollups } from './server/billing/rollups.js';
-import { checkFeatureAccess, checkResourceLimit } from './server/billing/entitlements.js';
+import { checkFeatureAccess, checkResourceLimit, checkUsageDispatch } from './server/billing/entitlements.js';
 import { canTransitionSubscription } from './server/billing/subscriptionState.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1312,6 +1312,7 @@ app.post('/api/ai/chat', csrfAndOrigin, requireUser, async (req,res) => {
   if (!Array.isArray(messages)||!messages.length||messages.length>12) return sendError(res,400,'Send a short chat message and try again.');
   const contents=messages.slice(-10).filter(item=>item&&['user','model'].includes(item.role)&&typeof item.text==='string'&&item.text.trim()&&item.text.length<=1200).map(item=>({role:item.role,parts:[{text:item.text.trim()}]}));
   if (!contents.length||contents.at(-1).role!=='user') return sendError(res,400,'Enter a message to continue.');
+  const promptText=contents.map(message=>message.parts.map(part=>part.text||'').join('')).join('\n'),estimatedUsage=estimateGeminiTokens(promptText,''),quota=checkUsageDispatch(db,{organizationId:req.user.organization_id,eventType:'ai_call',quantity:estimatedUsage.inputTokens+256});if(!quota.allowed)return sendError(res,402,'AI usage is paused because this organization reached its plan limit or needs to restore its subscription.');
   const attachment=req.body.attachment;
   if(attachment!==undefined){
     if(!attachment||typeof attachment!=='object'||typeof attachment.name!=='string'||attachment.name.length>160)return sendError(res,400,'Choose a valid attachment.');
@@ -1342,8 +1343,9 @@ app.post('/api/ai/speech', csrfAndOrigin, requireUser, requirePlanFeature('voice
   const voice=String(req.body.voice||'Kore');
   if(!text||text.length>5000)return sendError(res,400,'Choose a reply with 1 to 5,000 characters to read aloud.');
   if(!['Kore','Puck','Charon','Aoede'].includes(voice))return sendError(res,400,'Choose one of the available assistant voices.');
-  if(!GEMINI_API_KEY)return sendError(res,503,'Gemini is not configured. Set GEMINI_API_KEY in the server .env file.');
   let response;const started=Date.now(),estimatedInput=estimateGeminiTokens(text,'');
+  const quota=checkUsageDispatch(db,{organizationId:req.user.organization_id,eventType:'ai_call',quantity:estimatedInput.inputTokens});if(!quota.allowed)return sendError(res,402,'Speech generation is paused because this organization reached its plan limit or needs to restore its subscription.');
+  if(!GEMINI_API_KEY)return sendError(res,503,'Gemini is not configured. Set GEMINI_API_KEY in the server .env file.');
   try{
     response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_TTS_MODEL)}:generateContent`,{method:'POST',signal:AbortSignal.timeout(60000),headers:{'x-goog-api-key':GEMINI_API_KEY,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({contents:[{role:'user',parts:[{text,speech_metadata:{style:'Clear, calm, conversational delivery.'}}]}],generationConfig:{responseModalities:['AUDIO'],speechConfig:{voiceConfig:{voice}}}})});
   }catch{metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:estimatedInput.inputTokens,unit:'token',rateDivisor:1000000,tokensInput:estimatedInput.inputTokens,tokensOutput:0,estimated:true,status:'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});return sendError(res,503,"Could not connect to Gemini speech. Check the server's internet connection.");}
@@ -1388,17 +1390,19 @@ async function sendTextBeeBreakSms(recipients, record, usageContext={}) {
       : `${name}, বিরতির সময় হয়েছে। ${record.site} কর্মস্থলে ${record.duration_minutes} মিনিট পানি পান করুন ও ছায়ায় বিশ্রাম নিন। সময়: ${record.break_date} ${record.break_time}। - JibonGuard`;
     return {recipients:[recipient.phone],message:`${message} ${timing}`,...(subscription?{simSubscriptionId:Number(subscription)}:{})};
   });
+  const meterEntries=messages.flatMap(item=>item.recipients.map(phone=>({phone,message:item.message,refId:recipients.find(row=>row.phone===phone)?.refId})));
+  const quota=smsQuotaDecision(messages,usageContext);if(!quota.allowed){meterSmsAttempt(messages.flatMap(item=>item.recipients.map(phone=>({phone,message:item.message}))),usageContext,'blocked',token(16));return {status:'quota_blocked',recipient_count:0,message:'Routine SMS is paused because this organization has reached its plan limit or needs to restore its subscription.'};}
   try {
     const messageTemplate=({break:'পানি পান ও ছায়ায় বিরতি',rain:'বৃষ্টি সতর্কতা',storm:'ঝড় সতর্কতা',earthquake:'ভূমিকম্প সতর্কতা'})[record.alert_type]||'নিরাপত্তা সতর্কতা';
     const response=await fetch(`${base}/gateway/send-bulk-sms`,{method:'POST',signal:AbortSignal.timeout(20000),headers:{'x-api-key':apiKey,'Content-Type':'application/json',Accept:'application/json','User-Agent':'JibonGuard/1.0 (site break notifications)'},body:JSON.stringify({messages,messageTemplate})});
     const result=await response.json().catch(()=>({}));
-    if (!response.ok) {meterSmsAttempt(recipients,usageContext,'failed',token(16));const detail=String(result.message||result.error?.message||result.data?.message||'').replace(/\s+/g,' ').slice(0,180); return {status:'failed',recipient_count:0,message:response.status===401?'Break saved, but TextBee rejected the API key. Check TEXTBEE_API_KEY.':response.status===429?"Break saved, but TextBee's sending limit was reached.":`Break saved, but TextBee returned HTTP ${response.status}.${detail?` ${detail}`:' Check that a default device is enabled and online.'}`}; }
+    if (!response.ok) {meterSmsAttempt(meterEntries,usageContext,'failed',token(16));const detail=String(result.message||result.error?.message||result.data?.message||'').replace(/\s+/g,' ').slice(0,180); return {status:'failed',recipient_count:0,message:response.status===401?'Break saved, but TextBee rejected the API key. Check TEXTBEE_API_KEY.':response.status===429?"Break saved, but TextBee's sending limit was reached.":`Break saved, but TextBee returned HTTP ${response.status}.${detail?` ${detail}`:' Check that a default device is enabled and online.'}`}; }
     const accepted=result.data?.success===true||Number(result.data?.successCount)>0;
-    if (!accepted) {meterSmsAttempt(recipients,usageContext,'failed',token(16));const failed=Number(result.data?.failureCount)||0; return {status:'failed',recipient_count:0,message:failed?`Break saved, but TextBee could not queue ${failed} SMS. Check device status and recipient numbers.`:'Break saved, but TextBee did not confirm the batch. Check that a default sending device is enabled and online.'}; }
+    if (!accepted) {meterSmsAttempt(meterEntries,usageContext,'failed',token(16));const failed=Number(result.data?.failureCount)||0; return {status:'failed',recipient_count:0,message:failed?`Break saved, but TextBee could not queue ${failed} SMS. Check device status and recipient numbers.`:'Break saved, but TextBee did not confirm the batch. Check that a default sending device is enabled and online.'}; }
     const acceptedCount=Number(result.data?.recipientCount||result.data?.successCount)||recipients.length;
-    meterSmsAttempt(recipients,usageContext,'queued',token(16));
+    meterSmsAttempt(meterEntries,usageContext,'queued',token(16));
     return {status:'queued',recipient_count:acceptedCount,message:`TextBee accepted ${acceptedCount} personalized SMS message(s) into its queue.`};
-  } catch { meterSmsAttempt(recipients,usageContext,'failed',token(16));return {status:'failed',recipient_count:0,message:'Break saved, but the TextBee request timed out or failed. Retry shortly.'}; }
+  } catch { meterSmsAttempt(meterEntries,usageContext,'failed',token(16));return {status:'failed',recipient_count:0,message:'Break saved, but the TextBee request timed out or failed. Retry shortly.'}; }
 }
 function queueBreakSms(orgId, breakId, recipients, record, scheduledAt) {
   const insert=db.prepare("INSERT INTO scheduled_break_sms(id,organization_id,break_id,worker_id,workload,recipient,message,scheduled_at,status,created_at) VALUES(?,?,?,?,?,?,?,?,'scheduled',?)");
@@ -1510,14 +1514,20 @@ async function runAlertAutomationTick(){
 }
 jobRunner.register('alert_automation', runAlertAutomationTick, { jitterMs: 0 });
 async function runAlertAutomation(){ await jobRunner.execute('alert_automation'); }
-function meterSmsAttempt(entries,{organizationId,siteId=null,category='routine',feature='sms'},status,attemptId=token(16)){
+function meterSmsAttempt(entries,usageContext={},status,attemptId=token(16)){
+  const {organizationId,siteId=null,category='routine',feature='sms'}=usageContext;
   if(!organizationId)return;
   const unique=new Map();for(const entry of entries){const key=`${entry.phone}\0${entry.message}`;if(!unique.has(key))unique.set(key,entry);}
   for(const entry of unique.values()){
     const sms=calculateSmsSegments(entry.message||''),refs=[...(entry.referenceIds||[]),...(entry.refId?[entry.refId]:[])].map(String).sort();
     const reference=refs.length?refs.map(ref=>usageContext.refPrefix?`${usageContext.refPrefix}:${ref}`:ref).join(','):attemptId;
-    metering.recordUsage({organizationId,siteId,eventType:'sms_outbound',provider:'textbee',feature,quantity:sms.segments,unit:'segment',status,category,unitPriceMinor:status==='failed'?0:undefined,refType:refs.length?'send_attempt':'provider_attempt',refId:reference,metadata:{encoding:sms.encoding,units:sms.units,category},idempotencyKey:`sms-out:${organizationId}:${attemptId}:${reference}`});
+    metering.recordUsage({organizationId,siteId,eventType:'sms_outbound',provider:'textbee',feature,quantity:sms.segments,unit:'segment',status,category,unitPriceMinor:['failed','blocked'].includes(status)?0:undefined,refType:refs.length?'send_attempt':'provider_attempt',refId:reference,metadata:{encoding:sms.encoding,units:sms.units,category},idempotencyKey:`sms-out:${organizationId}:${attemptId}:${reference}`});
   }
+}
+function smsQuotaDecision(messages,usageContext={}){
+  if(!usageContext.organizationId)return {allowed:true};
+  const quantity=messages.reduce((sum,item)=>sum+item.recipients.length*calculateSmsSegments(item.message||'').segments,0);
+  return checkUsageDispatch(db,{organizationId:usageContext.organizationId,eventType:'sms_outbound',quantity,category:usageContext.category||'routine'});
 }
 async function sendTextBeeMessages(entries,messageTemplate,usageContext={}) {
   const apiKey=(process.env.TEXTBEE_API_KEY||process.env.TEXTBEE_DEV_API||'').trim();
@@ -1527,6 +1537,7 @@ async function sendTextBeeMessages(entries,messageTemplate,usageContext={}) {
   const attemptId=token(16),started=Date.now();
   const byText=new Map();for(const entry of entries){if(!byText.has(entry.message))byText.set(entry.message,new Set());byText.get(entry.message).add(entry.phone);}
   const messages=[...byText].map(([message,phones])=>({recipients:[...phones],message,...(subscription&&/^\d+$/.test(subscription)?{simSubscriptionId:Number(subscription)}:{})}));
+  const quota=smsQuotaDecision(messages,usageContext);if(!quota.allowed){meterSmsAttempt(entries,usageContext,'blocked',attemptId);return {accepted:false,blocked:true,reason:quota.reason||'quota'};}
   try {
     const response=await fetch(`${base}/gateway/send-bulk-sms`,{method:'POST',signal:AbortSignal.timeout(20000),headers:{'x-api-key':apiKey,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({messages,messageTemplate})});
     const result=await response.json().catch(()=>({}));

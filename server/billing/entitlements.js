@@ -38,7 +38,7 @@ export function checkUsageDispatch(db,{organizationId,eventType,quantity,categor
   if(!limit||limit.unlimited)return {allowed:true,unlimited:true};
   const policy=db.prepare('SELECT policy FROM plan_overage_settings WHERE plan_id=?').get(subscription.plan_id)?.policy||'soft_warn';
   const periodStart=subscription.current_period_start,periodEnd=subscription.current_period_end;
-  const used=Number(db.prepare('SELECT COALESCE(SUM(quantity),0) AS n FROM usage_events WHERE organization_id=? AND event_type=? AND created_at>=? AND created_at<?').get(organizationId,eventType,periodStart,periodEnd).n||0);
+  const used=Number(db.prepare("SELECT COALESCE(SUM(quantity),0) AS n FROM usage_events WHERE organization_id=? AND event_type=? AND status IN ('queued','sent','delivered','success') AND created_at>=? AND created_at<?").get(organizationId,eventType,periodStart,periodEnd).n||0);
   const scaledLimit=limitKey==='voice_minutes_month'?limit.value*60:limit.value;
   const safetyExempt=db.prepare("SELECT value_json FROM billing_settings WHERE setting_key='safety_alerts_exempt_from_limits'").get()?.value_json!=='false';
   if(safetyExempt&&['safety','emergency'].includes(category))return {allowed:true,safetyExemptApplied:true,used,limit:scaledLimit,policy};

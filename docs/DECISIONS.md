@@ -35,7 +35,8 @@
 
 - Added subscription feature and limit resolution, including organization-level feature/limit overrides and status checks. Migration v5 adds the feature override column for databases that already applied v4 and enables existing products on the Legacy plan.
 - Enforced plan access for AI chat, simulator, CSV import, data export, and speech endpoints. Worker imports and individual worker/site creation now check plan resource limits before inserting. Emergency dispatch remains on the existing safety path.
-- New plans still need operator-reviewed feature and limit settings before activation. Not all expensive provider calls are yet preflighted against quota, and customer billing pages and subscription lifecycle workflows remain outstanding.
+- SMS dispatch now preflights segment quotas and suspended-plan status before the provider request; failed and blocked sends do not count against included quota. Chat and speech perform estimated AI-token preflight checks. Other AI/provider call paths still lack complete quota preflight.
+- New plans still need operator-reviewed feature and limit settings before activation. Customer billing and subscription lifecycle workflows remain outstanding at this phase.
 - Phase 3 verification on Node v26.7.0: `npm test` passes 29/29; `npm run build` passes.
 
 ## 2026-10-17 — Phase 4 billing workflow (partial)
