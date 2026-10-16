@@ -10,14 +10,16 @@ import { createGeminiClient } from './ai/geminiClient.js';
 
 test('versioned migration is additive and idempotent', () => {
   const db = new DatabaseSync(':memory:');
-  db.exec('CREATE TABLE organizations(id TEXT PRIMARY KEY); CREATE TABLE workers(id TEXT PRIMARY KEY); CREATE TABLE sites(id TEXT PRIMARY KEY);');
+  db.exec('CREATE TABLE organizations(id TEXT PRIMARY KEY); CREATE TABLE workers(id TEXT PRIMARY KEY); CREATE TABLE sites(id TEXT PRIMARY KEY); CREATE TABLE official_advisories(id TEXT PRIMARY KEY); INSERT INTO official_advisories(id) VALUES(\'keep-me\');');
   runMigrations(db, { development: false, clock: () => 100 });
   runMigrations(db, { development: false, clock: () => 200 });
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get().n, 2);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get().n, 4);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM subscriptions WHERE plan_id=?').get('legacy-default').n, 0);
   assert.equal(db.prepare('PRAGMA table_info(sites)').all().some(row => row.name === 'emergency_contact_phone'), true);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='ai_calls'").get().n, 1);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='official_advisories'").get().n, 0);
-  assert.equal(db.prepare('PRAGMA table_info(workers)').all().some(row => row.name === 'voice_first'), false);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='official_advisories'").get().n, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM official_advisories').get().n, 1);
+  assert.equal(db.prepare('PRAGMA table_info(workers)').all().some(row => row.name === 'voice_first'), true);
   db.close();
 });
 

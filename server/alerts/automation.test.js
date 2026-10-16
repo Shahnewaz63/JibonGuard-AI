@@ -47,7 +47,7 @@ test('consent, cooldown, daily cap and quiet hours constrain AI decisions', asyn
   const request = worker_id => ({ worker_id, action: 'send_now', channel: 'sms', alert_type: 'water', template_id: 'water', variables: {}, reason: 'A reminder may help.' });
   const aiClient = async contexts => ({ status: 'ok', decisions: contexts.map(item => request(item.worker.id)) });
   const contexts = [context({ worker: { id: 'no-consent', consentStatus: 'pending', consentAt: null } }), context({ worker: { id: 'cooldown' } }), context({ worker: { id: 'capped' } }), context({ worker: { id: 'quiet', shiftStart: '00:00', shiftEnd: '23:59' }, now: new Date('2026-10-13T23:00:00Z') })];
-  const results = await decideAlerts(contexts, { config, aiClient, getHistory: id => id === 'cooldown' ? { lastByType: { water: '2026-10-13T09:50:00Z' } } : id === 'capped' ? { sentToday: 2 } : {} });
+  const results = await decideAlerts(contexts, { config: { ...config, aiEnabled: true }, aiClient, getHistory: id => id === 'cooldown' ? { lastByType: { water: '2026-10-13T09:50:00Z' } } : id === 'capped' ? { sentToday: 2 } : {} });
   assert.match(results.decisions.find(item => item.workerId === 'no-consent').reason, /consent/i);
   assert.match(results.decisions.find(item => item.workerId === 'cooldown').reason, /cooldown/i);
   assert.match(results.decisions.find(item => item.workerId === 'capped').reason, /cap/i);
@@ -98,7 +98,7 @@ test('invalid, empty and timed-out model responses fall back without throwing', 
   const configWithAi={...config,aiEnabled:true,apiKey:'test-key',model:'test-model',retryCount:0,timeoutMs:1000};
   const contextOne=context({worker:{id:'worker_one'}});
   const invalid=await callAlertAi([contextOne],configWithAi,async()=>({ok:true,json:async()=>({candidates:[{content:{parts:[{text:'not json'}]}}]})}));
-  const empty=await callAlertAi([contextOne],configWithAi,async()=>({ok:true,json:async()=>({candidates:[{content:{parts:[{text:'{"decisions":[]}'}]}}]})}));
+  const empty=await callAlertAi([],configWithAi,async()=>({ok:true,json:async()=>({candidates:[{content:{parts:[{text:'{"decisions":[]}'}]}}]})}));
   const timedOut=await callAlertAi([contextOne],{...configWithAi,timeoutMs:10},async(_url,options)=>new Promise((_resolve,reject)=>options.signal.addEventListener('abort',()=>reject(new Error('timeout')),{once:true})));
   assert.equal(invalid.status,'fallback');
   assert.equal(empty.status,'ok');

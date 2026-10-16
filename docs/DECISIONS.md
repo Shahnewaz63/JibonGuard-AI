@@ -13,6 +13,22 @@
 - Phase 0: `docs/ADMIN_AUDIT.md` added. It records current architecture, code-declared schema, major provider boundaries, auth model, scheduler, tests, working-tree protections, and a migration safety finding. Live DB schema was not queried because opening the active SQLite database could affect its pre-existing WAL/SHM state; a safe read-only schema inspection remains required.
 - Verification: baseline `npm test` fails 4/17; baseline `npm run build` passes.
 
+## 2026-10-17 — Phase 1 foundation
+
+- Added additive migration v4 for separate admin identities/sessions/recovery codes, login attempt tracking, append-only admin audit rows, plan catalog and versioned prices, limits/features, rate cards, immutable usage events and rollups, subscriptions/events, invoices/lines, payments/refunds/credits, coupons, expenses, settings, notices, organization billing details, resource snapshots, and soft-delete metadata.
+- Existing organizations receive a hidden zero-price Legacy subscription and generous unlimited limits. Basic, Pro, and ProMax are hidden editable sample plans with explicitly sample limits and zero sample prices. Public plans must be explicitly activated after operators configure real amounts and rates.
+- Added money arithmetic, GSM-7/UCS-2 SMS segmentation, feature registry, permission matrix, encrypted TOTP primitives, audit redaction, quota/state helpers, and failure-safe idempotent metering. Added `/admin` UI with separate login, TOTP enrollment (secret/URI instructions), recovery-code display, overview, organization list, plans, audit, and session views. Plan create/update APIs preserve price versions and default to keeping existing subscriber prices.
+- Added the `npm run admin:create` bootstrap command. It requires an interactive terminal, a strong password, and `ADMIN_ENCRYPTION_KEY`; then the first sign-in requires TOTP enrollment. This UI currently displays the secret/otpauth URI for manual authenticator setup; QR rendering is still outstanding.
+- Historical migration v2 was destructive for databases that had not yet applied it. It has been made a no-op while retaining the version number; the migration runner still adds its compatibility columns and no longer deletes tables, columns, settings, or data. Databases that already applied v2 remain unchanged. This is deliberate to honor additive-only upgrades.
+- Fixed two alert-path behaviors uncovered by the baseline suite: a successful AI skip can no longer suppress a deterministic floor alert, and AI tests now explicitly enable the AI decision layer. The empty AI result test now uses an empty eligible-worker set, matching strict output validation.
+- Phase 1 verification on Node v26.7.0: `npm test` passes 25/25 including a temporary-database admin-auth integration test; `npm run build` passes. Runtime Node 24 compatibility is still unverified.
+
+### Status
+
+- Phase 0: audit documented; the active SQLite file was not opened. A truly read-only live schema inventory is still required.
+- Phase 1: foundation delivered; remaining items include admin account management UI/API, QR enrollment, admin password reset, stronger re-auth action wiring, and security review.
+- Phase 2 and later: provider metering is not yet wired into real SMS/AI/weather/geocoding/email/voice paths; rate editing, rollup jobs, entitlements, billing lifecycle, payments, customer pages, admin modules, deletion workflows, analytics, smoke/seed tools, and complete operating docs remain outstanding.
+
 ## 2026-10-14 — Initial audit and scope
 
 - Preserve the existing emergency digit parser and its precedence. New SMS commands must never claim digit-only messages.

@@ -2,6 +2,4 @@ node_modules/
 dist/
 .env
 .history/
-jibonguard.sqlite3
-jibonguard.sqlite3-wal
-jibonguard.sqlite3-shm
+*.sqlite3*

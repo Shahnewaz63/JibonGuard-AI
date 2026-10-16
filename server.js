@@ -11,6 +11,10 @@ import { renderAlertTemplate } from './server/alerts/templates.js';
 import { dispatchAlertGroups } from './server/alerts/gateway.js';
 import { runMigrations } from './server/db/migrations.js';
 import { createJobRunner } from './server/jobs/runner.js';
+import { decryptTotpSecret, encryptTotpSecret, newTotpSecret, verifyTotp } from './server/billing/totp.js';
+import { writeAdminAudit } from './server/billing/audit.js';
+import { hasPermission } from './server/billing/permissions.js';
+import { FEATURE_KEYS } from './server/billing/features.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 for (const line of (existsSync(path.join(__dirname, '.env')) ? readFileSync(path.join(__dirname, '.env'), 'utf8') : '').split(/\r?\n/)) {
@@ -27,10 +31,14 @@ const PUBLIC_ORIGIN = (process.env.PUBLIC_ORIGIN || `http://${HOST}:${PORT}`).re
 const SESSION_SECRET = process.env.SESSION_SECRET || '';
 const SESSION_COOKIE = 'jg_session';
 const CSRF_COOKIE = 'jg_csrf';
+const ADMIN_SESSION_COOKIE = 'jg_admin_session';
+const ADMIN_CSRF_COOKIE = 'jg_admin_csrf';
 const SESSION_LIFETIME = 12 * 60 * 60;
 const REMEMBER_LIFETIME = 30 * 24 * 60 * 60;
 const OTP_RESEND_COOLDOWN_SECONDS = 60;
 const TOKEN_LIFETIME = 60 * 60;
+const PLAN_LIMIT_KEYS = new Set(['workers','sites','users','sms_segments_month','ai_tokens_month','voice_minutes_month','weather_checks_month','retention_days']);
+const ADMIN_SESSION_LIFETIME = Math.min(8 * 60 * 60, Math.max(600, Number(process.env.ADMIN_SESSION_LIFETIME_SECONDS || 3600)));
 const PASSWORD_MIN = 12;
 const DB_PATH = process.env.JIBONGUARD_DB || path.join(__dirname, 'jibonguard.sqlite3');
 if (IS_PRODUCTION && SESSION_SECRET.length < 32) throw new Error('Set SESSION_SECRET to a random value of at least 32 characters.');
@@ -168,6 +176,47 @@ const requireUser = (req, res, next) => {
   if (!req.user) return sendError(res, 401, 'Sign in to continue.');
   next();
 };
+const adminSessionUser = req => {
+  const opaque = parseCookies(req)[ADMIN_SESSION_COOKIE];
+  if (!opaque) return null;
+  const stamp = now();
+  db.prepare('DELETE FROM admin_sessions WHERE expires_at<?').run(stamp);
+  return db.prepare(`SELECT a.id,a.email,a.role,a.totp_enabled,s.expires_at,s.reauth_at
+    FROM admin_sessions s JOIN admin_users a ON a.id=s.admin_id
+    WHERE s.token_hash=? AND s.expires_at>=? AND a.disabled_at IS NULL`).get(hashToken(opaque), stamp) || null;
+};
+const adminIpAllowed = req => {
+  const configured = String(process.env.ADMIN_IP_ALLOWLIST || '').split(',').map(value => value.trim()).filter(Boolean);
+  return !configured.length || configured.includes(req.ip || req.socket.remoteAddress || '');
+};
+const validRequestOrigin = req => {
+  const origin = req.get('origin');
+  if (origin === PUBLIC_ORIGIN) return true;
+  if (!IS_PRODUCTION && origin) {
+    try { const parsed = new URL(origin); return ['127.0.0.1','localhost','::1'].includes(parsed.hostname) && /^https?:$/.test(parsed.protocol); } catch { return false; }
+  }
+  return false;
+};
+const adminCsrfAndOrigin = (req,res,next) => {
+  const cookies=parseCookies(req),header=req.get('x-csrf-token')||'';
+  if(!validRequestOrigin(req))return sendError(res,403,'Request origin could not be verified.');
+  if(!cookies[ADMIN_CSRF_COOKIE]||!header||cookies[ADMIN_CSRF_COOKIE]!==header)return sendError(res,403,'Admin security token expired. Reload the page and try again.');
+  next();
+};
+const loadAdmin = (req,res,next,{allowPendingTotp=false}={}) => {
+  if(!adminIpAllowed(req))return sendError(res,403,'Admin access is not allowed from this network.');
+  req.admin=adminSessionUser(req);
+  if(!req.admin)return sendError(res,401,'Admin sign-in is required.');
+  if(!req.admin.totp_enabled&&!allowPendingTotp)return res.status(403).json({error:'Complete admin two-factor setup to continue.',requiresTotpSetup:true});
+  next();
+};
+const requireAdmin=(req,res,next)=>loadAdmin(req,res,next);
+const requireAdminSetup=(req,res,next)=>loadAdmin(req,res,next,{allowPendingTotp:true});
+const adminPermission=permission=>(req,res,next)=>{
+  if(!req.admin)return sendError(res,401,'Admin sign-in is required.');
+  if(!hasPermission(req.admin.role,permission))return sendError(res,403,'This admin role cannot perform that action.');
+  next();
+};
 const hashPassword = async password => {
   const salt = randomBytes(16);
   const digest = await scrypt(password, salt, 64, { N: 2 ** 14, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
@@ -193,6 +242,217 @@ app.use((req, res, next) => {
 });
 app.use(express.json({ limit: '15mb' }));
 app.use((req, res, next) => { if (!req.path.startsWith('/api/')) console.log(`${req.method} ${req.path}`); next(); });
+
+app.get('/api/admin/auth/csrf',(req,res)=>{
+  const cookies=parseCookies(req),existing=cookies[ADMIN_CSRF_COOKIE];
+  const value=existing&&/^[A-Za-z0-9_-]{32,64}$/.test(existing)?existing:token(32);
+  if(value!==existing)res.cookie(ADMIN_CSRF_COOKIE,value,cookieOptions(false,ADMIN_SESSION_LIFETIME));
+  res.set('Cache-Control','no-store').json({csrf_token:value});
+});
+app.post('/api/admin/auth/login',adminCsrfAndOrigin,async(req,res)=>{
+  if(!adminIpAllowed(req))return sendError(res,403,'Admin access is not allowed from this network.');
+  if(!rateAllowed(req,'admin-login',8,900))return sendError(res,429,'Too many admin sign-in attempts. Try again later.');
+  const email=String(req.body.email||'').trim().toLowerCase(),password=req.body.password,code=String(req.body.code||'');
+  if(email.length>254||!/^\S+@\S+\.\S+$/.test(email)||typeof password!=='string'||password.length>128)return sendError(res,400,'Enter a valid email and password.');
+  const address=req.ip||req.socket.remoteAddress||'unknown',stamp=now();
+  const failures=db.prepare('SELECT COUNT(*) AS n FROM admin_login_attempts WHERE email=? AND ip=? AND success=0 AND created_at>?').get(email,address,stamp-900).n;
+  if(failures>=5)return sendError(res,429,'Admin sign-in is temporarily locked. Try again later.');
+  const admin=db.prepare('SELECT * FROM admin_users WHERE email=? COLLATE NOCASE AND disabled_at IS NULL').get(email);
+  let valid=Boolean(admin&&await checkPassword(password,admin.password_hash,admin.password_salt));
+  let usedRecovery=false;
+  if(valid&&admin.totp_enabled){
+    try{valid=verifyTotp(decryptTotpSecret(admin.totp_secret_encrypted,process.env.ADMIN_ENCRYPTION_KEY||''),code);}
+    catch{valid=false;}
+    if(!valid&&code.length>=16){
+      const consumed=db.prepare('UPDATE admin_recovery_codes SET used_at=? WHERE admin_id=? AND code_hash=? AND used_at IS NULL').run(stamp,admin.id,hashToken(code));
+      valid=consumed.changes===1;usedRecovery=valid;
+    }
+  }
+  db.prepare('INSERT INTO admin_login_attempts(id,email,ip,success,created_at) VALUES(?,?,?,?,?)').run(token(16),email,address,valid?1:0,stamp);
+  if(!valid)return sendError(res,401,'Email, password, or two-factor code was not accepted.');
+  const opaque=token(32),lifetime=admin.totp_enabled?ADMIN_SESSION_LIFETIME:600;
+  db.prepare('INSERT INTO admin_sessions(token_hash,admin_id,created_at,expires_at,ip,user_agent,reauth_at) VALUES(?,?,?,?,?,?,?)').run(hashToken(opaque),admin.id,stamp,stamp+lifetime,address,String(req.get('user-agent')||'').slice(0,300),null);
+  writeAdminAudit(db,{adminId:admin.id,role:admin.role,action:'admin.login',targetType:'admin_user',targetId:admin.id,ip:address,userAgent:req.get('user-agent')||'',after:{success:true,recoveryCode:usedRecovery},now:stamp});
+  res.cookie(ADMIN_SESSION_COOKIE,opaque,cookieOptions(true,lifetime));
+  res.set('Cache-Control','no-store').json({authenticated:true,requiresTotpSetup:!admin.totp_enabled,admin:{id:admin.id,email:admin.email,role:admin.role}});
+});
+app.get('/api/admin/auth/me',(req,res)=>{
+  if(!adminIpAllowed(req))return sendError(res,403,'Admin access is not allowed from this network.');
+  const admin=adminSessionUser(req);
+  if(!admin)return sendError(res,401,'Admin sign-in is required.');
+  res.set('Cache-Control','no-store').json({authenticated:true,requiresTotpSetup:!admin.totp_enabled,admin:{id:admin.id,email:admin.email,role:admin.role}});
+});
+app.get('/api/admin/auth/totp/setup',requireAdminSetup,(req,res)=>{
+  if(req.admin.totp_enabled)return sendError(res,409,'Two-factor authentication is already enabled.');
+  const row=db.prepare('SELECT totp_secret_encrypted FROM admin_users WHERE id=?').get(req.admin.id);
+  let secret;
+  try{secret=row?.totp_secret_encrypted?decryptTotpSecret(row.totp_secret_encrypted,process.env.ADMIN_ENCRYPTION_KEY||''):newTotpSecret();}
+  catch{return sendError(res,503,'Set a strong ADMIN_ENCRYPTION_KEY before enrolling admin two-factor authentication.');}
+  if(!row?.totp_secret_encrypted){
+    try{db.prepare('UPDATE admin_users SET totp_secret_encrypted=?,updated_at=? WHERE id=?').run(encryptTotpSecret(secret,process.env.ADMIN_ENCRYPTION_KEY||''),now(),req.admin.id);}
+    catch{return sendError(res,503,'Could not protect the admin two-factor secret.');}
+    writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'admin.totp_setup_started',targetType:'admin_user',targetId:req.admin.id,ip:req.ip||'',userAgent:req.get('user-agent')||'',now:now()});
+  }
+  const uri=`otpauth://totp/${encodeURIComponent(`JibonGuard:${req.admin.email}`)}?secret=${secret}&issuer=JibonGuard&algorithm=SHA1&digits=6&period=30`;
+  res.set('Cache-Control','no-store').json({secret,otpauth_uri:uri,issuer:'JibonGuard',account:req.admin.email});
+});
+app.post('/api/admin/auth/totp/setup',adminCsrfAndOrigin,requireAdminSetup,(req,res)=>{
+  if(req.admin.totp_enabled)return sendError(res,409,'Two-factor authentication is already enabled.');
+  const row=db.prepare('SELECT totp_secret_encrypted FROM admin_users WHERE id=?').get(req.admin.id);
+  let secret;
+  try{secret=decryptTotpSecret(row?.totp_secret_encrypted,process.env.ADMIN_ENCRYPTION_KEY||'');}
+  catch{return sendError(res,400,'Start two-factor setup again.');}
+  if(!verifyTotp(secret,String(req.body.code||'')))return sendError(res,422,'The two-factor code is not valid yet.');
+  const stamp=now(),codes=Array.from({length:10},()=>randomBytes(10).toString('hex'));
+  const enable=db.prepare('UPDATE admin_users SET totp_enabled=1,updated_at=? WHERE id=? AND totp_enabled=0').run(stamp,req.admin.id);
+  if(!enable.changes)return sendError(res,409,'Two-factor authentication changed in another session.');
+  const insert=db.prepare('INSERT INTO admin_recovery_codes(id,admin_id,code_hash,created_at) VALUES(?,?,?,?)');
+  for(const recovery of codes)insert.run(token(16),req.admin.id,hashToken(recovery),stamp);
+  db.prepare('UPDATE admin_sessions SET expires_at=?,reauth_at=? WHERE token_hash=?').run(stamp+ADMIN_SESSION_LIFETIME,stamp,hashToken(parseCookies(req)[ADMIN_SESSION_COOKIE]));
+  writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'admin.totp_enabled',targetType:'admin_user',targetId:req.admin.id,ip:req.ip||'',userAgent:req.get('user-agent')||'',after:{recoveryCodesCreated:codes.length},now:stamp});
+  res.set('Cache-Control','no-store').json({enabled:true,recovery_codes:codes});
+});
+app.post('/api/admin/auth/logout',adminCsrfAndOrigin,requireAdminSetup,(req,res)=>{
+  db.prepare('DELETE FROM admin_sessions WHERE token_hash=?').run(hashToken(parseCookies(req)[ADMIN_SESSION_COOKIE]));
+  writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'admin.logout',targetType:'admin_user',targetId:req.admin.id,ip:req.ip||'',userAgent:req.get('user-agent')||'',now:now()});
+  res.clearCookie(ADMIN_SESSION_COOKIE,cookieOptions(true,0));res.json({ok:true});
+});
+app.post('/api/admin/auth/reauth',adminCsrfAndOrigin,requireAdmin,async(req,res)=>{
+  const password=req.body.password,code=String(req.body.code||'');
+  if(typeof password!=='string'||password.length>128)return sendError(res,400,'Enter your admin password.');
+  const row=db.prepare('SELECT password_hash,password_salt,totp_secret_encrypted FROM admin_users WHERE id=? AND disabled_at IS NULL').get(req.admin.id);
+  let valid=false;
+  try{valid=Boolean(row&&verifyTotp(decryptTotpSecret(row.totp_secret_encrypted,process.env.ADMIN_ENCRYPTION_KEY||''),code)&&await checkPassword(password,row.password_hash,row.password_salt));}catch{valid=false;}
+  if(!valid)return sendError(res,401,'Password or two-factor code did not match.');
+  db.prepare('UPDATE admin_sessions SET reauth_at=? WHERE token_hash=?').run(now(),hashToken(parseCookies(req)[ADMIN_SESSION_COOKIE]));
+  writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'admin.reauthenticated',targetType:'admin_user',targetId:req.admin.id,ip:req.ip||'',userAgent:req.get('user-agent')||'',now:now()});
+  res.json({ok:true});
+});
+app.get('/api/admin/overview',requireAdmin,adminPermission('dashboard_read'),(req,res)=>{
+  const day=new Date();day.setUTCHours(0,0,0,0);const start=Math.floor(day.getTime()/1000);
+  const counts=table=>Number(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n||0);
+  const mrr=Number(db.prepare("SELECT COALESCE(SUM(price_minor),0) AS n FROM subscriptions WHERE status IN ('active','trialing') AND billing_cycle='monthly'").get().n||0);
+  const todayUsage=db.prepare('SELECT event_type,SUM(quantity) AS quantity,SUM(cost_minor) AS cost_minor FROM usage_events WHERE created_at>=? GROUP BY event_type').all(start);
+  const usage=Object.fromEntries(todayUsage.map(row=>[row.event_type,{quantity:Number(row.quantity||0),cost_minor:Number(row.cost_minor||0)}]));
+  res.set('Cache-Control','no-store').json({organizations:counts('organizations'),workers:counts('workers'),sites:counts('sites'),alerts_today:Number(db.prepare('SELECT COUNT(*) AS n FROM automated_alerts WHERE created_at>=?').get(start).n||0),subscriptions_active:Number(db.prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE status='active'").get().n||0),subscriptions_trialing:Number(db.prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE status='trialing'").get().n||0),subscriptions_past_due:Number(db.prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE status='past_due'").get().n||0),mrr_minor:mrr,currency:'BDT',usage_today:usage});
+});
+app.get('/api/admin/organizations',requireAdmin,adminPermission('organizations_read'),(req,res)=>{
+  const limit=Math.min(100,Math.max(1,Number.parseInt(req.query.limit,10)||25)),offset=Math.max(0,Number.parseInt(req.query.offset,10)||0),search=String(req.query.q||'').trim().slice(0,100),like=`%${search.replace(/[\\%_]/g,'\\$&')}%`;
+  const where=search?"WHERE o.name LIKE ? ESCAPE '\\' OR o.phone LIKE ? ESCAPE '\\' OR o.id LIKE ? ESCAPE '\\'":'';
+  const args=search?[like,like,like]:[];
+  const total=Number(db.prepare(`SELECT COUNT(*) AS n FROM organizations o ${where}`).get(...args).n||0);
+  const rows=db.prepare(`SELECT o.id,o.name,o.organization_type,o.phone,o.address,o.created_at,
+    (SELECT COUNT(*) FROM users u WHERE u.organization_id=o.id) AS users_count,
+    (SELECT COUNT(*) FROM workers w WHERE w.organization_id=o.id) AS workers_count,
+    (SELECT COUNT(*) FROM sites s WHERE s.organization_id=o.id) AS sites_count,
+    (SELECT status FROM subscriptions sub WHERE sub.organization_id=o.id ORDER BY sub.created_at DESC LIMIT 1) AS subscription_status,
+    (SELECT p.name FROM subscriptions sub JOIN plans p ON p.id=sub.plan_id WHERE sub.organization_id=o.id ORDER BY sub.created_at DESC LIMIT 1) AS plan_name
+    FROM organizations o ${where} ORDER BY o.created_at DESC LIMIT ? OFFSET ?`).all(...args,limit,offset);
+  const items=rows.map(row=>({...row,phone:req.admin.role==='viewer'&&row.phone?`${row.phone.slice(0,3)}••••${row.phone.slice(-2)}`:row.phone}));
+  res.set('Cache-Control','no-store').json({items,total,limit,offset});
+});
+app.get('/api/admin/plans',requireAdmin,adminPermission('plans_read'),(_req,res)=>{
+  const plans=db.prepare(`SELECT p.*, (SELECT amount_minor FROM plan_prices pp WHERE pp.plan_id=p.id AND pp.billing_cycle='monthly' ORDER BY effective_from DESC LIMIT 1) AS monthly_price_minor,
+    (SELECT amount_minor FROM plan_prices pp WHERE pp.plan_id=p.id AND pp.billing_cycle='yearly' ORDER BY effective_from DESC LIMIT 1) AS yearly_price_minor,
+    (SELECT currency FROM plan_prices pp WHERE pp.plan_id=p.id ORDER BY effective_from DESC LIMIT 1) AS currency
+    FROM plans p ORDER BY p.sort_order,p.name`).all();
+  res.set('Cache-Control','no-store').json({plans});
+});
+const readAdminPlan=id=>{
+  const plan=db.prepare('SELECT * FROM plans WHERE id=?').get(id);if(!plan)return null;
+  return {...plan,prices:db.prepare('SELECT * FROM plan_prices WHERE plan_id=? ORDER BY effective_from DESC,billing_cycle').all(id),limits:Object.fromEntries(db.prepare('SELECT limit_key,value,unlimited FROM plan_limits WHERE plan_id=?').all(id).map(row=>[row.limit_key,{value:row.value,unlimited:Boolean(row.unlimited)}])),features:Object.fromEntries(db.prepare('SELECT feature_key,enabled FROM plan_features WHERE plan_id=?').all(id).map(row=>[row.feature_key,Boolean(row.enabled)]))};
+};
+function normalizePlanSettings(input){
+  if(input.limits!==undefined){
+    if(!input.limits||typeof input.limits!=='object'||Array.isArray(input.limits))return {error:'Plan limits must be an object.'};
+    for(const [key,raw] of Object.entries(input.limits)){
+      if(!PLAN_LIMIT_KEYS.has(key))return {error:`Unknown plan limit: ${key}.`};
+      const limit=raw&&typeof raw==='object'?raw:{value:raw,unlimited:false};
+      if(limit.unlimited!==true&&(!Number.isSafeInteger(limit.value)||limit.value<0))return {error:`${key} must be a nonnegative whole number or unlimited.`};
+    }
+  }
+  if(input.features!==undefined){
+    if(!input.features||typeof input.features!=='object'||Array.isArray(input.features))return {error:'Plan features must be an object.'};
+    for(const [key,value] of Object.entries(input.features))if(!FEATURE_KEYS.includes(key)||typeof value!=='boolean')return {error:`Unknown or invalid plan feature: ${key}.`};
+  }
+  return {};
+}
+function savePlanSettings(planId,input,stamp){
+  for(const [key,raw] of Object.entries(input.limits||{})){
+    const limit=raw&&typeof raw==='object'?raw:{value:raw,unlimited:false};
+    db.prepare('INSERT INTO plan_limits(plan_id,limit_key,value,unlimited,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(plan_id,limit_key) DO UPDATE SET value=excluded.value,unlimited=excluded.unlimited,updated_at=excluded.updated_at').run(planId,key,limit.unlimited?null:limit.value,limit.unlimited?1:0,stamp);
+  }
+  for(const [key,enabled] of Object.entries(input.features||{}))db.prepare('INSERT INTO plan_features(plan_id,feature_key,enabled,updated_at) VALUES(?,?,?,?) ON CONFLICT(plan_id,feature_key) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at').run(planId,key,enabled?1:0,stamp);
+}
+app.get('/api/admin/plans/:id',requireAdmin,adminPermission('plans_read'),(req,res)=>{
+  const plan=readAdminPlan(req.params.id);if(!plan)return sendError(res,404,'Plan not found.');
+  res.set('Cache-Control','no-store').json({plan});
+});
+app.post('/api/admin/plans',adminCsrfAndOrigin,requireAdmin,adminPermission('plans_write'),(req,res)=>{
+  const input=req.body||{},name=String(input.name||'').trim(),slug=String(input.slug||name.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')).toLowerCase(),currency=String(input.currency||'BDT').toUpperCase(),status=input.status||'draft';
+  if(!name||name.length>80||!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug)||slug.length>80)return sendError(res,422,'Enter a plan name and valid unique slug.');
+  if(!['draft','active','hidden','archived'].includes(status)||!Number.isInteger(input.trial_days??0)||(input.trial_days??0)<0||(input.trial_days??0)>365)return sendError(res,422,'Plan status or trial length is invalid.');
+  if(!/^[A-Z]{3}$/.test(currency)||!Number.isSafeInteger(input.monthly_price_minor)||input.monthly_price_minor<0||!Number.isSafeInteger(input.yearly_price_minor)||input.yearly_price_minor<0)return sendError(res,422,'Set monthly and yearly prices as integer minor units and select a 3-letter currency.');
+  const settings=normalizePlanSettings(input);if(settings.error)return sendError(res,422,settings.error);
+  const id=token(18),stamp=now();
+  db.exec('BEGIN IMMEDIATE');
+  try{
+    db.prepare('INSERT INTO plans(id,name,slug,description,status,sort_order,trial_days,badge_text,sample_values,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,0,?,?)').run(id,name,slug,String(input.description||'').slice(0,2000),status,Number.isInteger(input.sort_order)?input.sort_order:100,input.trial_days||0,String(input.badge_text||'').slice(0,80),stamp,stamp);
+    for(const [cycle,amount] of [['monthly',input.monthly_price_minor],['yearly',input.yearly_price_minor]])db.prepare('INSERT INTO plan_prices(id,plan_id,billing_cycle,amount_minor,currency,effective_from,version,created_by,created_at) VALUES(?,?,?,?,?,?,1,?,?)').run(token(18),id,cycle,amount,currency,stamp,req.admin.id,stamp);
+    savePlanSettings(id,input,stamp);
+    writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'plan.created',targetType:'plan',targetId:id,ip:req.ip||'',userAgent:req.get('user-agent')||'',after:{name,slug,status,currency,monthly_price_minor:input.monthly_price_minor,yearly_price_minor:input.yearly_price_minor},reason:String(input.reason||''),now:stamp});
+    db.exec('COMMIT');
+  }catch(error){db.exec('ROLLBACK');if(String(error.message).includes('UNIQUE'))return sendError(res,409,'A plan with this slug already exists.');throw error;}
+  res.status(201).json({plan:readAdminPlan(id)});
+});
+app.patch('/api/admin/plans/:id',adminCsrfAndOrigin,requireAdmin,adminPermission('plans_write'),(req,res)=>{
+  const existing=readAdminPlan(req.params.id);if(!existing)return sendError(res,404,'Plan not found.');
+  const input=req.body||{},settings=normalizePlanSettings(input);if(settings.error)return sendError(res,422,settings.error);
+  const stamp=now(),name=input.name===undefined?existing.name:String(input.name).trim(),status=input.status===undefined?existing.status:input.status;
+  if(!name||name.length>80||!['draft','active','hidden','archived'].includes(status))return sendError(res,422,'Plan name or status is invalid.');
+  const priceUpdates=[];
+  if(input.monthly_price_minor!==undefined||input.yearly_price_minor!==undefined||input.currency!==undefined){
+    const currentCurrency=existing.prices[0]?.currency||'BDT',currency=String(input.currency||currentCurrency).toUpperCase();
+    if(!/^[A-Z]{3}$/.test(currency))return sendError(res,422,'Currency must be a 3-letter code.');
+    for(const [cycle,key] of [['monthly','monthly_price_minor'],['yearly','yearly_price_minor']]){
+      if(input[key]===undefined&&currency===currentCurrency)continue;
+      const current=existing.prices.find(price=>price.billing_cycle===cycle),amount=input[key]===undefined?Number(current?.amount_minor||0):input[key];
+      if(!Number.isSafeInteger(amount)||amount<0)return sendError(res,422,`${cycle} price must be a nonnegative integer in minor units.`);
+      if(!current||amount!==current.amount_minor||currency!==current.currency)priceUpdates.push({cycle,amount,currency});
+    }
+  }
+  db.exec('BEGIN IMMEDIATE');
+  try{
+    db.prepare('UPDATE plans SET name=?,description=?,status=?,sort_order=?,trial_days=?,badge_text=?,updated_at=? WHERE id=?').run(name,String(input.description??existing.description).slice(0,2000),status,Number.isInteger(input.sort_order)?input.sort_order:existing.sort_order,Number.isInteger(input.trial_days)?Math.max(0,Math.min(365,input.trial_days)):existing.trial_days,String(input.badge_text??existing.badge_text).slice(0,80),stamp,existing.id);
+    for(const price of priceUpdates){
+      const version=Number(db.prepare('SELECT COALESCE(MAX(version),0)+1 AS n FROM plan_prices WHERE plan_id=? AND billing_cycle=?').get(existing.id,price.cycle).n);
+      db.prepare('INSERT INTO plan_prices(id,plan_id,billing_cycle,amount_minor,currency,effective_from,version,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)').run(token(18),existing.id,price.cycle,price.amount,price.currency,stamp,version,req.admin.id,stamp);
+      if(input.apply_existing===true)db.prepare("UPDATE subscriptions SET price_minor=?,currency=?,updated_at=? WHERE plan_id=? AND status IN ('active','trialing','past_due') AND billing_cycle=?").run(price.amount,price.currency,stamp,existing.id,price.cycle);
+    }
+    savePlanSettings(existing.id,input,stamp);
+    const after=readAdminPlan(existing.id);
+    writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'plan.updated',targetType:'plan',targetId:existing.id,ip:req.ip||'',userAgent:req.get('user-agent')||'',before:existing,after,reason:String(input.reason||''),now:stamp});
+    db.exec('COMMIT');
+  }catch(error){db.exec('ROLLBACK');throw error;}
+  res.json({plan:readAdminPlan(existing.id)});
+});
+app.get('/api/admin/audit',requireAdmin,adminPermission('audit_read'),(req,res)=>{
+  const limit=Math.min(100,Math.max(1,Number.parseInt(req.query.limit,10)||50)),offset=Math.max(0,Number.parseInt(req.query.offset,10)||0);
+  const rows=db.prepare('SELECT * FROM admin_audit_log ORDER BY created_at DESC LIMIT ? OFFSET ?').all(limit,offset);
+  res.set('Cache-Control','no-store').json({items:rows,total:Number(db.prepare('SELECT COUNT(*) AS n FROM admin_audit_log').get().n||0),limit,offset});
+});
+app.get('/api/admin/auth/sessions',requireAdmin,(req,res)=>{
+  const sessions=db.prepare('SELECT token_hash,created_at,expires_at,ip,user_agent,reauth_at FROM admin_sessions WHERE admin_id=? AND expires_at>=? ORDER BY created_at DESC').all(req.admin.id,now()).map((session,index)=>({...session,current:index===0}));
+  res.set('Cache-Control','no-store').json({sessions});
+});
+app.delete('/api/admin/auth/sessions/:hash',adminCsrfAndOrigin,requireAdmin,(req,res)=>{
+  const key=String(req.params.hash||'');
+  const target=db.prepare('SELECT admin_id FROM admin_sessions WHERE token_hash=?').get(key);
+  if(!target||target.admin_id!==req.admin.id)return sendError(res,404,'Admin session not found.');
+  db.prepare('DELETE FROM admin_sessions WHERE token_hash=? AND admin_id=?').run(key,req.admin.id);
+  writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'admin.session_revoked',targetType:'admin_session',targetId:key.slice(0,12),ip:req.ip||'',userAgent:req.get('user-agent')||'',now:now()});
+  res.json({ok:true});
+});
 
 app.get('/api/auth/csrf', (req, res) => {
   const csrf = csrfToken(req);

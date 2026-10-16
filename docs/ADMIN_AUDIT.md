@@ -22,7 +22,7 @@ Organization users have the `organization_owner` role. Passwords use salted scry
 
 Startup schema declarations in `server.js` include: `organizations`, `users`, `sessions`, `action_tokens`, `auth_otp_challenges`, `workers`, `sites`, `worker_consent_events`, `break_logs`, `scheduled_break_sms`, `sms_messages`, `sms_sync_state`, `alert_settings`, `automated_alerts`, and feature-suite tables. The database also has additive schema migrations in `server/db/migrations.js`, including `schema_migrations`, feature flags, AI-call/job records, nowcast, break planner, triage, report, and SMS deletion-marker tables. This is a code-declaration inventory, not a live `sqlite_master` inspection; the local DB was not opened for this audit. The migration runner backs up an existing DB in development before each migration.
 
-Important migration finding: migration v2 drops advisory tables and columns. This violates the new brief's additive-only rule and needs a compatibility assessment before extending migration behavior. Do not silently rewrite historical migrations on deployed databases.
+Important migration finding: migration v2 originally dropped advisory tables, settings, and worker columns. In this implementation it has been changed to a no-op for databases that encounter it for the first time, while retaining the version number and the old additive compatibility-column additions. Already-migrated databases are unaffected. This avoids repeating the destructive path on a new upgrade; installations that already lost data from v2 cannot recover that data through this migration.
 
 ## External service and metering locations
 
@@ -49,9 +49,17 @@ Alert automation uses periodic timers in `server.js`. `server/jobs/runner.js` an
 - No separate admin authentication, roles, 2FA, audit log, organization management panel, or customer billing pages.
 - No plans, subscriptions, invoices, payments, rate cards, usage ledger/rollups, expense ledger, or revenue analytics.
 - Existing DB migration runner is versioned and backup-aware, but one historical migration is destructive.
-- `.gitignore` currently ignores the main SQLite database and WAL/SHM, but not the `*.sqlite3*` family (including backup files).
+- `.gitignore` now ignores the full `*.sqlite3*` family. Existing tracked SQLite artifacts remain tracked by Git until explicitly removed from repository history; do not stage them as part of this implementation.
 - The feature-suite remote branch exists. This checkout already contains feature-suite code and docs, but its history/integration state should be reviewed before selecting any merge/cherry-pick strategy.
 
 ## Safety and data handling
 
 Safety messaging includes deterministic guardrails, consent-aware routine dispatch, emergency-code handling, and alert automation. Billing/entitlements must not suppress emergency-code handling or safety alerts when the configured safety exemption is enabled. Admin data views should mask worker phone numbers and health-related free text by default; reveal actions must be reasoned and audited. Preserve `.env`, database files, WAL/SHM files, and existing user changes.
+
+## Phase 1 implementation map (2026-10-17)
+
+- Additive schema v4 is in `server/db/migrations.js`; it creates admin, audit, pricing, metering, subscription, payment, expense, and retention tables. It gives every existing organization a hidden zero-price Legacy subscription with unlimited compatibility limits and creates hidden, clearly marked sample plan records.
+- Admin routes are in `server.js` under `/api/admin/*`; admin sessions and CSRF use separate cookie names. `server/billing/permissions.js` contains the server-side permission map; `server/billing/totp.js` implements RFC 6238 and AES-GCM secret protection; `server/billing/audit.js` redacts sensitive snapshot fields.
+- The admin interface is `/admin` using `src/AdminApp.jsx` and `src/admin.css`. Current views are overview, organizations, plans, audit, and own active sessions. The setup screen shows a secret and otpauth URI for manual TOTP enrollment but does not yet render a QR code.
+- `scripts/createAdmin.js` backs `npm run admin:create` and only permits the initial bootstrap. It does not use a default password.
+- Pure billing helpers live under `server/billing/`; integration coverage is in `server/billing/adminAuth.integration.test.js`. The shared meter exists but is not wired into provider boundaries yet.

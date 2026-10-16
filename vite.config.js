@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react(), {
     name: 'jibonguard-react-route-fallback',
     configureServer(server) {
-      const reactRoutes = new Set(['/dashboard.html', '/account.html', '/privacy.html', '/signup.html', '/verify.html', '/resend-verification.html', '/login.html']);
+      const reactRoutes = new Set(['/dashboard.html', '/account.html', '/privacy.html', '/signup.html', '/verify.html', '/resend-verification.html', '/login.html', '/admin']);
       server.middlewares.use((req, _res, next) => {
         const url = req.url || '/';
         const pathname = url.split('?')[0];

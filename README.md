@@ -68,6 +68,30 @@ Open-Meteo's public Forecast API is used by default for non-commercial developme
 
 Set `GEMINI_API_KEY` to enable AI chat and weather-based break suggestions. The key stays server-side. Both features need internet access and a valid Gemini key/quota. AI suggestions are decision support, not emergency monitoring; follow official local alerts and site safety procedures.
 
+## Admin foundation (in progress)
+
+The separate admin interface is at `/admin`. Admin identities use a different cookie and session table from organization accounts. Existing organizations are assigned a hidden, zero-price **Legacy** subscription during the additive billing migration so their current dashboard access continues while real plans and prices are configured. Basic, Pro, and ProMax are hidden sample plans with zero sample prices; they are not customer offers until an operator configures and publishes them.
+
+Before bootstrapping the first admin, set a private encryption key in `.env`. In PowerShell, generate one with:
+
+```powershell
+$adminKeyBytes = New-Object byte[] 48
+[Security.Cryptography.RandomNumberGenerator]::Fill($adminKeyBytes)
+[Convert]::ToBase64String($adminKeyBytes)
+```
+
+Copy the output into `ADMIN_ENCRYPTION_KEY` and keep it backed up outside the repository. Then run:
+
+```powershell
+npm run admin:create
+```
+
+The command prompts for the first super-admin email and a strong password. Open `/admin`, sign in, and finish authenticator-app enrollment before using admin features. Keep the displayed recovery codes securely. The enrollment page currently provides the secret and `otpauth://` URI for manual setup; QR rendering is not yet implemented. Optional `ADMIN_IP_ALLOWLIST` accepts comma-separated exact source IP addresses. `ADMIN_SESSION_LIFETIME_SECONDS` controls the separate admin session duration (bounded to 10 minutes through 8 hours).
+
+Current implemented admin roles are `super_admin`, `finance`, `support`, and `viewer`; API authorization is role checked. Current admin screens cover an overview, organization list, plans, audit records, and the current admin's sessions. Plan create/update retains price history; applying new plan prices to existing subscriptions requires the explicit API flag. The wider billing and subscription workflow is not complete yet. Do not treat the current panel as a completed production billing system.
+
+The billing migration creates editable sample plan values, but provider costs, customer overage prices, taxes, invoice settings, and real plan prices require operator configuration before launch. New migrations back up an existing DB in development. Back up the database and its WAL state before production upgrades, and test restoration. See `docs/ADMIN_AUDIT.md` and `docs/DECISIONS.md` for the current scope and outstanding work.
+
 To send account email, configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_FROM`. With SMTP configured, sign-up and each successful password check send a six-digit OTP valid for 10 minutes. In development without SMTP, OTPs are printed in the Node server terminal.
 
 To send worker SMS and sync SMS history, configure `TEXTBEE_API_KEY` and optionally numeric `TEXTBEE_SIM_SUBSCRIPTION_ID`. In TextBee, enable SMS receiving on the Android gateway. The server checks incoming SMS every 30 seconds, accepts emergency codes `০`–`৯` or `0`–`9`, replies in Bangla, and sends emergency alerts to workers at the sender's site. New workers receive a Bangla registration confirmation and emergency-code guide by SMS. Emergency messages go to every worker at that site; routine break notifications remain consent-aware.

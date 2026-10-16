@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "concurrently -k \"node --watch-path=server.js --watch-path=server --watch-path=.env server.js\" \"vite\"",
     "build": "vite build",
-    "test": "node --test server/alerts/*.test.js server/features.test.js",
+    "test": "node --test server/**/*.test.js server/features.test.js",
+    "admin:create": "node scripts/createAdmin.js",
     "start": "npm run build && node server.js",
     "preview": "vite preview"
   },

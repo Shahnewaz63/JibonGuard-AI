@@ -30,25 +30,92 @@ const migrations = [
   {
     version: 2,
     name: 'remove_official_advisories_and_voice_calls',
-    sql: `
-      DROP TABLE IF EXISTS advisory_crosschecks;
-      DROP TABLE IF EXISTS official_feed_status;
-      DROP TABLE IF EXISTS official_advisories;
-      DROP INDEX IF EXISTS advisory_external_dedupe_idx;
-      DROP INDEX IF EXISTS advisory_active_idx;
-      DROP INDEX IF EXISTS crosschecks_org_time_idx;
-      DELETE FROM feature_flags WHERE flag_key='official_advisories';
-      UPDATE org_ai_features SET settings_json=json_remove(settings_json,'$.officialAdvisories');
-      UPDATE workers SET channel_preference='sms' WHERE channel_preference IN ('voice','sms+voice');
-      ALTER TABLE workers DROP COLUMN voice_first;
-      ALTER TABLE workers DROP COLUMN channel_preference;
-    `,
+    // The original v2 dropped tables, feature settings, and worker columns. Keep
+    // the version number for installations that already applied it, but make
+    // it non-destructive for databases encountering this migration for the first time.
+    sql: `SELECT 1;`,
   },
   {
     version: 3,
     name: 'sms_history_deletion_markers',
     sql: `
       CREATE TABLE IF NOT EXISTS sms_deleted_messages(organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,id TEXT NOT NULL,deleted_at INTEGER NOT NULL,PRIMARY KEY(organization_id,id));
+    `,
+  },
+  {
+    version: 4,
+    name: 'admin_billing_foundation',
+    sql: `
+      CREATE TABLE IF NOT EXISTS admin_users(id TEXT PRIMARY KEY,email TEXT NOT NULL COLLATE NOCASE UNIQUE,password_hash TEXT NOT NULL,password_salt TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('super_admin','finance','support','viewer')),totp_secret_encrypted TEXT,totp_enabled INTEGER NOT NULL DEFAULT 0,disabled_at INTEGER,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS admin_sessions(token_hash TEXT PRIMARY KEY,admin_id TEXT NOT NULL REFERENCES admin_users(id) ON DELETE CASCADE,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,ip TEXT NOT NULL DEFAULT '',user_agent TEXT NOT NULL DEFAULT '',reauth_at INTEGER);
+      CREATE INDEX IF NOT EXISTS admin_sessions_admin_exp_idx ON admin_sessions(admin_id,expires_at);
+      CREATE TABLE IF NOT EXISTS admin_login_attempts(id TEXT PRIMARY KEY,email TEXT NOT NULL,ip TEXT NOT NULL,success INTEGER NOT NULL,created_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS admin_login_attempts_lookup_idx ON admin_login_attempts(email,ip,created_at DESC);
+      CREATE TABLE IF NOT EXISTS admin_recovery_codes(id TEXT PRIMARY KEY,admin_id TEXT NOT NULL REFERENCES admin_users(id) ON DELETE CASCADE,code_hash TEXT NOT NULL,used_at INTEGER,created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS admin_audit_log(id TEXT PRIMARY KEY,admin_id TEXT,admin_role TEXT NOT NULL DEFAULT '',action TEXT NOT NULL,target_type TEXT NOT NULL DEFAULT '',target_id TEXT NOT NULL DEFAULT '',ip TEXT NOT NULL DEFAULT '',user_agent TEXT NOT NULL DEFAULT '',before_json TEXT,after_json TEXT,reason TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS admin_audit_created_idx ON admin_audit_log(created_at DESC);
+      CREATE INDEX IF NOT EXISTS admin_audit_target_idx ON admin_audit_log(target_type,target_id,created_at DESC);
+      CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY,name TEXT NOT NULL,slug TEXT NOT NULL UNIQUE,description TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','active','hidden','archived')),sort_order INTEGER NOT NULL DEFAULT 0,trial_days INTEGER NOT NULL DEFAULT 0,badge_text TEXT NOT NULL DEFAULT '',sample_values INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS plan_prices(id TEXT PRIMARY KEY,plan_id TEXT NOT NULL REFERENCES plans(id),billing_cycle TEXT NOT NULL CHECK(billing_cycle IN ('monthly','yearly')),amount_minor INTEGER NOT NULL CHECK(amount_minor>=0),currency TEXT NOT NULL,effective_from INTEGER NOT NULL,version INTEGER NOT NULL,created_by TEXT,created_at INTEGER NOT NULL,UNIQUE(plan_id,billing_cycle,version));
+      CREATE INDEX IF NOT EXISTS plan_prices_current_idx ON plan_prices(plan_id,billing_cycle,effective_from DESC);
+      CREATE TABLE IF NOT EXISTS plan_limits(plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,limit_key TEXT NOT NULL,value INTEGER,unlimited INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL,PRIMARY KEY(plan_id,limit_key));
+      CREATE TABLE IF NOT EXISTS plan_features(plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,feature_key TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL,PRIMARY KEY(plan_id,feature_key));
+      CREATE TABLE IF NOT EXISTS cost_rates(id TEXT PRIMARY KEY,event_type TEXT NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL DEFAULT '',unit TEXT NOT NULL,unit_cost_minor INTEGER NOT NULL CHECK(unit_cost_minor>=0),currency TEXT NOT NULL,effective_from INTEGER NOT NULL,created_by TEXT,created_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS cost_rates_effective_idx ON cost_rates(event_type,provider,model,effective_from DESC);
+      CREATE TABLE IF NOT EXISTS price_rates(id TEXT PRIMARY KEY,event_type TEXT NOT NULL,feature TEXT NOT NULL DEFAULT '',unit TEXT NOT NULL,unit_price_minor INTEGER NOT NULL CHECK(unit_price_minor>=0),currency TEXT NOT NULL,effective_from INTEGER NOT NULL,created_by TEXT,created_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS price_rates_effective_idx ON price_rates(event_type,feature,effective_from DESC);
+      CREATE TABLE IF NOT EXISTS usage_events(id TEXT PRIMARY KEY,idempotency_key TEXT UNIQUE,organization_id TEXT NOT NULL REFERENCES organizations(id),site_id TEXT,event_type TEXT NOT NULL,provider TEXT NOT NULL DEFAULT '',feature TEXT NOT NULL DEFAULT '',quantity INTEGER NOT NULL,unit TEXT NOT NULL,status TEXT NOT NULL DEFAULT '',category TEXT NOT NULL DEFAULT '',tokens_input INTEGER,tokens_output INTEGER,tokens_total INTEGER,latency_ms INTEGER,estimated INTEGER NOT NULL DEFAULT 0,unit_cost_minor INTEGER NOT NULL DEFAULT 0,unit_price_minor INTEGER NOT NULL DEFAULT 0,cost_minor INTEGER NOT NULL DEFAULT 0,price_minor INTEGER NOT NULL DEFAULT 0,currency TEXT NOT NULL,model TEXT NOT NULL DEFAULT '',ref_type TEXT NOT NULL DEFAULT '',ref_id TEXT NOT NULL DEFAULT '',metadata_json TEXT NOT NULL DEFAULT '{}',created_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS usage_events_org_date_idx ON usage_events(organization_id,created_at);
+      CREATE INDEX IF NOT EXISTS usage_events_type_date_idx ON usage_events(event_type,created_at);
+      CREATE TABLE IF NOT EXISTS usage_rollups_daily(organization_id TEXT NOT NULL REFERENCES organizations(id),day TEXT NOT NULL,event_type TEXT NOT NULL,feature TEXT NOT NULL DEFAULT '',quantity INTEGER NOT NULL,cost_minor INTEGER NOT NULL,price_minor INTEGER NOT NULL,currency TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(organization_id,day,event_type,feature,currency));
+      CREATE TABLE IF NOT EXISTS usage_rollups_monthly(organization_id TEXT NOT NULL REFERENCES organizations(id),month TEXT NOT NULL,event_type TEXT NOT NULL,feature TEXT NOT NULL DEFAULT '',quantity INTEGER NOT NULL,cost_minor INTEGER NOT NULL,price_minor INTEGER NOT NULL,currency TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(organization_id,month,event_type,feature,currency));
+      CREATE TABLE IF NOT EXISTS organization_resource_snapshots(organization_id TEXT NOT NULL REFERENCES organizations(id),day TEXT NOT NULL,workers INTEGER NOT NULL,sites INTEGER NOT NULL,active_users INTEGER NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(organization_id,day));
+      CREATE TABLE IF NOT EXISTS subscriptions(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),plan_id TEXT NOT NULL REFERENCES plans(id),status TEXT NOT NULL CHECK(status IN ('trialing','active','past_due','suspended','cancelled','expired')),billing_cycle TEXT NOT NULL CHECK(billing_cycle IN ('monthly','yearly')),price_minor INTEGER NOT NULL,currency TEXT NOT NULL,current_period_start INTEGER NOT NULL,current_period_end INTEGER NOT NULL,trial_end INTEGER,cancel_at_period_end INTEGER NOT NULL DEFAULT 0,grace_end INTEGER,limits_override_json TEXT NOT NULL DEFAULT '{}',price_override_minor INTEGER,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS subscriptions_org_status_idx ON subscriptions(organization_id,status);
+      CREATE INDEX IF NOT EXISTS subscriptions_period_idx ON subscriptions(status,current_period_end);
+      CREATE TABLE IF NOT EXISTS subscription_events(id TEXT PRIMARY KEY,subscription_id TEXT NOT NULL REFERENCES subscriptions(id),organization_id TEXT NOT NULL REFERENCES organizations(id),event_type TEXT NOT NULL,from_status TEXT,to_status TEXT,details_json TEXT NOT NULL DEFAULT '{}',reason TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS invoices(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),subscription_id TEXT,invoice_number TEXT NOT NULL UNIQUE,status TEXT NOT NULL CHECK(status IN ('draft','open','paid','void','uncollectible')),currency TEXT NOT NULL,subtotal_minor INTEGER NOT NULL,tax_minor INTEGER NOT NULL,total_minor INTEGER NOT NULL,amount_paid_minor INTEGER NOT NULL DEFAULT 0,issued_at INTEGER NOT NULL,due_at INTEGER,paid_at INTEGER,billing_details_json TEXT NOT NULL DEFAULT '{}',created_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS invoices_org_date_idx ON invoices(organization_id,issued_at DESC);
+      CREATE TABLE IF NOT EXISTS invoice_lines(id TEXT PRIMARY KEY,invoice_id TEXT NOT NULL REFERENCES invoices(id),description TEXT NOT NULL,line_type TEXT NOT NULL,quantity INTEGER NOT NULL,unit_amount_minor INTEGER NOT NULL,amount_minor INTEGER NOT NULL,metadata_json TEXT NOT NULL DEFAULT '{}');
+      CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY,invoice_id TEXT NOT NULL REFERENCES invoices(id),organization_id TEXT NOT NULL REFERENCES organizations(id),adapter TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('pending','succeeded','rejected','failed','refunded')),amount_minor INTEGER NOT NULL,currency TEXT NOT NULL,transaction_ref TEXT NOT NULL DEFAULT '',proof_ref TEXT NOT NULL DEFAULT '',verified_by TEXT,verified_at INTEGER,created_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS payments_org_date_idx ON payments(organization_id,created_at DESC);
+      CREATE TABLE IF NOT EXISTS refunds(id TEXT PRIMARY KEY,payment_id TEXT NOT NULL REFERENCES payments(id),amount_minor INTEGER NOT NULL,currency TEXT NOT NULL,reason TEXT NOT NULL,created_by TEXT NOT NULL,created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS credit_notes(id TEXT PRIMARY KEY,invoice_id TEXT NOT NULL REFERENCES invoices(id),amount_minor INTEGER NOT NULL,currency TEXT NOT NULL,reason TEXT NOT NULL,created_by TEXT NOT NULL,created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS billing_settings(setting_key TEXT PRIMARY KEY,value_json TEXT NOT NULL,updated_by TEXT,updated_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS coupons(id TEXT PRIMARY KEY,code TEXT NOT NULL UNIQUE,discount_type TEXT NOT NULL CHECK(discount_type IN ('percent','fixed')),discount_value INTEGER NOT NULL,applies_to_json TEXT NOT NULL DEFAULT '[]',duration TEXT NOT NULL CHECK(duration IN ('once','repeating','forever')),duration_months INTEGER,valid_from INTEGER,valid_until INTEGER,max_redemptions INTEGER,redemption_count INTEGER NOT NULL DEFAULT 0,active INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS coupon_redemptions(id TEXT PRIMARY KEY,coupon_id TEXT NOT NULL REFERENCES coupons(id),organization_id TEXT NOT NULL REFERENCES organizations(id),subscription_id TEXT NOT NULL REFERENCES subscriptions(id),created_at INTEGER NOT NULL,UNIQUE(coupon_id,organization_id));
+      CREATE TABLE IF NOT EXISTS expenses(id TEXT PRIMARY KEY,category TEXT NOT NULL,description TEXT NOT NULL,amount_minor INTEGER NOT NULL,currency TEXT NOT NULL,expense_date TEXT NOT NULL,recurring INTEGER NOT NULL DEFAULT 0,notes TEXT NOT NULL DEFAULT '',created_by TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS admin_job_runs(id TEXT PRIMARY KEY,job_key TEXT NOT NULL,status TEXT NOT NULL,started_at INTEGER NOT NULL,finished_at INTEGER,error_code TEXT NOT NULL DEFAULT '',details_json TEXT NOT NULL DEFAULT '{}');
+      CREATE INDEX IF NOT EXISTS admin_job_runs_key_date_idx ON admin_job_runs(job_key,started_at DESC);
+      CREATE TABLE IF NOT EXISTS announcements(id TEXT PRIMARY KEY,title TEXT NOT NULL,body TEXT NOT NULL,target_json TEXT NOT NULL DEFAULT '{}',starts_at INTEGER NOT NULL,ends_at INTEGER,active INTEGER NOT NULL DEFAULT 1,created_by TEXT NOT NULL,created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS admin_notes(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id),admin_id TEXT NOT NULL REFERENCES admin_users(id),note TEXT NOT NULL,created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS admin_bootstrap_state(id INTEGER PRIMARY KEY CHECK(id=1),completed_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS organization_billing_details(organization_id TEXT PRIMARY KEY REFERENCES organizations(id),legal_name TEXT NOT NULL DEFAULT '',address TEXT NOT NULL DEFAULT '',tax_id TEXT NOT NULL DEFAULT '',updated_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS soft_delete_records(id TEXT PRIMARY KEY,entity_type TEXT NOT NULL,entity_id TEXT NOT NULL,organization_id TEXT NOT NULL,deleted_by TEXT NOT NULL,reason TEXT NOT NULL,deleted_at INTEGER NOT NULL,UNIQUE(entity_type,entity_id));
+      INSERT OR IGNORE INTO plans(id,name,slug,description,status,sort_order,trial_days,sample_values,created_at,updated_at) VALUES
+        ('sample-basic','Basic','basic','Editable sample plan. Set your real prices and limits.','hidden',10,0,1,0,0),
+        ('sample-pro','Pro','pro','Editable sample plan. Set your real prices and limits.','hidden',20,0,1,0,0),
+        ('sample-promax','ProMax','promax','Editable sample plan. Set your real prices and limits.','hidden',30,0,1,0,0),
+        ('legacy-default','Legacy','legacy','Hidden zero-price migration plan; review and replace per organization.','hidden',0,0,0,0,0);
+      INSERT OR IGNORE INTO plan_prices(id,plan_id,billing_cycle,amount_minor,currency,effective_from,version,created_at) VALUES
+        ('sample-basic-monthly','sample-basic','monthly',0,'BDT',0,1,0),('sample-basic-yearly','sample-basic','yearly',0,'BDT',0,1,0),
+        ('sample-pro-monthly','sample-pro','monthly',0,'BDT',0,1,0),('sample-pro-yearly','sample-pro','yearly',0,'BDT',0,1,0),
+        ('sample-promax-monthly','sample-promax','monthly',0,'BDT',0,1,0),('sample-promax-yearly','sample-promax','yearly',0,'BDT',0,1,0),
+        ('legacy-monthly','legacy-default','monthly',0,'BDT',0,1,0),('legacy-yearly','legacy-default','yearly',0,'BDT',0,1,0);
+      INSERT OR IGNORE INTO billing_settings(setting_key,value_json,updated_at) VALUES
+        ('currency','"BDT"',0),('tax_rate_bps','0',0),('prices_include_tax','false',0),('invoice_prefix','"JG-"',0),('invoice_next_sequence','1',0),('grace_period_days','7',0),('safety_alerts_exempt_from_limits','true',0),('default_plan_id','"legacy-default"',0),('payment_instructions','"Configure manual payment instructions in admin settings."',0);
+      INSERT OR IGNORE INTO plan_limits(plan_id,limit_key,value,unlimited,updated_at) VALUES
+        ('legacy-default','workers',NULL,1,0),('legacy-default','sites',NULL,1,0),('legacy-default','users',NULL,1,0),('legacy-default','sms_segments_month',NULL,1,0),('legacy-default','ai_tokens_month',NULL,1,0),('legacy-default','voice_minutes_month',NULL,1,0),('legacy-default','weather_checks_month',NULL,1,0),('legacy-default','retention_days',NULL,1,0);
+      INSERT OR IGNORE INTO plan_limits(plan_id,limit_key,value,unlimited,updated_at) VALUES
+        ('sample-basic','workers',10,0,0),('sample-basic','sites',2,0,0),('sample-basic','users',2,0,0),('sample-basic','sms_segments_month',300,0,0),('sample-basic','ai_tokens_month',100000,0,0),('sample-basic','voice_minutes_month',0,0,0),('sample-basic','weather_checks_month',1000,0,0),('sample-basic','retention_days',30,0,0),
+        ('sample-pro','workers',50,0,0),('sample-pro','sites',10,0,0),('sample-pro','users',5,0,0),('sample-pro','sms_segments_month',2000,0,0),('sample-pro','ai_tokens_month',1000000,0,0),('sample-pro','voice_minutes_month',120,0,0),('sample-pro','weather_checks_month',10000,0,0),('sample-pro','retention_days',90,0,0),
+        ('sample-promax','workers',500,0,0),('sample-promax','sites',100,0,0),('sample-promax','users',50,0,0),('sample-promax','sms_segments_month',50000,0,0),('sample-promax','ai_tokens_month',25000000,0,0),('sample-promax','voice_minutes_month',10000,0,0),('sample-promax','weather_checks_month',250000,0,0),('sample-promax','retention_days',365,0,0);
+      INSERT OR IGNORE INTO plan_features(plan_id,feature_key,enabled,updated_at)
+        SELECT p.id,f.feature_key,0,0 FROM plans p CROSS JOIN (
+          SELECT 'ai_chat' AS feature_key UNION ALL SELECT 'ai_alert_automation' UNION ALL SELECT 'simulator' UNION ALL SELECT 'voice_alerts' UNION ALL SELECT 'csv_import' UNION ALL SELECT 'data_export' UNION ALL SELECT 'break_planner' UNION ALL SELECT 'nowcasting' UNION ALL SELECT 'heat_triage' UNION ALL SELECT 'ai_reports' UNION ALL SELECT 'official_advisories' UNION ALL SELECT 'priority_support' UNION ALL SELECT 'api_access' UNION ALL SELECT 'custom_branding'
+        ) f;
+      INSERT OR IGNORE INTO subscriptions(id,organization_id,plan_id,status,billing_cycle,price_minor,currency,current_period_start,current_period_end,created_at,updated_at)
+        SELECT 'legacy-'||o.id,o.id,'legacy-default','active','monthly',0,'BDT',unixepoch(),253402300799,unixepoch(),unixepoch() FROM organizations o;
     `,
   },
 ];

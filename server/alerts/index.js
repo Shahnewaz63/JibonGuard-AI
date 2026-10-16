@@ -21,7 +21,8 @@ export async function decideAlerts(contexts, { config = ALERT_CONFIG, aiClient =
     let chosen;
     if (aiControlsAllAlerts && !weatherStale) {
       // A successful AI cycle chooses whether each consented worker receives an alert.
-      chosen = [aiDecision || { action: 'skip', alert_type: 'water', template_id: 'water', channel: 'sms', reason: 'AI did not select this worker for an alert.', floor: false }];
+      const optional = aiDecision && aiDecision.action !== 'skip' && !floor.some(item => item.alert_type === aiDecision.alert_type) ? [aiDecision] : [];
+      chosen = [...floor, ...optional];
     } else {
       // Deterministic rules remain the fallback when AI is off, unavailable, or weather is stale.
       chosen = [...floor];
@@ -29,7 +30,7 @@ export async function decideAlerts(contexts, { config = ALERT_CONFIG, aiClient =
     }
     const history = getHistory(context.worker.id, context);
     const limited = enforceGuardrails(chosen, context, history, config, context.now || new Date(), { aiControlled: aiControlsAllAlerts && !weatherStale });
-    if (!limited.length) limited.push({ action: 'skip', final_status: 'skipped', alert_type: 'heat_nudge', channel: 'sms', reason: weatherStale ? 'Weather data is delayed; optional alert suppressed.' : ai.status === 'fallback' ? 'AI unavailable; no deterministic rule triggered.' : 'No additional alert was warranted.', floor: false });
+    if (!limited.length) limited.push({ action: 'skip', final_status: 'skipped', alert_type: 'heat_nudge', channel: 'sms', reason: !(context.worker.consentStatus === 'consented' || context.worker.consentAt) ? 'Worker has not accepted alert consent.' : weatherStale ? 'Weather data is delayed; optional alert suppressed.' : ai.status === 'fallback' ? 'AI unavailable; no deterministic rule triggered.' : 'No additional alert was warranted.', floor: false });
     for (const decision of limited) results.push({ workerId: context.worker.id, siteId: context.site.id, ...decision, templateId: decision.template_id || decision.alert_type, variables: { ...(decision.variables || {}), level: decision.level || context.rule.riskLevel }, message: renderAlertTemplate(decision.template_id || decision.alert_type, { ...(decision.variables || {}), minutes: Math.max(0, Math.round(Number(context.weather.rainEtaMinutes ?? decision.variables?.minutes ?? 0))), level: context.rule.riskLevel }), reason: decision.reason || 'Rule-based safety decision.', floor: Boolean(decision.floor), inputHash: context.hash, modelOutput: weatherStale ? null : ai.modelOutput, aiStatus: weatherStale ? 'stale' : ai.status, createdAt: (context.now || new Date()).toISOString() });
   }
   return { decisions: results, modelOutput: ai.modelOutput, aiStatus: ai.status };
