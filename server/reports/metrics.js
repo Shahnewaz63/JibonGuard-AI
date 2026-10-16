@@ -1,4 +1,4 @@
-export function buildSafetyFacts({ alerts = [], breaks = [], acknowledgements = null, triage = [], advisories = [], nowcasts = [], heatReadings = [], period = {} } = {}) {
+export function buildSafetyFacts({ alerts = [], breaks = [], acknowledgements = null, triage = [], nowcasts = [], heatReadings = [], period = {} } = {}) {
   const by = (items, key) => items.reduce((out, item) => { const value = String(item[key] || 'unknown'); out[value] = (out[value] || 0) + 1; return out; }, {});
   const sent = alerts.filter(item => item.status === 'sent').length;
   const knownDelivery = alerts.filter(item => ['sent', 'failed'].includes(item.status)).length;
@@ -13,7 +13,6 @@ export function buildSafetyFacts({ alerts = [], breaks = [], acknowledgements = 
     break_reminders_sent: breaks.length,
     break_acknowledgements: acknowledgements === null ? 'not available' : acknowledgements.length,
     nowcast: { evaluated: nowcasts.filter(item => item.actual_rain !== null || item.actual_apparent_c !== null).length },
-    official_advisories_active: advisories.filter(item => item.active).length,
     triage_counts_by_severity: by(triage, 'severity'),
     data_quality_notes: [],
   };

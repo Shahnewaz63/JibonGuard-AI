@@ -4,7 +4,6 @@ import { DatabaseSync } from 'node:sqlite';
 import { runMigrations } from './db/migrations.js';
 import { classifySymptoms, redactTriageText } from './triage/rules.js';
 import { makeNowcastFeatures, inferNowcast } from './nowcast/features.js';
-import { parseCapXml, advisoryMatchesSite, officialHeatFloor } from './advisories/cap.js';
 import { buildSafetyFacts, deterministicFindings, narrativeNumbersAreSupported } from './reports/metrics.js';
 import { createJobRunner } from './jobs/runner.js';
 import { createGeminiClient } from './ai/geminiClient.js';
@@ -14,9 +13,11 @@ test('versioned migration is additive and idempotent', () => {
   db.exec('CREATE TABLE organizations(id TEXT PRIMARY KEY); CREATE TABLE workers(id TEXT PRIMARY KEY); CREATE TABLE sites(id TEXT PRIMARY KEY);');
   runMigrations(db, { development: false, clock: () => 100 });
   runMigrations(db, { development: false, clock: () => 200 });
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get().n, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get().n, 2);
   assert.equal(db.prepare('PRAGMA table_info(sites)').all().some(row => row.name === 'emergency_contact_phone'), true);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='ai_calls'").get().n, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='official_advisories'").get().n, 0);
+  assert.equal(db.prepare('PRAGMA table_info(workers)').all().some(row => row.name === 'voice_first'), false);
   db.close();
 });
 
@@ -42,16 +43,6 @@ test('nowcast feature windows and inference are deterministic with fallback', ()
   assert.equal(fallback.heat_crossing_60m, true);
   const artifact = { version: 'test', trained_at: '2026-01-01T00:00:00Z', models: { rain: { intercept: 0, weights: {} }, temperature_30m: { intercept: 32, weights: {} }, temperature_60m: { intercept: 35, weights: {} } }, thresholds: { rain: 0.4 } };
   assert.deepEqual(inferNowcast(features, artifact, { now: Date.parse('2026-06-01'), heatTriggerC: 34 }), inferNowcast(features, artifact, { now: Date.parse('2026-06-01'), heatTriggerC: 34 }));
-});
-
-test('CAP parser handles multiple affected areas, expiry, matching and monotonic heat floor', () => {
-  const xml = `<alert><identifier>bd-1</identifier><sent>2026-10-14T08:00:00Z</sent><info><event>Heat Wave</event><severity>Severe</severity><onset>2026-10-14T09:00:00Z</onset><expires>2026-10-16T09:00:00Z</expires><headline>Heat alert</headline><description>Heat warning</description><area><areaDesc>Dhaka, Gazipur</areaDesc></area><area><areaDesc>Khulna</areaDesc></area></info></alert>`;
-  const [advisory] = parseCapXml(xml, { now: Date.parse('2026-10-14T10:00:00Z') });
-  assert.deepEqual(advisory.areas, ['Dhaka, Gazipur', 'Khulna']);
-  assert.equal(advisoryMatchesSite(advisory, { division: 'Dhaka', district: 'Dhaka' }), true);
-  assert.equal(officialHeatFloor('moderate', 'Extreme'), 'Extreme');
-  assert.throws(() => parseCapXml(xml, { now: Date.parse('2026-10-17T00:00:00Z') }), /expired/);
-  assert.throws(() => parseCapXml('<!DOCTYPE x [<!ENTITY e SYSTEM "file:///x">]><alert/>'), /forbidden/);
 });
 
 test('report facts remain deterministic and hallucinated numbers are rejected', () => {

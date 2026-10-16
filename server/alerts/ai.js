@@ -13,12 +13,12 @@ export async function callAlertAi(contexts, config, fetchImpl = fetch) {
   const system = await promptCache;
   const anonymousIds = contexts.map((_, index) => `subject_${index + 1}`);
   const contents = contexts.map((context, index) => ({
-    worker: { id: anonymousIds[index], jobType: context.worker.jobType, workload: context.worker.workload, shiftStart: context.worker.shiftStart, shiftEnd: context.worker.shiftEnd, newWorker: context.worker.newWorker, channelPreference: context.worker.channelPreference, voiceFirst: context.worker.voiceFirst, ageGroup: context.worker.ageGroup, hasPersonalRiskFactor: Boolean(context.worker.hasPersonalRiskFactor) },
-    state: context.state, site: context.site, weather: context.weather, rule: context.rule,
+    worker: { id: anonymousIds[index], jobType: context.worker.jobType, workload: context.worker.workload, shiftStart: context.worker.shiftStart, shiftEnd: context.worker.shiftEnd, newWorker: context.worker.newWorker },
+    state: context.state, site: context.site, weather: context.weather,
     limits: context.limits,
   }));
   const client = createGeminiClient({ apiKey: config.apiKey, model: config.model, db: config.db, fetchImpl, timeoutMs: config.timeoutMs, retries: config.retryCount });
-  const response = await client({ feature: 'alert_decision', promptVersion: 'alert-decision-v1', system, payload: contents, organizationId: config.organizationId, maxOutputTokens: 1600, validate: parsed => {
+  const response = await client({ feature: 'alert_decision', promptVersion: 'alert-decision-v2', system, payload: contents, organizationId: config.organizationId, maxOutputTokens: 8192, validate: parsed => {
     try { validateAiOutput(parsed, anonymousIds); return true; } catch { return false; }
   } });
   if (!response.ok) return { decisions: [], modelOutput: { error: response.error }, status: 'fallback', input: JSON.stringify(contents) };

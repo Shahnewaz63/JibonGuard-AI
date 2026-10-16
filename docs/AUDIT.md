@@ -19,7 +19,6 @@ There is no versioned migration framework. A live SQLite schema inspection was n
 
 - Alert logic is split among `server/alerts/config.js`, `index.js`, `decision.js`, `templates.js`, `gateway.js`, and `ai.js`.
 - Organization alert settings are stored in `alert_settings` as JSON plus enabled flags. `automated_alerts` stores decisions and delivery state, including a decision input context and whether a deterministic floor applied.
-- Deterministic rules are evaluated alongside optional Gemini decisions; validated Bangla templates are rendered and grouped for dispatch. Consent is checked before routine worker delivery. SMS dispatch uses TextBee; optional voice dispatch can fall back to SMS.
 - Inbound SMS history is synchronized from TextBee by the authenticated `/api/sms` route and by a server polling loop. Incoming digit-only emergency messages are matched to worker phone/site and trigger the existing site emergency behavior. Emergency codes accept English and Bangla digits. The SMS polling and emergency parser live in `server.js`.
 - Worker registration messages include emergency instructions. No acknowledgement/check-in keyword flow or symptom triage flow exists yet.
 
@@ -28,7 +27,6 @@ There is no versioned migration framework. A live SQLite schema inspection was n
 - Weather and geocoding integrations are implemented in `server.js` using Open-Meteo and Photon/Nominatim.
 - Gemini use is currently split between dashboard chat/break suggestions in `server.js` and alert decisions in `server/alerts/ai.js`; there is no shared AI client or `ai_calls` audit table.
 - Alert automation is controlled by environment configuration and organization settings. A periodic server timer evaluates sites, queues decisions, and dispatches due records. Alert tests cover decision and guardrail behavior in `server/alerts/automation.test.js`.
-- There is no shared job runner, persistent job-run status, nowcast model/training pipeline, official advisory ingestion, medical triage, or generated safety report pipeline.
 
 ## Security and data scope
 

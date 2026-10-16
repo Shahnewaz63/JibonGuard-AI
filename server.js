@@ -1,6 +1,6 @@
 import express from 'express';
 import { DatabaseSync } from 'node:sqlite';
-import { createHash, createHmac, randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomInt, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
@@ -11,7 +11,6 @@ import { renderAlertTemplate } from './server/alerts/templates.js';
 import { dispatchAlertGroups } from './server/alerts/gateway.js';
 import { runMigrations } from './server/db/migrations.js';
 import { createJobRunner } from './server/jobs/runner.js';
-import { advisoryMatchesSite, officialHeatFloor } from './server/advisories/cap.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 for (const line of (existsSync(path.join(__dirname, '.env')) ? readFileSync(path.join(__dirname, '.env'), 'utf8') : '').split(/\r?\n/)) {
@@ -30,6 +29,7 @@ const SESSION_COOKIE = 'jg_session';
 const CSRF_COOKIE = 'jg_csrf';
 const SESSION_LIFETIME = 12 * 60 * 60;
 const REMEMBER_LIFETIME = 30 * 24 * 60 * 60;
+const OTP_RESEND_COOLDOWN_SECONDS = 60;
 const TOKEN_LIFETIME = 60 * 60;
 const PASSWORD_MIN = 12;
 const DB_PATH = process.env.JIBONGUARD_DB || path.join(__dirname, 'jibonguard.sqlite3');
@@ -38,6 +38,7 @@ if (IS_PRODUCTION && (!PUBLIC_ORIGIN.startsWith('https://') || !new URL(PUBLIC_O
 if (IS_PRODUCTION && (!process.env.SMTP_HOST || !(process.env.SMTP_FROM || process.env.SMTP_USER))) throw new Error('Set SMTP_HOST and SMTP_FROM (or SMTP_USER) in production.');
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite').trim();
+const GEMINI_TTS_MODEL = (process.env.GEMINI_TTS_MODEL || 'gemini-3.8-flash-lite-tts').trim();
 const OPEN_METEO_API_KEY = (process.env.OPEN_METEO_API_KEY || '').trim();
 const BREAK_ALERTS = { break: 'Water and shade break', rain: 'Rain safety alert', storm: 'Storm safety alert', earthquake: 'Earthquake safety alert' };
 const BANGLA_DIGITS = '\u09e6\u09e7\u09e8\u09e9\u09ea\u09eb\u09ec\u09ed\u09ee\u09ef';
@@ -51,6 +52,8 @@ CREATE TABLE IF NOT EXISTS organizations(id TEXT PRIMARY KEY,name TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,full_name TEXT NOT NULL,email TEXT NOT NULL COLLATE NOCASE UNIQUE,phone TEXT NOT NULL,password_hash TEXT NOT NULL,password_salt TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('organization_owner')),email_verified_at INTEGER,privacy_notice_version TEXT NOT NULL,privacy_consent_at INTEGER NOT NULL,created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS action_tokens(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,purpose TEXT NOT NULL CHECK(purpose IN ('verify_email','reset_password')),expires_at INTEGER NOT NULL,created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS auth_otp_challenges(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,purpose TEXT NOT NULL CHECK(purpose IN ('signup','login')),otp_hash TEXT NOT NULL,expires_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,remember INTEGER NOT NULL DEFAULT 0,next_path TEXT NOT NULL DEFAULT '/dashboard.html',created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS auth_otp_user_idx ON auth_otp_challenges(user_id,purpose,created_at DESC);
 CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id); CREATE INDEX IF NOT EXISTS sessions_exp_idx ON sessions(expires_at); CREATE INDEX IF NOT EXISTS action_tokens_user_idx ON action_tokens(user_id);
 CREATE TABLE IF NOT EXISTS workers(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,name TEXT NOT NULL,phone TEXT NOT NULL,site TEXT NOT NULL,job_type TEXT NOT NULL,workload TEXT NOT NULL DEFAULT 'Standard',risk_level TEXT NOT NULL DEFAULT 'Moderate',outdoor_minutes INTEGER NOT NULL DEFAULT 0,last_break TEXT NOT NULL DEFAULT '',consent_at INTEGER,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sites(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,name TEXT NOT NULL,address TEXT NOT NULL DEFAULT '',latitude REAL,longitude REAL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(organization_id,name));
@@ -58,6 +61,8 @@ CREATE TABLE IF NOT EXISTS worker_consent_events(id TEXT PRIMARY KEY,organizatio
 CREATE INDEX IF NOT EXISTS consent_worker_idx ON worker_consent_events(organization_id,worker_id,changed_at DESC); CREATE INDEX IF NOT EXISTS workers_org_idx ON workers(organization_id,created_at);
 CREATE TABLE IF NOT EXISTS break_logs(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,title TEXT NOT NULL,site TEXT NOT NULL,break_date TEXT NOT NULL,break_time TEXT NOT NULL,duration_minutes INTEGER NOT NULL,worker_count INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'logged' CHECK(status IN ('logged','scheduled')),source TEXT NOT NULL DEFAULT 'manual' CHECK(source IN ('manual','ai')),alert_type TEXT NOT NULL DEFAULT 'break',ai_rationale TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS break_logs_org_idx ON break_logs(organization_id,break_date DESC,break_time DESC);
+CREATE TABLE IF NOT EXISTS scheduled_break_sms(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,break_id TEXT NOT NULL REFERENCES break_logs(id) ON DELETE CASCADE,worker_id TEXT,workload TEXT NOT NULL DEFAULT '',recipient TEXT NOT NULL,message TEXT NOT NULL,scheduled_at INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'scheduled' CHECK(status IN ('scheduled','sending','sent','failed')),created_at INTEGER NOT NULL,sent_at INTEGER,error TEXT NOT NULL DEFAULT '');
+CREATE INDEX IF NOT EXISTS scheduled_break_sms_due_idx ON scheduled_break_sms(status,scheduled_at);
 CREATE TABLE IF NOT EXISTS sms_messages(id TEXT NOT NULL,organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,direction TEXT NOT NULL CHECK(direction IN ('sent','received')),sender TEXT NOT NULL DEFAULT '',recipient TEXT NOT NULL DEFAULT '',message TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'unknown',device_name TEXT NOT NULL DEFAULT '',message_at TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(organization_id,id));
 CREATE INDEX IF NOT EXISTS sms_messages_org_date_idx ON sms_messages(organization_id,message_at DESC);
 CREATE TABLE IF NOT EXISTS sms_sync_state(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -68,13 +73,20 @@ CREATE INDEX IF NOT EXISTS automated_alerts_dispatch_idx ON automated_alerts(sta
 `);
 for (const [table, column, declaration] of [
   ['workers', 'site_id', 'TEXT'], ['workers', 'consent_method', "TEXT NOT NULL DEFAULT ''"],
-  ['workers', 'shift_start', "TEXT NOT NULL DEFAULT '07:00'"], ['workers', 'shift_end', "TEXT NOT NULL DEFAULT '17:00'"], ['workers', 'channel_preference', "TEXT NOT NULL DEFAULT 'sms'"], ['workers', 'voice_first', 'INTEGER NOT NULL DEFAULT 0'], ['workers', 'age_group', "TEXT NOT NULL DEFAULT ''"], ['workers', 'has_personal_risk_factor', 'INTEGER NOT NULL DEFAULT 0'],
+  ['workers', 'shift_start', "TEXT NOT NULL DEFAULT '07:00'"], ['workers', 'shift_end', "TEXT NOT NULL DEFAULT '17:00'"], ['workers', 'age_group', "TEXT NOT NULL DEFAULT ''"], ['workers', 'has_personal_risk_factor', 'INTEGER NOT NULL DEFAULT 0'],
   ['sites', 'shade_available', 'INTEGER NOT NULL DEFAULT 0'], ['sites', 'water_available', 'INTEGER NOT NULL DEFAULT 0'], ['sites', 'rest_area', 'INTEGER NOT NULL DEFAULT 0'],
-  ['break_logs', 'source', "TEXT NOT NULL DEFAULT 'manual'"], ['break_logs', 'alert_type', "TEXT NOT NULL DEFAULT 'break'"], ['break_logs', 'ai_rationale', "TEXT NOT NULL DEFAULT ''"],
+  ['break_logs', 'source', "TEXT NOT NULL DEFAULT 'manual'"], ['break_logs', 'alert_type', "TEXT NOT NULL DEFAULT 'break'"], ['break_logs', 'ai_rationale', "TEXT NOT NULL DEFAULT ''"], ['break_logs', 'workload_levels', "TEXT NOT NULL DEFAULT '[]'"],
+  ['scheduled_break_sms', 'worker_id', 'TEXT'], ['scheduled_break_sms', 'workload', "TEXT NOT NULL DEFAULT ''"],
   ['sms_messages', 'emergency_status', "TEXT NOT NULL DEFAULT ''"],
 ]) {
   const columns = db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name);
   if (!columns.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`);
+}
+const retiredWorkload=['Very','Heavy'].join(' ');
+db.prepare("UPDATE workers SET workload='Heavy' WHERE workload=?").run(retiredWorkload);
+db.prepare("UPDATE scheduled_break_sms SET workload='Heavy' WHERE workload=?").run(retiredWorkload);
+for(const row of db.prepare('SELECT id,workload_levels FROM break_logs').all()){
+  try{const levels=JSON.parse(row.workload_levels||'[]');if(Array.isArray(levels)&&levels.includes(retiredWorkload)){const normalized=[...new Set(levels.map(level=>level===retiredWorkload?'Heavy':level).filter(level=>['Light','Standard','Heavy'].includes(level)))];db.prepare('UPDATE break_logs SET workload_levels=? WHERE id=?').run(JSON.stringify(normalized),row.id);}}catch{}
 }
 runMigrations(db, { databasePath: DB_PATH, development: !IS_PRODUCTION });
 const jobRunner = createJobRunner({ db });
@@ -94,9 +106,20 @@ const GEO_CACHE = new Map();
 const RATE_LIMITS = new Map();
 const ALERT_WEATHER_CACHE = new Map();
 const ALERT_WEATHER_STATUS = new Map();
+const SITE_TIMEZONES = new Map();
 const now = () => Math.floor(Date.now() / 1000);
 const token = (bytes = 24) => randomBytes(bytes).toString('base64url');
 const hashToken = value => SESSION_SECRET ? createHmac('sha256', SESSION_SECRET).update(value).digest('hex') : createHash('sha256').update(value).digest('hex');
+function issueAuthOtp(userId,purpose,remember=false,nextPath='/dashboard.html') {
+  const id=token(24),code=String(randomInt(0,1_000_000)).padStart(6,'0'),stamp=now();
+  db.prepare('DELETE FROM auth_otp_challenges WHERE user_id=? AND purpose=?').run(userId,purpose);
+  db.prepare('INSERT INTO auth_otp_challenges(id,user_id,purpose,otp_hash,expires_at,attempts,remember,next_path,created_at) VALUES(?,?,?,?,?,0,?,?,?)').run(id,userId,purpose,hashToken(`${id}:${code}`),stamp+600,remember?1:0,safeNext(nextPath),stamp);
+  return {challengeId:id,code};
+}
+async function emailAuthOtp(user,challenge,purpose) {
+  const action=purpose==='signup'?'verify your email and finish creating your account':'finish signing in';
+  await sendEmail(user.email,purpose==='signup'?'Verify your JibonGuard account':'Your JibonGuard sign-in code',`Hello ${user.full_name},\n\nYour one-time code to ${action} is: ${challenge.code}\n\nThis code expires in 10 minutes. If you did not request it, you can ignore this email.`);
+}
 const rateAllowed = (req, key, limit = 5, windowSeconds = 900) => {
   const address = req.ip || req.socket.remoteAddress || 'unknown';
   const id = `${key}:${address}`, cutoff = Date.now() - windowSeconds * 1000;
@@ -168,7 +191,7 @@ app.use((req, res, next) => {
   if (IS_PRODUCTION) res.set('Strict-Transport-Security', 'max-age=31536000');
   next();
 });
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '15mb' }));
 app.use((req, res, next) => { if (!req.path.startsWith('/api/')) console.log(`${req.method} ${req.path}`); next(); });
 
 app.get('/api/auth/csrf', (req, res) => {
@@ -177,8 +200,8 @@ app.get('/api/auth/csrf', (req, res) => {
   res.set('Cache-Control', 'no-store').json({ csrf_token: csrf.value });
 });
 app.get('/api/health', (_req, res) => res.set('Cache-Control', 'no-store').json({ ok: true, service: 'jibonguard-api' }));
-const FEATURE_MASTERS = Object.freeze({ nowcast: process.env.NOWCAST_ENABLED === 'true', breakPlanner: process.env.SMART_BREAK_SCHEDULER_ENABLED === 'true', triage: process.env.TRIAGE_ENABLED === 'true', aiTriage: process.env.AI_TRIAGE_ENABLED === 'true', reports: process.env.AI_SAFETY_REPORTS_ENABLED === 'true', officialAdvisories: process.env.OFFICIAL_ADVISORIES_ENABLED !== 'false' });
-const featureDefaults = Object.freeze({ nowcast: false, breakPlanner: false, triage: false, aiTriage: false, reports: false, officialAdvisories: false });
+const FEATURE_MASTERS = Object.freeze({ nowcast: process.env.NOWCAST_ENABLED === 'true', breakPlanner: process.env.SMART_BREAK_SCHEDULER_ENABLED === 'true', triage: process.env.TRIAGE_ENABLED === 'true', aiTriage: process.env.AI_TRIAGE_ENABLED === 'true', reports: process.env.AI_SAFETY_REPORTS_ENABLED === 'true' });
+const featureDefaults = Object.freeze({ nowcast: false, breakPlanner: false, triage: false, aiTriage: false, reports: false });
 function orgFeatures(organizationId) {
   let saved = {};
   try { saved = JSON.parse(db.prepare('SELECT settings_json FROM org_ai_features WHERE organization_id=?').get(organizationId)?.settings_json || '{}'); } catch { /* fail closed to defaults */ }
@@ -198,34 +221,9 @@ app.put('/api/features', csrfAndOrigin, requireUser, (req, res) => {
 });
 app.get('/api/system/health', requireUser, (req, res) => {
   const org = req.user.organization_id;
-  const jobs = db.prepare('SELECT job_key,status,started_at,finished_at,error_code FROM job_runs WHERE organization_id=? OR organization_id IS NULL ORDER BY started_at DESC LIMIT 30').all(org);
-  const feed = db.prepare('SELECT feed_key,last_success_at,last_error,items_fetched,updated_at FROM official_feed_status ORDER BY feed_key').all();
-  const aiCalls = db.prepare('SELECT feature,prompt_version,ok,fallback,latency_ms,created_at FROM ai_calls WHERE organization_id=? ORDER BY created_at DESC LIMIT 20').all(org);
-  res.set('Cache-Control', 'no-store').json({ features: orgFeatures(org), jobs, feeds: feed, ai_calls: aiCalls });
-});
-app.get('/api/advisories', requireUser, (req, res) => {
-  const org = req.user.organization_id, stamp = now();
-  const advisories = db.prepare('SELECT id,source,external_id,hazard,severity,areas_json,issued_at,valid_from,valid_to,headline,body,source_url,created_at FROM official_advisories WHERE organization_id=? ORDER BY valid_from DESC LIMIT 200').all(org).map(row => ({ ...row, areas: JSON.parse(row.areas_json), active: row.valid_from <= stamp && row.valid_to > stamp }));
-  const sites = db.prepare('SELECT id,name,address,division,district FROM sites WHERE organization_id=?').all(org);
-  const matches = advisories.filter(item => item.active).flatMap(advisory => sites.filter(site => advisoryMatchesSite(advisory, site)).map(site => ({ advisory_id: advisory.id, site_id: site.id, site: site.name, heat_floor: advisory.hazard.includes('heat') ? officialHeatFloor(advisory.severity) : null })));
-  res.set('Cache-Control', 'no-store').json({ advisories, matches });
-});
-app.post('/api/advisories', csrfAndOrigin, requireUser, (req, res) => {
-  const org = req.user.organization_id, d = req.body || {};
-  if (!FEATURE_MASTERS.officialAdvisories) return sendError(res, 503, 'Official advisory entry is disabled by the server master switch.');
-  if (!orgFeatures(org).officialAdvisories) return sendError(res, 403, 'Enable official advisories in the organization feature settings first.');
-  if (!rateAllowed(req, 'advisory-entry', 20, 3600)) return sendError(res, 429, 'Official advisory entry is being used too quickly.');
-  const source = String(d.source || '').trim().slice(0, 100), sourceUrl = String(d.source_url || '').trim().slice(0, 1000), hazard = String(d.hazard || '').trim().toLowerCase(), severity = String(d.severity || '').trim().toLowerCase();
-  const areas = Array.isArray(d.areas) ? [...new Set(d.areas.map(item => String(item).trim()).filter(Boolean))].slice(0, 30) : [];
-  const issuedAt = Date.parse(d.issued_at), validFrom = Date.parse(d.valid_from), validTo = Date.parse(d.valid_to), headline = String(d.headline || '').trim().slice(0, 240), body = String(d.body || '').trim().slice(0, 4000);
-  if (!source || !/^https:\/\//i.test(sourceUrl) || !['heatwave', 'rain', 'lightning', 'cyclone', 'other'].includes(hazard) || !['mild', 'moderate', 'severe', 'very_severe'].includes(severity) || !areas.length || !Number.isFinite(issuedAt) || !Number.isFinite(validFrom) || !Number.isFinite(validTo) || validTo <= validFrom || validTo < now() * 1000 || !headline) return sendError(res, 400, 'Provide a source URL, hazard, severity, affected areas, headline, and valid time range.');
-  const externalId = String(d.external_id || '').trim().slice(0, 200) || null, id = token(12), raw = JSON.stringify({ manual: true }), contentHash = createHash('sha256').update(JSON.stringify({ source, hazard, severity, areas, issuedAt, validFrom, validTo, headline, body })).digest('hex');
-  const duplicate = db.prepare('SELECT id FROM official_advisories WHERE organization_id=? AND content_hash=?').get(org, contentHash);
-  if (duplicate) return res.status(200).json({ id: duplicate.id, duplicate: true });
-  try {
-    db.prepare('INSERT INTO official_advisories(id,organization_id,source,external_id,content_hash,hazard,severity,areas_json,issued_at,valid_from,valid_to,headline,body,source_url,raw_json,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id, org, source, externalId, contentHash, hazard, severity, JSON.stringify(areas), Math.floor(issuedAt / 1000), Math.floor(validFrom / 1000), Math.floor(validTo / 1000), headline, body, sourceUrl, raw, now(), req.user.id);
-  } catch (error) { if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return sendError(res, 409, 'An advisory with this source ID already exists.'); throw error; }
-  res.status(201).json({ id, duplicate: false });
+  const jobs = db.prepare('SELECT id,organization_id,job_key,status,started_at,finished_at,error_code FROM job_runs WHERE organization_id=? OR organization_id IS NULL ORDER BY started_at DESC LIMIT 30').all(org);
+  const aiCalls = db.prepare('SELECT id,feature,prompt_version,ok,fallback,latency_ms,created_at FROM ai_calls WHERE organization_id=? ORDER BY created_at DESC LIMIT 20').all(org);
+  res.set('Cache-Control', 'no-store').json({ features: orgFeatures(org), jobs, ai_calls: aiCalls });
 });
 app.get('/api/auth/me', requireUser, (req, res) => res.set('Cache-Control', 'no-store').json({ authenticated: true, user: req.user }));
 app.get('/api/workers', requireUser, (req, res) => {
@@ -236,14 +234,16 @@ app.get('/api/sites', requireUser, (req, res) => res.json({ sites: db.prepare('S
 app.get('/api/breaks', requireUser, (req, res) => {
   const date = String(req.query.date || '');
   if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) return sendError(res, 400, 'Enter a valid date.');
-  const records = db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at FROM break_logs WHERE organization_id=? ORDER BY break_date DESC,break_time DESC,created_at DESC').all(req.user.organization_id);
+  const records = db.prepare(`SELECT b.id,b.title,b.site,b.break_date,b.break_time,b.duration_minutes,b.worker_count,b.status,b.source,b.alert_type,b.ai_rationale,b.workload_levels,b.created_at,
+    (SELECT CASE WHEN SUM(q.status='scheduled')>0 THEN 'queued' WHEN SUM(q.status='sending')>0 THEN 'sending' WHEN SUM(q.status='failed')>0 THEN 'failed' WHEN SUM(q.status='sent')>0 THEN 'sent' ELSE 'none' END FROM scheduled_break_sms q WHERE q.break_id=b.id) AS sms_status
+    FROM break_logs b WHERE b.organization_id=? ORDER BY b.break_date DESC,b.break_time DESC,b.created_at DESC`).all(req.user.organization_id);
   res.json({ breaks: records, total: records.length, date_total: date ? records.filter(row => row.break_date === date && row.status === 'logged').length : 0 });
 });
 const defaultAlertSettings=()=>({enabled:false,aiEnabled:false,baseHeatTriggerC:ALERT_CONFIG.baseHeatTriggerC,workloadOffsets:{...ALERT_CONFIG.workloadOffsets},rainLeadMinutes:ALERT_CONFIG.rainLeadMinutes,rainProbability:ALERT_CONFIG.rainProbability,cooldownMinutes:ALERT_CONFIG.cooldownMinutes,dailyCap:ALERT_CONFIG.dailyCap,quietHours:{...ALERT_CONFIG.quietHours}});
-function alertSettingsFor(org){const row=db.prepare('SELECT settings_json,enabled,ai_enabled FROM alert_settings WHERE organization_id=?').get(org);let saved={};try{saved=JSON.parse(row?.settings_json||'{}');}catch{}return {...defaultAlertSettings(),...saved,enabled:Boolean(row?.enabled),aiEnabled:Boolean(row?.ai_enabled)&&ALERT_CONFIG.aiEnabled,workloadOffsets:{...ALERT_CONFIG.workloadOffsets,...(saved.workloadOffsets||{})},quietHours:{...ALERT_CONFIG.quietHours,...(saved.quietHours||{})}};}
+function alertSettingsFor(org){const row=db.prepare('SELECT settings_json,enabled,ai_enabled FROM alert_settings WHERE organization_id=?').get(org);let saved={};try{saved=JSON.parse(row?.settings_json||'{}');}catch{}const workloadOffsets=Object.fromEntries(Object.keys(ALERT_CONFIG.workloadOffsets).map(level=>[level,saved.workloadOffsets?.[level]??ALERT_CONFIG.workloadOffsets[level]]));return {...defaultAlertSettings(),...saved,enabled:Boolean(row?.enabled),aiEnabled:Boolean(row?.ai_enabled)&&ALERT_CONFIG.aiEnabled,workloadOffsets,quietHours:{...ALERT_CONFIG.quietHours,...(saved.quietHours||{})}};}
 function sanitizeAlertSettings(input,base=defaultAlertSettings()){
   const n=(value,fallback,min,max)=>Number.isFinite(Number(value))?Math.min(max,Math.max(min,Number(value))):fallback;
-  const offsets={};for(const level of ['Light','Standard','Heavy','Very Heavy'])offsets[level]=n(input.workloadOffsets?.[level],base.workloadOffsets[level],0,10);
+  const offsets={};for(const level of ['Light','Standard','Moderate','Heavy'])offsets[level]=n(input.workloadOffsets?.[level],base.workloadOffsets[level],0,10);
   const clock=value=>/^([01]\d|2[0-3]):[0-5]\d$/.test(String(value||''))?String(value):null;
   return {enabled:input.enabled===true,aiEnabled:input.aiEnabled===true,baseHeatTriggerC:n(input.baseHeatTriggerC,base.baseHeatTriggerC,28,42),workloadOffsets:offsets,rainLeadMinutes:n(input.rainLeadMinutes,base.rainLeadMinutes,15,360),rainProbability:n(input.rainProbability,base.rainProbability,1,100),cooldownMinutes:n(input.cooldownMinutes,base.cooldownMinutes,1,1440),dailyCap:n(input.dailyCap,base.dailyCap,1,100),quietHours:{start:clock(input.quietHours?.start)||base.quietHours.start,end:clock(input.quietHours?.end)||base.quietHours.end}};
 }
@@ -273,7 +273,11 @@ app.post('/api/alerts/simulate',csrfAndOrigin,requireUser,async(req,res)=>{
 });
 app.get('/api/sms', requireUser, async (req, res) => {
   const apiKey = (process.env.TEXTBEE_API_KEY || process.env.TEXTBEE_DEV_API || '').trim();
-  if (!apiKey) return res.set('Cache-Control','no-store').json({messages:[],configured:false,synced:0,message:'TextBee is not configured.'});
+  const queuedMessages=()=>db.prepare(`SELECT 'break-queue-'||q.id AS id,'sent' AS direction,'' AS sender,q.recipient,q.message,
+    CASE q.status WHEN 'scheduled' THEN 'queued' WHEN 'sending' THEN 'sending' ELSE q.status END AS status,
+    '' AS device_name,datetime(q.scheduled_at,'unixepoch')||'Z' AS message_at
+    FROM scheduled_break_sms q WHERE q.organization_id=? ORDER BY q.scheduled_at DESC LIMIT 250`).all(req.user.organization_id);
+  if (!apiKey) return res.set('Cache-Control','no-store').json({messages:queuedMessages(),configured:false,synced:0,message:'TextBee is not configured.'});
   const base = (process.env.TEXTBEE_BASE_URL || 'https://api.textbee.dev/api/v1').replace(/\/$/,'');
   if (!base.startsWith('https://')) return sendError(res, 503, 'TextBee must use an HTTPS API URL.');
   try {
@@ -290,6 +294,7 @@ app.get('/api/sms', requireUser, async (req, res) => {
       return [normalizePhone(ascii),digits.length>=10?digits.slice(-10):null].filter(Boolean);
     };
     const numbers = new Set(workers.flatMap(row=>phoneKeys(row.phone)));
+    const hiddenMessageIds=new Set(db.prepare('SELECT id FROM sms_deleted_messages WHERE organization_id=?').all(req.user.organization_id).map(row=>row.id));
     const upsert = db.prepare(`INSERT INTO sms_messages(id,organization_id,direction,sender,recipient,message,status,device_name,message_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(organization_id,id) DO UPDATE SET status=excluded.status,message=excluded.message,message_at=excluded.message_at`);
     let synced=0,receivedMatched=0;
     const sentMessages=(Array.isArray(sentResult.data)?sentResult.data:[]).map(item=>({...item,direction:'sent'}));
@@ -298,21 +303,21 @@ app.get('/api/sms', requireUser, async (req, res) => {
       const sender=String(item.sender||''), recipient=String(item.recipient||'');
       const direction=item.direction;
       const matched=phoneKeys(direction==='received'?sender:recipient).some(phone=>numbers.has(phone));
-      if (!matched || !item._id || !['sent','received'].includes(direction)) continue;
+      if (!matched || !item._id || !['sent','received'].includes(direction) || hiddenMessageIds.has(String(item._id))) continue;
       const stamp = direction==='received'?(item.receivedAt||item.createdAt):(item.sentAt||item.requestedAt||item.createdAt);
       upsert.run(String(item._id),req.user.organization_id,direction,sender,recipient,String(item.message||''),String(item.status||'unknown'),String(item.device?.name||''),stamp||new Date().toISOString(),now()); synced++;
       if(direction==='received')receivedMatched++;
     }
-    const messages=db.prepare('SELECT id,direction,sender,recipient,message,status,device_name,message_at FROM sms_messages WHERE organization_id=? ORDER BY message_at DESC LIMIT 250').all(req.user.organization_id);
+    const messages=[...db.prepare('SELECT id,direction,sender,recipient,message,status,device_name,message_at FROM sms_messages WHERE organization_id=? ORDER BY message_at DESC LIMIT 250').all(req.user.organization_id),...queuedMessages()].sort((a,b)=>Date.parse(b.message_at)-Date.parse(a.message_at)).slice(0,250);
     res.set('Cache-Control','no-store').json({messages,configured:true,synced,receivedFromTextbee:receivedMessages.length,receivedMatched});
   } catch { return sendError(res,502,'Could not reach TextBee. Try syncing again shortly.'); }
 });
 app.get('/api/privacy/export', requireUser, (req, res) => {
   const organization = db.prepare('SELECT name,organization_type,phone,address,estimated_workers,created_at FROM organizations WHERE id=?').get(req.user.organization_id);
   const privacy = db.prepare('SELECT privacy_notice_version,privacy_consent_at,created_at FROM users WHERE id=?').get(req.user.id);
-  const workers = db.prepare('SELECT id,name,phone,site,site_id,job_type,workload,risk_level,shift_start,shift_end,channel_preference,voice_first,age_group,has_personal_risk_factor,outdoor_minutes,last_break,consent_at,consent_method,created_at,updated_at FROM workers WHERE organization_id=? ORDER BY name COLLATE NOCASE').all(req.user.organization_id);
+  const workers = db.prepare('SELECT id,name,phone,site,site_id,job_type,workload,risk_level,shift_start,shift_end,age_group,has_personal_risk_factor,outdoor_minutes,last_break,consent_at,consent_method,created_at,updated_at FROM workers WHERE organization_id=? ORDER BY name COLLATE NOCASE').all(req.user.organization_id);
   const sites = db.prepare('SELECT id,name,address,latitude,longitude,shade_available,water_available,rest_area,created_at,updated_at FROM sites WHERE organization_id=? ORDER BY name COLLATE NOCASE').all(req.user.organization_id);
-  const break_logs = db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at FROM break_logs WHERE organization_id=? ORDER BY break_date DESC,break_time DESC').all(req.user.organization_id);
+  const break_logs = db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,workload_levels,created_at FROM break_logs WHERE organization_id=? ORDER BY break_date DESC,break_time DESC').all(req.user.organization_id);
   const sms_messages = db.prepare('SELECT id,direction,sender,recipient,message,status,device_name,message_at FROM sms_messages WHERE organization_id=? ORDER BY message_at DESC').all(req.user.organization_id);
   const worker_consent_events = db.prepare('SELECT worker_id,action,method,note,changed_by,changed_at FROM worker_consent_events WHERE organization_id=? ORDER BY changed_at DESC,rowid DESC').all(req.user.organization_id);
   res.set('Content-Disposition', 'attachment; filename=jibonguard-account-data.json').json({ account: req.user, organization, workers, sites, worker_consent_events, break_logs, sms_messages, privacy, exported_at: new Date().toISOString() });
@@ -331,28 +336,60 @@ app.post('/api/auth/signup', csrfAndOrigin, async (req, res) => {
   if (typeof password !== 'string' || password.length < PASSWORD_MIN || password.length > 128) return sendError(res, 400, `Use a password between ${PASSWORD_MIN} and 128 characters.`);
   if (d.privacy_consent !== true) return sendError(res, 400, 'Please review and accept the privacy notice and terms.');
   const ids = token(18), organizationId = token(18), stamp = now(), { passwordHash, passwordSalt } = await hashPassword(password);
+  let challenge;
   try {
     db.exec('BEGIN IMMEDIATE');
     db.prepare('INSERT INTO organizations(id,name,organization_type,phone,estimated_workers,created_at) VALUES(?,?,?,?,?,?)').run(organizationId, organization, type, phone, Number(workerCount), stamp);
     db.prepare(`INSERT INTO users(id,organization_id,full_name,email,phone,password_hash,password_salt,role,privacy_notice_version,privacy_consent_at,email_verified_at,created_at)
-      VALUES(?,?,?,?,?,?,?,'organization_owner','2026-10-01',?,?,?)`).run(ids, organizationId, name, email, phone, passwordHash, passwordSalt, stamp, stamp, stamp);
+      VALUES(?,?,?,?,?,?,?,'organization_owner','2026-10-01',?,NULL,?)`).run(ids, organizationId, name, email, phone, passwordHash, passwordSalt, stamp, stamp);
+    challenge=issueAuthOtp(ids,'signup');
     db.exec('COMMIT');
-    res.status(201).json({ message: 'Account created. You can sign in now.' });
-  } catch (error) { db.exec('ROLLBACK'); if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return sendError(res, 409, 'An account with these details already exists.'); throw error; }
+  } catch (error) { try{db.exec('ROLLBACK');}catch{} if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return sendError(res, 409, 'An account with these details already exists.'); throw error; }
+  try { await emailAuthOtp({email,full_name:name},challenge,'signup'); }
+  catch { db.prepare('DELETE FROM organizations WHERE id=?').run(organizationId); return sendError(res,502,'We could not deliver the verification code, so the account was not created. Check the SMTP settings and try again.'); }
+  res.status(201).json({ otp_required:true,purpose:'signup',challenge_id:challenge.challengeId,email,resend_after:OTP_RESEND_COOLDOWN_SECONDS,message:'We emailed a 6-digit verification code. Enter it to finish creating your account.' });
 });
 
 app.post('/api/auth/login', csrfAndOrigin, async (req, res) => {
+  if (!rateAllowed(req, 'login', 8)) return sendError(res, 429, 'Too many sign-in attempts. Please try again later.');
   const email = String(req.body.email || '').trim().toLowerCase(), password = req.body.password;
   if (email.length > 254 || typeof password !== 'string' || password.length > 128) return sendError(res, 400, 'Enter a valid email and password.');
   const user = db.prepare('SELECT * FROM users WHERE email=?').get(email);
   if (!user) { await hashPassword(password || 'invalid-password'); return sendError(res, 401, 'Email or password is incorrect.'); }
   if (!(await checkPassword(password, user.password_hash, user.password_salt))) return sendError(res, 401, 'Email or password is incorrect.');
-  const remember = req.body.remember === true, lifetime = remember ? REMEMBER_LIFETIME : SESSION_LIFETIME, opaque = token(32), cookie = parseCookies(req)[SESSION_COOKIE];
-  if (cookie) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(cookie));
-  db.prepare('INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)').run(hashToken(opaque), user.id, now(), now() + lifetime);
-  const csrf = token(32);
-  res.cookie(SESSION_COOKIE, opaque, cookieOptions(true, lifetime)); res.cookie(CSRF_COOKIE, csrf, cookieOptions(false, REMEMBER_LIFETIME));
-  res.json({ message: 'Signed in.', csrf_token: csrf, next: safeNext(req.body.next) });
+  const purpose=user.email_verified_at?'login':'signup',challenge=issueAuthOtp(user.id,purpose,req.body.remember===true,req.body.next||'/dashboard.html');
+  try { await emailAuthOtp(user,challenge,purpose); }
+  catch (error) { db.prepare('DELETE FROM auth_otp_challenges WHERE id=?').run(challenge.challengeId); console.error('Login OTP delivery failed:', JSON.stringify({ code: error.code, command: error.command, responseCode: error.responseCode })); return sendError(res,502,'We could not send a one-time code. Check the server SMTP log for the delivery reason, then try again.'); }
+  res.json({otp_required:true,purpose,challenge_id:challenge.challengeId,email:user.email,resend_after:OTP_RESEND_COOLDOWN_SECONDS,message:purpose==='signup'?'This account still needs email verification. We sent a verification code.':'We emailed a 6-digit sign-in code.'});
+});
+app.post('/api/auth/verify-otp', csrfAndOrigin, (req,res)=>{
+  if(!rateAllowed(req,'verify-otp',10))return sendError(res,429,'Too many code attempts. Please try again later.');
+  const id=String(req.body.challenge_id||''),code=String(req.body.code||'').trim();
+  if(!/^[A-Za-z0-9_-]{24,64}$/.test(id)||!/^\d{6}$/.test(code))return sendError(res,400,'Enter the 6-digit code from your email.');
+  const challenge=db.prepare('SELECT c.*,u.email_verified_at FROM auth_otp_challenges c JOIN users u ON u.id=c.user_id WHERE c.id=?').get(id);
+  if(!challenge||challenge.expires_at<now())return sendError(res,400,'That code expired. Request a new one and try again.');
+  if(challenge.attempts>=5)return sendError(res,429,'Too many incorrect codes. Request a new code.');
+  if(hashToken(`${id}:${code}`)!==challenge.otp_hash){const attempts=challenge.attempts+1;db.prepare('UPDATE auth_otp_challenges SET attempts=? WHERE id=?').run(attempts,id);return sendError(res,attempts>=5?429:400,attempts>=5?'Too many incorrect codes. Request a new code.':'The code is incorrect. Check the email and try again.');}
+  db.prepare('DELETE FROM auth_otp_challenges WHERE id=?').run(id);
+  if(challenge.purpose==='signup') db.prepare('UPDATE users SET email_verified_at=? WHERE id=?').run(now(),challenge.user_id);
+  else if(!challenge.email_verified_at)return sendError(res,400,'Verify your email before signing in.');
+  const remember=Boolean(challenge.remember),lifetime=remember?REMEMBER_LIFETIME:SESSION_LIFETIME,opaque=token(32),cookie=parseCookies(req)[SESSION_COOKIE];
+  if(cookie)db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(cookie));
+  db.prepare('INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)').run(hashToken(opaque),challenge.user_id,now(),now()+lifetime);
+  const csrf=token(32);res.cookie(SESSION_COOKIE,opaque,cookieOptions(true,lifetime));res.cookie(CSRF_COOKIE,csrf,cookieOptions(false,REMEMBER_LIFETIME));
+  res.json({message:challenge.purpose==='signup'?'Email verified. Your account is ready.':'Signed in.',csrf_token:csrf,next:safeNext(challenge.next_path)});
+});
+app.post('/api/auth/resend-otp',csrfAndOrigin,async(req,res)=>{
+  if(!rateAllowed(req,'resend-otp',4))return sendError(res,429,'Too many code requests. Please try again later.');
+  const id=String(req.body.challenge_id||''),email=String(req.body.email||'').trim().toLowerCase();
+  const prior=db.prepare('SELECT c.*,u.email,u.full_name,u.email_verified_at FROM auth_otp_challenges c JOIN users u ON u.id=c.user_id WHERE c.id=? AND u.email=? COLLATE NOCASE AND c.created_at>=?').get(id,email,now()-86400);
+  if(!prior)return sendError(res,400,'This code request can no longer be renewed. Start sign-in again.');
+  if(prior.purpose==='signup'&&prior.email_verified_at)return sendError(res,400,'Email is already verified. Return to sign in.');
+  const resendAfter=Math.max(0,OTP_RESEND_COOLDOWN_SECONDS-(now()-prior.created_at));
+  if(resendAfter>0)return res.status(429).json({error:`Please wait ${resendAfter} seconds before requesting another code.`,resend_after:resendAfter});
+  const challenge=issueAuthOtp(prior.user_id,prior.purpose,Boolean(prior.remember),prior.next_path);
+  try{await emailAuthOtp(prior,challenge,prior.purpose);}catch{db.prepare('DELETE FROM auth_otp_challenges WHERE id=?').run(challenge.challengeId);return sendError(res,502,'We could not send a new code. Check the SMTP settings and try again.');}
+  res.json({challenge_id:challenge.challengeId,resend_after:OTP_RESEND_COOLDOWN_SECONDS,message:'A new 6-digit code has been sent.'});
 });
 app.post('/api/auth/logout', csrfAndOrigin, (req, res) => {
   const opaque = parseCookies(req)[SESSION_COOKIE];
@@ -384,13 +421,16 @@ app.post('/api/auth/forgot', csrfAndOrigin, async (req, res) => {
 });
 app.post('/api/auth/resend-verification', csrfAndOrigin, async (req, res) => {
   if (!rateAllowed(req, 'resend-verification', 5)) return sendError(res, 429, 'Too many requests. Please try again later.');
-  const email = String(req.body.email || '').trim().toLowerCase(), result = { message: 'If that address has an account awaiting verification, a new one-time link will be sent.' };
+  const email = String(req.body.email || '').trim().toLowerCase(), result = { message: 'If that address has an account awaiting verification, a new code will be sent.' };
   if (email.length <= 254 && /^[^\s@]{1,64}@[^ @.]+(?:\.[^ @.]+)+$/.test(email)) {
     const user = db.prepare('SELECT id,full_name FROM users WHERE email=? AND email_verified_at IS NULL').get(email);
     if (user) {
-      const secret = issueActionToken(user.id, 'verify_email'), link = `${appOrigin(req)}/verify.html?token=${encodeURIComponent(secret)}`;
-      await sendEmail(email, 'Verify your JibonGuard email', `Hello ${user.full_name},\n\nUse this new one-time link to verify your email address:\n${link}\n\nIt expires in one hour.`);
-      if (!IS_PRODUCTION) result.development_action_url = link;
+      const previous=db.prepare("SELECT created_at FROM auth_otp_challenges WHERE user_id=? AND purpose='signup' ORDER BY created_at DESC LIMIT 1").get(user.id);
+      const resendAfter=previous?Math.max(0,OTP_RESEND_COOLDOWN_SECONDS-(now()-previous.created_at)):0;
+      if(resendAfter>0)return res.status(429).json({error:`Please wait ${resendAfter} seconds before requesting another code.`,resend_after:resendAfter});
+      const challenge=issueAuthOtp(user.id,'signup');
+      try{await emailAuthOtp({...user,email},challenge,'signup');}catch{db.prepare('DELETE FROM auth_otp_challenges WHERE id=?').run(challenge.challengeId);return sendError(res,502,'We could not send a new code. Check the SMTP settings and try again.');}
+      Object.assign(result,{otp_required:true,purpose:'signup',challenge_id:challenge.challengeId,email,resend_after:OTP_RESEND_COOLDOWN_SECONDS,message:'We emailed a new 6-digit verification code.'});
     }
   }
   res.json(result);
@@ -404,7 +444,7 @@ app.post('/api/auth/reset', csrfAndOrigin, async (req, res) => {
   if (!row) return sendError(res, 400, 'This reset link is invalid or expired. Request a new one.');
   const { passwordHash, passwordSalt } = await hashPassword(password);
   db.prepare('UPDATE users SET password_hash=?,password_salt=? WHERE id=?').run(passwordHash, passwordSalt, row.user_id);
-  db.prepare('DELETE FROM action_tokens WHERE user_id=?').run(row.user_id); db.prepare('DELETE FROM sessions WHERE user_id=?').run(row.user_id);
+  db.prepare('DELETE FROM action_tokens WHERE user_id=?').run(row.user_id); db.prepare('DELETE FROM sessions WHERE user_id=?').run(row.user_id);db.prepare('DELETE FROM auth_otp_challenges WHERE user_id=?').run(row.user_id);
   res.json({ message: 'Password updated. Sign in using your new password.' });
 });
 app.post('/api/privacy/delete-account', csrfAndOrigin, requireUser, async (req, res) => {
@@ -428,8 +468,46 @@ async function sendEmail(recipient, subject, body) {
   }
   const { default: nodemailer } = await import('nodemailer');
   const port = Number(process.env.SMTP_PORT || 587);
-  const transport = nodemailer.createTransport({ host, port, secure: port === 465, ...(process.env.SMTP_USER && process.env.SMTP_PASSWORD ? { auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD } } : {}) });
-  await transport.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to: recipient, subject, text: body });
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('SMTP_PORT must be a valid port number.');
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASSWORD) throw new Error('SMTP_USER and SMTP_PASSWORD are required for SMTP delivery.');
+  if (!from) throw new Error('Set SMTP_FROM to a verified sender address.');
+
+  const transport = nodemailer.createTransport({
+    host,
+    port,
+    secure: port === 465,
+    requireTLS: port === 587,
+    connectionTimeout: 15000,
+    greetingTimeout: 10000,
+    socketTimeout: 20000,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
+  });
+  try {
+    const result = await transport.sendMail({ from, to: recipient, subject, text: body });
+    const accepted = Array.isArray(result.accepted) ? result.accepted : [];
+    const recipientAccepted = accepted.some(address => String(address).toLowerCase() === String(recipient).toLowerCase());
+    if (!recipientAccepted) {
+      const error = new Error('SMTP did not accept the message recipient.');
+      error.code = 'EENVELOPE';
+      error.command = 'RCPT TO';
+      error.responseCode = result.responseCode;
+      error.response = result.response;
+      error.rejectedCount = Array.isArray(result.rejected) ? result.rejected.length : 0;
+      throw error;
+    }
+    let relayResponse = String(result.response || '').replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[email]').replace(/[\r\n\t]+/g, ' ').slice(0, 240);
+    for (const secret of [process.env.SMTP_USER, process.env.SMTP_PASSWORD]) if (secret) relayResponse = relayResponse.split(secret).join('[redacted]');
+    console.info('SMTP accepted message:', JSON.stringify({ messageId: result.messageId, response: relayResponse || 'accepted by relay' }));
+  } catch (error) {
+    // Log provider diagnostics only; never include credentials, recipient, or message content.
+    let response = String(error.response || '').replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[email]').replace(/[\r\n\t]+/g, ' ').slice(0, 240);
+    for (const secret of [process.env.SMTP_USER, process.env.SMTP_PASSWORD]) if (secret) response = response.split(secret).join('[redacted]');
+    console.error('SMTP delivery failed:', JSON.stringify({ code: error.code, command: error.command, responseCode: error.responseCode, rejectedCount: error.rejectedCount, response }));
+    throw error;
+  } finally {
+    transport.close();
+  }
 }
 function normalizePhone(value) {
   const bangla = '০১২৩৪৫৬৭৮৯', normalized = String(value || '').replace(/[০-৯]/g, digit => String(bangla.indexOf(digit))).trim();
@@ -440,33 +518,52 @@ function normalizePhone(value) {
   if (digits.startsWith('880')) return `+${digits}`;
   return null;
 }
+function normalizeShiftTime(value, fallback) {
+  const raw=String(value||fallback).trim(),match=raw.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
+  if(!match)return raw;
+  let hour=Number(match[1]);const minute=Number(match[2]),meridiem=match[3]?.toUpperCase();
+  if(minute>59)return raw;
+  if(meridiem){if(hour<1||hour>12)return raw;hour=hour%12+(meridiem==='PM'?12:0);}else if(hour>23)return raw;
+  return `${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}`;
+}
 function workerValues(data, organizationId) {
   const banglaDigits = '০১২৩৪৫৬৭৮৯', name = String(data.name || '').trim(), phone = String(data.phone || '').replace(/[০-৯]/g, digit => String(banglaDigits.indexOf(digit))).trim();
   const siteId = String(data.site_id || '').trim(), legacySite = String(data.site || '').trim();
   const jobType = String(data.job_type || '').trim(), workload = String(data.workload || 'Standard').trim();
-  const shiftStart=String(data.shift_start||'07:00'),shiftEnd=String(data.shift_end||'17:00'),channelPreference=String(data.channel_preference||'sms'),ageGroup=String(data.age_group||'');
-  if (!name || name.length > 120 || !/^[+()0-9 .-]{7,24}$/.test(phone) || !jobType || jobType.length > 120 || !['Light','Standard','Heavy','Very Heavy'].includes(workload) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(shiftStart) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(shiftEnd) || !['sms','voice','sms+voice'].includes(channelPreference) || !['','under_18','18_40','over_40'].includes(ageGroup)) return null;
+  const shiftStart=normalizeShiftTime(data.shift_start,'07:00'),shiftEnd=normalizeShiftTime(data.shift_end,'17:00'),ageGroup=String(data.age_group||'').trim();
+  if (!name || name.length > 120 || !/^[+()0-9 .-]{7,24}$/.test(phone) || !jobType || jobType.length > 120 || !['Light','Standard','Heavy'].includes(workload) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(shiftStart) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(shiftEnd) || !['','under_18','18_40','over_40'].includes(ageGroup)) return null;
   const site = db.prepare('SELECT id,name FROM sites WHERE organization_id=? AND (id=? OR name=? COLLATE NOCASE)').get(organizationId, siteId, legacySite);
   if (!site) throw Object.assign(new Error('Choose a worksite from your saved Sites list. Create the site first if it is not listed.'), { status: 400 });
-  return { name, phone, siteId: site.id, site: site.name, jobType, workload, shiftStart, shiftEnd, channelPreference, voiceFirst: data.voice_first === 'on' || data.voice_first === true || data.voice_first === 1, ageGroup, hasPersonalRiskFactor: data.has_personal_risk_factor === 'on' || data.has_personal_risk_factor === true || data.has_personal_risk_factor === 1 };
+  return { name, phone, siteId: site.id, site: site.name, jobType, workload, shiftStart, shiftEnd, ageGroup, hasPersonalRiskFactor: data.has_personal_risk_factor === 'on' || data.has_personal_risk_factor === true || data.has_personal_risk_factor === 1 };
 }
 function siteValues(data) {
-  const name = String(data.name || '').trim(), address = String(data.address || '').trim(), latitudeRaw = String(data.latitude ?? '').trim(), longitudeRaw = String(data.longitude ?? '').trim(), latitude = Number(latitudeRaw), longitude = Number(longitudeRaw);
-  if (!name || name.length > 120 || address.length > 240 || !latitudeRaw || !longitudeRaw || !Number.isFinite(latitude) || !Number.isFinite(longitude) || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null;
-  const division = String(data.division || '').trim().slice(0, 80), district = String(data.district || '').trim().slice(0, 80), emergencyContactPhone = normalizePhone(data.emergency_contact_phone || '');
-  if (data.emergency_contact_phone && !emergencyContactPhone) return null;
+  const name = String(data.name || '').trim(), address = String(data.address || '').trim(), latitudeRaw = String(data.latitude ?? '').trim(), longitudeRaw = String(data.longitude ?? '').trim();
+  const hasLatitude=latitudeRaw!=='',hasLongitude=longitudeRaw!=='',latitude=hasLatitude?Number(latitudeRaw):null,longitude=hasLongitude?Number(longitudeRaw):null;
+  if (!name || name.length > 120 || address.length > 500 || hasLatitude!==hasLongitude || (hasLatitude&&(!Number.isFinite(latitude)||latitude < -90 || latitude > 90)) || (hasLongitude&&(!Number.isFinite(longitude)||longitude < -180 || longitude > 180))) return null;
+  const division = String(data.division || '').trim().slice(0, 80), district = String(data.district || '').trim().slice(0, 80), emergencyPhoneRaw=String(data.emergency_contact_phone||'').trim(),emergencyContactPhone=emergencyPhoneRaw?normalizePhone(emergencyPhoneRaw):'';
+  if (emergencyPhoneRaw && !emergencyContactPhone) return null;
   return { name, address, latitude, longitude, division, district, emergencyContactPhone, shadeAvailable: data.shade_available === 'on' || data.shade_available === true || data.shade_available === 1, waterAvailable: data.water_available === 'on' || data.water_available === true || data.water_available === 1, restArea: data.rest_area === 'on' || data.rest_area === true || data.rest_area === 1 };
+}
+function workerDuplicateKey(worker) {
+  const phone=normalizePhone(worker.phone)||String(worker.phone||'').replace(/[^0-9+]/g,'');
+  return JSON.stringify([String(worker.name||'').trim().replace(/\s+/g,' ').toLocaleLowerCase(),phone,String(worker.siteId||'').trim(),String(worker.jobType||'').trim().toLocaleLowerCase(),String(worker.workload||'').trim().toLocaleLowerCase(),String(worker.shiftStart||'').trim(),String(worker.shiftEnd||'').trim(),String(worker.ageGroup||'').trim().toLowerCase(),Boolean(worker.hasPersonalRiskFactor)]);
+}
+function assertWorkerIsNotDuplicate(worker, org, excludeId = '') {
+  const existing=db.prepare('SELECT id,name,phone,site_id AS siteId,job_type AS jobType,workload,shift_start AS shiftStart,shift_end AS shiftEnd,age_group AS ageGroup,has_personal_risk_factor AS hasPersonalRiskFactor FROM workers WHERE organization_id=?').all(org);
+  const duplicate=existing.find(item=>item.id!==excludeId&&workerDuplicateKey(item)===workerDuplicateKey(worker));
+  if(duplicate)throw Object.assign(new Error(`Duplicate worker entry: ${worker.name} is already listed at ${worker.site}.`),{status:409});
 }
 function addWorker(data, org, stamp = now()) {
   const values = workerValues(data, org);
   if (!values) throw Object.assign(new Error('Enter a name, valid phone, site, job type, and workload.'), { status: 400 });
+  assertWorkerIsNotDuplicate(values,org);
   const id = token(12);
-  db.prepare('INSERT INTO workers(id,organization_id,name,phone,site_id,site,job_type,workload,shift_start,shift_end,channel_preference,voice_first,age_group,has_personal_risk_factor,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id, org, values.name, values.phone, values.siteId, values.site, values.jobType, values.workload,values.shiftStart,values.shiftEnd,values.channelPreference,values.voiceFirst?1:0,values.ageGroup,values.hasPersonalRiskFactor?1:0, stamp, stamp);
+  db.prepare('INSERT INTO workers(id,organization_id,name,phone,site_id,site,job_type,workload,shift_start,shift_end,age_group,has_personal_risk_factor,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id, org, values.name, values.phone, values.siteId, values.site, values.jobType, values.workload,values.shiftStart,values.shiftEnd,values.ageGroup,values.hasPersonalRiskFactor?1:0, stamp, stamp);
   return db.prepare('SELECT * FROM workers WHERE id=?').get(id);
 }
 app.post('/api/workers', csrfAndOrigin, requireUser, async (req, res) => {
   try {
-    const worker=addWorker(req.body,req.user.organization_id),sms=await sendWorkerWelcomeSms(worker);
+    const worker=addWorker(req.body,req.user.organization_id),sms=await sendWorkerWelcomeSms(worker,req.user.organization_id);
     res.status(201).json({worker,sms});
   }
   catch (error) { sendError(res, error.status || (error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 409 : 400), error.message || 'Could not save worker.'); }
@@ -476,11 +573,21 @@ app.post('/api/workers/import', csrfAndOrigin, requireUser, async (req, res) => 
   if (!Array.isArray(rows) || !rows.length || rows.length > 500) return sendError(res, 400, 'Choose a CSV with between 1 and 500 worker rows.');
   try {
     const normalized = rows.map(row => workerValues(row, req.user.organization_id));
-    if (normalized.some(row => !row)) return sendError(res, 400, 'The CSV contains invalid worker data. Check name, phone, site, job type, and workload; no rows were imported.');
+    if (normalized.some(row => !row)) return sendError(res, 400, 'The CSV contains invalid worker data. Check name, phone, site, job type, workload, and shift times (use HH:mm or Excel times such as 7:00:00 AM); no rows were imported.');
     const stamp = now(),registered=[]; db.exec('BEGIN IMMEDIATE');
-    try { for (const row of normalized) { const id=token(12);db.prepare('INSERT INTO workers(id,organization_id,name,phone,site_id,site,job_type,workload,shift_start,shift_end,channel_preference,voice_first,age_group,has_personal_risk_factor,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id, req.user.organization_id, row.name, row.phone, row.siteId, row.site, row.jobType, row.workload,row.shiftStart,row.shiftEnd,row.channelPreference,row.voiceFirst?1:0,row.ageGroup,row.hasPersonalRiskFactor?1:0, stamp, stamp);registered.push({id,...row}); } db.exec('COMMIT'); }
+    try {
+      const keys=new Set();
+      for(const row of normalized){
+        const key=workerDuplicateKey(row);
+        if(keys.has(key))throw Object.assign(new Error(`Duplicate worker entry in CSV: ${row.name} is listed more than once at ${row.site}.`),{status:409});
+        keys.add(key);
+        assertWorkerIsNotDuplicate(row,req.user.organization_id);
+      }
+      for (const row of normalized) { const id=token(12);db.prepare('INSERT INTO workers(id,organization_id,name,phone,site_id,site,job_type,workload,shift_start,shift_end,age_group,has_personal_risk_factor,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id, req.user.organization_id, row.name, row.phone, row.siteId, row.site, row.jobType, row.workload,row.shiftStart,row.shiftEnd,row.ageGroup,row.hasPersonalRiskFactor?1:0, stamp, stamp);registered.push({id,...row}); }
+      db.exec('COMMIT');
+    }
     catch (error) { db.exec('ROLLBACK'); throw error; }
-    const sms=await sendWorkerWelcomeMessages(registered);
+    const sms=await sendWorkerWelcomeMessages(registered,req.user.organization_id);
     res.status(201).json({imported:normalized.length,sms});
   } catch (error) { sendError(res, error.status || 400, `${error.message || 'Invalid worker data.'} No rows were imported.`); }
 });
@@ -490,7 +597,8 @@ app.put('/api/workers', csrfAndOrigin, requireUser, (req, res) => {
   try {
     const values = workerValues(req.body, req.user.organization_id);
     if (!values) return sendError(res, 400, 'Enter a name, valid phone, site, job type, and workload.');
-    const result = db.prepare('UPDATE workers SET name=?,phone=?,site_id=?,site=?,job_type=?,workload=?,shift_start=?,shift_end=?,channel_preference=?,voice_first=?,age_group=?,has_personal_risk_factor=?,updated_at=? WHERE id=? AND organization_id=?').run(values.name, values.phone, values.siteId, values.site, values.jobType, values.workload,values.shiftStart,values.shiftEnd,values.channelPreference,values.voiceFirst?1:0,values.ageGroup,values.hasPersonalRiskFactor?1:0, now(), id, req.user.organization_id);
+    assertWorkerIsNotDuplicate(values,req.user.organization_id,id);
+    const result = db.prepare('UPDATE workers SET name=?,phone=?,site_id=?,site=?,job_type=?,workload=?,shift_start=?,shift_end=?,age_group=?,has_personal_risk_factor=?,updated_at=? WHERE id=? AND organization_id=?').run(values.name, values.phone, values.siteId, values.site, values.jobType, values.workload,values.shiftStart,values.shiftEnd,values.ageGroup,values.hasPersonalRiskFactor?1:0, now(), id, req.user.organization_id);
     if (!result.changes) return sendError(res, 404, 'Worker not found.');
     res.json({ worker: db.prepare('SELECT * FROM workers WHERE id=?').get(id) });
   } catch (error) { sendError(res, error.status || 400, error.message); }
@@ -515,30 +623,59 @@ app.post('/api/workers/consent', csrfAndOrigin, requireUser, (req, res) => {
 
 app.post('/api/sites', csrfAndOrigin, requireUser, (req, res) => {
   const values = siteValues(req.body);
-  if (!values) return sendError(res, 400, 'Enter a site name, address (optional), and valid latitude/longitude for weather.');
+  if (!values) return sendError(res, 400, 'Enter a worksite name (up to 120 characters), keep the address under 500 characters, and provide both valid coordinates if setting a map location.');
   const id = token(12), stamp = now();
   try {
     db.prepare('INSERT INTO sites(id,organization_id,name,address,latitude,longitude,division,district,emergency_contact_phone,shade_available,water_available,rest_area,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id, req.user.organization_id, values.name, values.address, values.latitude, values.longitude,values.division,values.district,values.emergencyContactPhone,values.shadeAvailable?1:0,values.waterAvailable?1:0,values.restArea?1:0, stamp, stamp);
     res.status(201).json({ site: db.prepare('SELECT id,name,address,latitude,longitude,division,district,emergency_contact_phone,shade_available,water_available,rest_area,created_at,updated_at FROM sites WHERE id=?').get(id) });
-  } catch (error) { sendError(res, error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 409 : 400, 'A site with this name already exists in your organization.'); }
+  } catch (error) { sendError(res, error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 409 : 400, error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 'A worksite with this name already exists in your organization.' : 'Could not save this worksite. Please check the details and try again.'); }
 });
 app.put('/api/sites', csrfAndOrigin, requireUser, (req, res) => {
   const id = String(req.query.id || ''), values = siteValues(req.body);
-  if (!values) return sendError(res, 400, 'Enter a site name, address (optional), and valid latitude/longitude for weather.');
+  if (!values) return sendError(res, 400, 'Enter a worksite name (up to 120 characters), keep the address under 500 characters, and provide both valid coordinates if setting a map location.');
   try {
     const result = db.prepare('UPDATE sites SET name=?,address=?,latitude=?,longitude=?,division=?,district=?,emergency_contact_phone=?,shade_available=?,water_available=?,rest_area=?,updated_at=? WHERE id=? AND organization_id=?').run(values.name, values.address, values.latitude, values.longitude,values.division,values.district,values.emergencyContactPhone,values.shadeAvailable?1:0,values.waterAvailable?1:0,values.restArea?1:0, now(), id, req.user.organization_id);
     if (!result.changes) return sendError(res, 404, 'Site not found.');
     db.prepare('UPDATE workers SET site=? WHERE site_id=? AND organization_id=?').run(values.name, id, req.user.organization_id);
     WEATHER_CACHE.delete(id);
     res.json({ site: db.prepare('SELECT id,name,address,latitude,longitude,division,district,emergency_contact_phone,shade_available,water_available,rest_area,created_at,updated_at FROM sites WHERE id=?').get(id) });
-  } catch (error) { sendError(res, error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 409 : 400, 'A site with this name already exists in your organization.'); }
+  } catch (error) { sendError(res, error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 409 : 400, error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 'A worksite with this name already exists in your organization.' : 'Could not update this worksite. Please check the details and try again.'); }
 });
 app.delete('/api/sites', csrfAndOrigin, requireUser, (req, res) => {
-  const id = String(req.query.id || '');
-  if (db.prepare('SELECT 1 FROM workers WHERE organization_id=? AND site_id=? LIMIT 1').get(req.user.organization_id, id)) return sendError(res, 409, 'Move or remove workers assigned to this site before deleting it.');
-  const result = db.prepare('DELETE FROM sites WHERE id=? AND organization_id=?').run(id, req.user.organization_id);
-  if (!result.changes) return sendError(res, 404, 'Site not found.');
-  WEATHER_CACHE.delete(id); res.json({ message: 'Site removed.' });
+  const id = String(req.query.id || ''),org=req.user.organization_id;
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    const site=db.prepare('SELECT id FROM sites WHERE id=? AND organization_id=?').get(id,org);
+    if(!site){db.exec('ROLLBACK');return sendError(res,404,'Site not found.');}
+    const removedWorkers=db.prepare('DELETE FROM workers WHERE organization_id=? AND site_id=?').run(org,id).changes;
+    db.prepare('DELETE FROM sites WHERE id=? AND organization_id=?').run(id,org);
+    db.exec('COMMIT');WEATHER_CACHE.delete(id);res.json({message:'Site and its assigned workers removed.',removedWorkers});
+  } catch(error) { try{db.exec('ROLLBACK');}catch{} sendError(res,500,'Could not delete the site and its workers.'); }
+});
+app.post('/api/records/bulk-delete',csrfAndOrigin,requireUser,(req,res)=>{
+  const records=req.body.records,allowed=new Set(['workers','sites','breaks','sms','alerts','jobs','ai_calls']);
+  if(!Array.isArray(records)||!records.length||records.length>500||records.some(item=>!item||!allowed.has(item.type)||typeof item.id!=='string'||!item.id))return sendError(res,400,'Select between 1 and 500 valid records to delete.');
+  const org=req.user.organization_id,stamp=now(),unique=[...new Map(records.map(item=>[`${item.type}:${item.id}`,item])).values()],counts={};
+  try{
+    db.exec('BEGIN IMMEDIATE');
+    for(const item of unique){let changed=0;
+      if(item.type==='workers')changed=db.prepare('DELETE FROM workers WHERE id=? AND organization_id=?').run(item.id,org).changes;
+      else if(item.type==='sites'){
+        const site=db.prepare('SELECT id FROM sites WHERE id=? AND organization_id=?').get(item.id,org);
+        if(site){const removedWorkers=db.prepare('DELETE FROM workers WHERE organization_id=? AND site_id=?').run(org,item.id).changes;changed=db.prepare('DELETE FROM sites WHERE id=? AND organization_id=?').run(item.id,org).changes;counts.workers=(counts.workers||0)+removedWorkers;WEATHER_CACHE.delete(item.id);}
+      }
+      else if(item.type==='breaks')changed=db.prepare('DELETE FROM break_logs WHERE id=? AND organization_id=?').run(item.id,org).changes;
+      else if(item.type==='sms'){
+        if(item.id.startsWith('break-queue-'))changed=db.prepare('DELETE FROM scheduled_break_sms WHERE id=? AND organization_id=?').run(item.id.slice('break-queue-'.length),org).changes;
+        else {db.prepare('INSERT INTO sms_deleted_messages(organization_id,id,deleted_at) VALUES(?,?,?) ON CONFLICT(organization_id,id) DO UPDATE SET deleted_at=excluded.deleted_at').run(org,item.id,stamp);changed=db.prepare('DELETE FROM sms_messages WHERE id=? AND organization_id=?').run(item.id,org).changes;}
+      }
+      else if(item.type==='alerts')changed=db.prepare('DELETE FROM automated_alerts WHERE id=? AND organization_id=?').run(item.id,org).changes;
+      else if(item.type==='jobs')changed=db.prepare('DELETE FROM job_runs WHERE id=? AND organization_id=?').run(item.id,org).changes;
+      else if(item.type==='ai_calls')changed=db.prepare('DELETE FROM ai_calls WHERE id=? AND organization_id=?').run(item.id,org).changes;
+      counts[item.type]=(counts[item.type]||0)+changed;
+    }
+    db.exec('COMMIT');res.json({deleted:Object.values(counts).reduce((sum,count)=>sum+count,0),counts});
+  }catch(error){try{db.exec('ROLLBACK');}catch{}sendError(res,500,'Could not delete the selected records.');}
 });
 
 function weatherSummary(code) {
@@ -556,6 +693,23 @@ async function openMeteo(site, forecastDays = 1) {
   const raw = await response.json().catch(() => ({}));
   if (!response.ok || !raw.current) throw new Error(response.status === 429 ? 'Open-Meteo request limit reached. Weather will be available again shortly.' : response.status === 401 || response.status === 403 ? 'Open-Meteo rejected the customer API key. Check OPEN_METEO_API_KEY in .env.' : raw.reason || `Open-Meteo could not return weather right now (HTTP ${response.status}).`);
   return raw;
+}
+async function timezoneForSite(siteId, organizationId) {
+  const cached=SITE_TIMEZONES.get(siteId);
+  if(cached&&cached.expires>Date.now())return cached.value;
+  const weather=ALERT_WEATHER_CACHE.get(siteId)?.raw;
+  if(weather?.timezone){SITE_TIMEZONES.set(siteId,{value:weather.timezone,expires:Date.now()+6*3600000});return weather.timezone;}
+  const site=db.prepare('SELECT id,latitude,longitude FROM sites WHERE id=? AND organization_id=?').get(siteId,organizationId);
+  if(site?.latitude!=null&&site?.longitude!=null){try{const raw=await openMeteo(site);if(raw.timezone){SITE_TIMEZONES.set(siteId,{value:raw.timezone,expires:Date.now()+6*3600000});return raw.timezone;}}catch{}}
+  return 'Asia/Dhaka';
+}
+function workerIsOnShift(worker, at=new Date(), timezone='Asia/Dhaka') {
+  const start=String(worker.shift_start||worker.shiftStart||''),end=String(worker.shift_end||worker.shiftEnd||''),parse=value=>{const match=value.match(/^([01]\d|2[0-3]):([0-5]\d)$/);return match?Number(match[1])*60+Number(match[2]):null;};
+  const startMinute=parse(start),endMinute=parse(end);
+  if(startMinute==null||endMinute==null||startMinute===endMinute)return false;
+  let parts;try{parts=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:timezone,hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(at).map(part=>[part.type,part.value]));}catch{parts=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Dhaka',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(at).map(part=>[part.type,part.value]));}
+  const minute=Number(parts.hour)*60+Number(parts.minute);
+  return startMinute<endMinute?minute>=startMinute&&minute<endMinute:minute>=startMinute||minute<endMinute;
 }
 function shapeWeather(raw) {
   const c = raw.current || {}, hourly = raw.hourly || {}, data = [];
@@ -631,8 +785,58 @@ app.post('/api/ai/chat', csrfAndOrigin, requireUser, async (req,res) => {
   if (!Array.isArray(messages)||!messages.length||messages.length>12) return sendError(res,400,'Send a short chat message and try again.');
   const contents=messages.slice(-10).filter(item=>item&&['user','model'].includes(item.role)&&typeof item.text==='string'&&item.text.trim()&&item.text.length<=1200).map(item=>({role:item.role,parts:[{text:item.text.trim()}]}));
   if (!contents.length||contents.at(-1).role!=='user') return sendError(res,400,'Enter a message to continue.');
+  const attachment=req.body.attachment;
+  if(attachment!==undefined){
+    if(!attachment||typeof attachment!=='object'||typeof attachment.name!=='string'||attachment.name.length>160)return sendError(res,400,'Choose a valid attachment.');
+    const name=path.basename(attachment.name),extension=path.extname(name).toLowerCase();
+    if(['.txt','.md'].includes(extension)){
+      if(typeof attachment.text!=='string'||attachment.text.length>100000)return sendError(res,400,'Text and Markdown files must contain 100,000 characters or fewer.');
+      contents.at(-1).parts.push({text:`\n\nAttached ${extension==='.md'?'Markdown':'text'} file (${name}):\n${attachment.text}`});
+    }else{
+      const mimeType=String(attachment.mimeType||'').toLowerCase(),allowedImages=new Set(['image/png','image/jpeg','image/webp','image/gif']);
+      if(extension!=='.pdf'&&!allowedImages.has(mimeType))return sendError(res,400,'Use a PDF, PNG, JPG, WEBP, or GIF image, or a TXT/MD file.');
+      if(extension==='.pdf'&&mimeType!=='application/pdf')return sendError(res,400,'The selected PDF file has an invalid content type.');
+      const data=attachment.data;
+      if(typeof data!=='string'||data.length>14_000_000||!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data))return sendError(res,400,'Attachment is invalid or larger than 10 MB.');
+      const bytes=Buffer.from(data,'base64');
+      if(!bytes.length||bytes.length>10*1024*1024||bytes.toString('base64')!==data)return sendError(res,400,'Attachment is invalid or larger than 10 MB.');
+      const validPdf=extension==='.pdf'&&bytes.subarray(0,5).toString('ascii')==='%PDF-';
+      const validImage=(mimeType==='image/png'&&bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])))||(mimeType==='image/jpeg'&&bytes[0]===255&&bytes[1]===216&&bytes[2]===255)||(mimeType==='image/gif'&&/^GIF8[79]a$/.test(bytes.subarray(0,6).toString('ascii')))||(mimeType==='image/webp'&&bytes.subarray(0,4).toString('ascii')==='RIFF'&&bytes.subarray(8,12).toString('ascii')==='WEBP');
+      if(!validPdf&&!validImage)return sendError(res,400,'The attachment content does not match its file type.');
+      contents.at(-1).parts.push({text:`Attached file: ${name}`},{inline_data:{mime_type:mimeType,data}});
+    }
+  }
   const instruction="You are JibonGuard's in-app assistant. Help organization administrators understand the dashboard, site weather, worker consent, break logs, and practical heat and weather safety. Be concise and clear. Do not claim to see private organization records or live weather unless supplied in the conversation. Never give a medical diagnosis or claim an emergency is safe; direct urgent situations to local emergency services and official instructions. Do not ask for passwords, API keys, or personal worker details.";
   try { res.json({ reply:await geminiGenerate(contents,instruction) }); } catch(error) { sendError(res,503,error.message); }
+});
+app.post('/api/ai/speech', csrfAndOrigin, requireUser, async (req,res) => {
+  if (!rateAllowed(req,'gemini-speech',30,3600)) return sendError(res,429,'Speech limit reached. Try again in a little while.');
+  const text=typeof req.body.text==='string'?req.body.text.trim():'';
+  const voice=String(req.body.voice||'Kore');
+  if(!text||text.length>5000)return sendError(res,400,'Choose a reply with 1 to 5,000 characters to read aloud.');
+  if(!['Kore','Puck','Charon','Aoede'].includes(voice))return sendError(res,400,'Choose one of the available assistant voices.');
+  if(!GEMINI_API_KEY)return sendError(res,503,'Gemini is not configured. Set GEMINI_API_KEY in the server .env file.');
+  let response;
+  try{
+    response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_TTS_MODEL)}:generateContent`,{method:'POST',signal:AbortSignal.timeout(60000),headers:{'x-goog-api-key':GEMINI_API_KEY,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({contents:[{role:'user',parts:[{text,speech_metadata:{style:'Clear, calm, conversational delivery.'}}]}],generationConfig:{responseModalities:['AUDIO'],speechConfig:{voiceConfig:{voice}}}})});
+  }catch{return sendError(res,503,"Could not connect to Gemini speech. Check the server's internet connection.");}
+  const result=await response.json().catch(()=>({}));
+  if(!response.ok){const detail=String(result.error?.message||'').replace(/\s+/g,' ').slice(0,220);return sendError(res,503,`Gemini speech returned HTTP ${response.status}.${detail?` ${detail}`:' Check TTS model access and API quota.'}`);}
+  const audioPart=(result.candidates?.[0]?.content?.parts||[]).find(part=>part.inlineData?.data);
+  if(!audioPart)return sendError(res,503,'Gemini returned no speech audio. Check TTS model access and try again.');
+  res.set('Cache-Control','no-store').json({audio:audioPart.inlineData.data,mime_type:audioPart.inlineData.mimeType||'audio/wav'});
+});
+app.post('/api/ai/live-token', csrfAndOrigin, requireUser, async (req,res) => {
+  if (!rateAllowed(req,'gemini-live-token',10,3600)) return sendError(res,429,'Live voice is temporarily limited. Try again in a little while.');
+  if (!GEMINI_API_KEY) return sendError(res,503,'Gemini is not configured. Set GEMINI_API_KEY in the server .env file.');
+  let response;
+  try {
+    const expiresAt=new Date(Date.now()+30*60*1000).toISOString();
+    response=await fetch('https://generativelanguage.googleapis.com/v1beta/auth_tokens',{method:'POST',signal:AbortSignal.timeout(15000),headers:{'x-goog-api-key':GEMINI_API_KEY,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({uses:1,expireTime:expiresAt,newSessionExpireTime:new Date(Date.now()+60*1000).toISOString()})});
+  } catch { return sendError(res,503,"Could not connect to Gemini Live. Check the server's internet connection."); }
+  const result=await response.json().catch(()=>({}));
+  if (!response.ok||typeof result.name!=='string') { const detail=String(result.error?.message||'').replace(/\s+/g,' ').slice(0,220); return sendError(res,503,`Gemini Live token request failed${response.status?` (HTTP ${response.status})`:''}.${detail?` ${detail}`:' Check Live API access, model availability and API quota.'}`); }
+  res.set('Cache-Control','no-store').json({token:result.name,model:'models/gemini-3.8-live'});
 });
 
 async function sendTextBeeBreakSms(recipients, record) {
@@ -646,12 +850,14 @@ async function sendTextBeeBreakSms(recipients, record) {
     storm:`ঝড়ের সতর্কতা: বাইরে কাজ বন্ধ করে নির্ধারিত নিরাপদ আশ্রয়ে যান। গাছ, বৈদ্যুতিক খুঁটি ও ধাতব কাঠামো থেকে দূরে থাকুন। কর্মস্থল: ${record.site}`,
     earthquake:`ভূমিকম্প: নিচু হন, মজবুত কিছুর নিচে আশ্রয় নিন এবং ধরে থাকুন। জানালা ও ভারী জিনিস থেকে দূরে থাকুন। কম্পন থামলে সাইটের নির্দেশনা মানুন। কর্মস্থল: ${record.site}`
   };
+  const plannedAt=Number(record.scheduled_at)||Math.floor(new Date(`${record.break_date}T${record.break_time}:00`).getTime()/1000);
+  const remaining=plannedAt-now(), timing=remaining>0?`Break starts in ${Math.max(1,Math.ceil(remaining/60))} minutes, at ${record.break_time}.`:`Break time: ${record.break_date} at ${record.break_time}.`;
   const messages=recipients.map(recipient=>{
     const name=recipient.name||'কর্মী';
     const message=alertCopy[record.alert_type]
       ? `${name}, ${alertCopy[record.alert_type]}। - JibonGuard`
       : `${name}, বিরতির সময় হয়েছে। ${record.site} কর্মস্থলে ${record.duration_minutes} মিনিট পানি পান করুন ও ছায়ায় বিশ্রাম নিন। সময়: ${record.break_date} ${record.break_time}। - JibonGuard`;
-    return {recipients:[recipient.phone],message,...(subscription?{simSubscriptionId:Number(subscription)}:{})};
+    return {recipients:[recipient.phone],message:`${message} ${timing}`,...(subscription?{simSubscriptionId:Number(subscription)}:{})};
   });
   try {
     const messageTemplate=({break:'পানি পান ও ছায়ায় বিরতি',rain:'বৃষ্টি সতর্কতা',storm:'ঝড় সতর্কতা',earthquake:'ভূমিকম্প সতর্কতা'})[record.alert_type]||'নিরাপত্তা সতর্কতা';
@@ -663,6 +869,45 @@ async function sendTextBeeBreakSms(recipients, record) {
     const acceptedCount=Number(result.data?.recipientCount||result.data?.successCount)||recipients.length;
     return {status:'queued',recipient_count:acceptedCount,message:`TextBee accepted ${acceptedCount} personalized SMS message(s) into its queue.`};
   } catch { return {status:'failed',recipient_count:0,message:'Break saved, but the TextBee request timed out or failed. Retry shortly.'}; }
+}
+function queueBreakSms(orgId, breakId, recipients, record, scheduledAt) {
+  const insert=db.prepare("INSERT INTO scheduled_break_sms(id,organization_id,break_id,worker_id,workload,recipient,message,scheduled_at,status,created_at) VALUES(?,?,?,?,?,?,?,?,'scheduled',?)");
+  const stamp=now();
+  for(const recipient of recipients) insert.run(token(12),orgId,breakId,recipient.worker_id||null,recipient.workload||'',recipient.phone,`JibonGuard: ${record.title} at ${record.site}. Break starts at ${record.break_time} on ${record.break_date} for ${record.duration_minutes} minutes.`,scheduledAt,stamp);
+  return recipients.length;
+}
+let breakSmsDispatchRunning=false;
+async function dispatchScheduledBreakSms() {
+  if(breakSmsDispatchRunning)return;
+  breakSmsDispatchRunning=true;
+  try {
+    const due=db.prepare("SELECT DISTINCT break_id,organization_id FROM scheduled_break_sms WHERE status='scheduled' AND scheduled_at<=? ORDER BY scheduled_at LIMIT 30").all(now());
+    for(const item of due) {
+      const claim=db.prepare("UPDATE scheduled_break_sms SET status='sending' WHERE break_id=? AND organization_id=? AND status='scheduled'").run(item.break_id,item.organization_id);
+      if(!claim.changes)continue;
+      const rows=db.prepare("SELECT id,worker_id,workload,recipient FROM scheduled_break_sms WHERE break_id=? AND organization_id=? AND status='sending'").all(item.break_id,item.organization_id);
+      const record=db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,alert_type,status,workload_levels FROM break_logs WHERE id=? AND organization_id=?').get(item.break_id,item.organization_id);
+      if(!record){db.prepare("UPDATE scheduled_break_sms SET status='failed',error='Safety log was removed.' WHERE break_id=? AND organization_id=? AND status='sending'").run(item.break_id,item.organization_id);continue;}
+      let workloadLevels=[];try{workloadLevels=JSON.parse(record.workload_levels||'[]');}catch{}
+      const firstWorker=rows.map(row=>row.worker_id&&db.prepare('SELECT site_id FROM workers WHERE id=? AND organization_id=?').get(row.worker_id,item.organization_id)).find(Boolean),timezone=firstWorker?await timezoneForSite(firstWorker.site_id,item.organization_id):'Asia/Dhaka';
+      const recipients=[];
+      for(const row of rows){
+        const worker=row.worker_id?db.prepare('SELECT id,name,phone,consent_at,workload,shift_start,shift_end FROM workers WHERE id=? AND organization_id=?').get(row.worker_id,item.organization_id):null;
+        let error='';
+        if(!worker||!worker.consent_at)error='Worker consent is not active at send time.';
+        else if(normalizePhone(worker.phone)!==normalizePhone(row.recipient))error='Worker phone changed before send.';
+        else if(workloadLevels.length&&!workloadLevels.includes(worker.workload))error='Worker workload is no longer selected for this alert.';
+        else if(!workerIsOnShift(worker,new Date(),timezone))error='Worker is outside their shift at send time.';
+        if(error){db.prepare("UPDATE scheduled_break_sms SET status='failed',error=? WHERE id=? AND organization_id=? AND status='sending'").run(error,row.id,item.organization_id);continue;}
+        recipients.push({phone:row.recipient,name:worker.name});
+      }
+      if(!recipients.length)continue;
+      const result=await sendTextBeeBreakSms(recipients,{...record,status:'scheduled',scheduled_at:item.scheduled_at});
+      const success=result.status==='queued';
+      db.prepare("UPDATE scheduled_break_sms SET status=?,sent_at=?,error=? WHERE break_id=? AND organization_id=? AND status='sending'").run(success?'sent':'failed',success?now():null,success?'':result.message,item.break_id,item.organization_id);
+    }
+  } catch(error) { console.error(`Scheduled break SMS dispatch failed (${error.name})`); }
+  finally {breakSmsDispatchRunning=false;}
 }
 const EMERGENCY_CODES = {
   '0': {label:'নির্দেশিকা',reply:'জীবনগার্ড নির্দেশিকা: বিপদে শুধু সংখ্যা লিখে পাঠান। ১ দুর্ঘটনা/সাহায্য, ২ আগুন, ৩ গরমে অসুস্থ, ৪ সহকর্মী অজ্ঞান, ৫ বিদ্যুৎ বিপদ, ৬ পড়ে যাওয়া/ধস, ৭ ঝড়-বজ্রপাত, ৮ গ্যাস/ধোঁয়া, ৯ অন্য বিপদ। জীবন বিপন্ন হলে ৯৯৯ এ কল করুন।'},
@@ -702,20 +947,19 @@ async function buildAlertContexts(site,organizationId,config,{simulation=null}={
     const lastAlerts=db.prepare('SELECT alert_type,MAX(COALESCE(sent_at,scheduled_at)) AS at FROM automated_alerts WHERE organization_id=? AND worker_id=? AND status IN (\'sent\',\'scheduled\',\'queued\') GROUP BY alert_type ORDER BY at DESC').all(organizationId,worker.id);
     const lastByType=Object.fromEntries(lastAlerts.filter(item=>item.at).map(item=>[item.alert_type,new Date(item.at*1000).toISOString()]));
     const today=new Date();today.setHours(0,0,0,0);const sentToday=db.prepare("SELECT COUNT(*) AS n FROM automated_alerts WHERE organization_id=? AND worker_id=? AND created_at>=? AND status IN ('sent','queued','scheduled')").get(organizationId,worker.id,Math.floor(today.getTime()/1000)).n;
-    const context={worker:{id:worker.id,jobType:worker.job_type,workload:worker.workload,riskLevel:worker.risk_level,consentStatus:worker.consent_status,consentAt:worker.consent_at,shiftStart:worker.shift_start,shiftEnd:worker.shift_end,newWorker:worker.created_at>now()-14*86400,channelPreference:worker.channel_preference,voiceFirst:Boolean(worker.voice_first),ageGroup:worker.age_group,hasPersonalRiskFactor:Boolean(worker.has_personal_risk_factor),continuousHours},state:{continuousHours,totalHoursToday:Number(worker.outdoor_minutes||0)/60,lastBreak:worker.last_break||null,lastAlertLevel:lastAlerts[0]?.alert_type||null,lastAlertTime:lastAlerts[0]?.at?new Date(lastAlerts[0].at*1000).toISOString():null,alertsSentToday:sentToday,lastAcknowledgement:null},site:{id:site.id,shadeAvailable:Boolean(site.shade_available),waterAvailable:Boolean(site.water_available),restArea:Boolean(site.rest_area)},weather:{...weather},now:nowDate};
+    const context={worker:{id:worker.id,jobType:worker.job_type,workload:worker.workload,riskLevel:worker.risk_level,consentStatus:worker.consent_status,consentAt:worker.consent_at,shiftStart:worker.shift_start,shiftEnd:worker.shift_end,newWorker:worker.created_at>now()-14*86400,ageGroup:worker.age_group,hasPersonalRiskFactor:Boolean(worker.has_personal_risk_factor),continuousHours},state:{continuousHours,totalHoursToday:Number(worker.outdoor_minutes||0)/60,lastBreak:worker.last_break||null,lastAlertLevel:lastAlerts[0]?.alert_type||null,lastAlertTime:lastAlerts[0]?.at?new Date(lastAlerts[0].at*1000).toISOString():null,alertsSentToday:sentToday,lastAcknowledgement:null},site:{id:site.id,shadeAvailable:Boolean(site.shade_available),waterAvailable:Boolean(site.water_available),restArea:Boolean(site.rest_area)},weather:{...weather},now:nowDate};
     const cooldownRemaining=Math.max(0,config.cooldownMinutes-Math.min(config.cooldownMinutes,...Object.values(lastByType).map(value=>Math.max(0,(nowDate.getTime()-Date.parse(value))/60000)))),clock=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:weather.timezone,hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(nowDate).map(part=>[part.type,part.value])),clockMinutes=Number(clock.hour)*60+Number(clock.minute),clockMinute=value=>{const [h,m]=String(value).split(':').map(Number);return h*60+m;},quietStart=clockMinute(config.quietHours.start),quietEnd=clockMinute(config.quietHours.end);
     context.limits={cooldownRemaining,dailyCapRemaining:Math.max(0,config.dailyCap-sentToday),quietHours:quietStart<quietEnd?clockMinutes>=quietStart&&clockMinutes<quietEnd:clockMinutes>=quietStart||clockMinutes<quietEnd};return context;
   });
 }
 function alertEventKey(decision,context){const weather=context.weather;if(decision.alert_type==='rain_2h')return `rain:${context.site.id}:${weather.expectedRainStart||Math.floor(now()/3600)}`;if(decision.alert_type==='lightning')return `lightning:${context.site.id}:${weather.expectedRainStart||Math.floor(now()/3600)}`;if(['heat_nudge','shade_break'].includes(decision.alert_type))return `${decision.alert_type}:${context.site.id}:${new Date().toISOString().slice(0,10)}`;return `${decision.alert_type}:${context.site.id}:${Math.floor(now()/1800)}`;}
-async function voiceAlertSender(items,message){const url=(process.env.VOICE_GATEWAY_URL||'').trim(),key=(process.env.VOICE_GATEWAY_API_KEY||'').trim();if(!url||!key||!url.startsWith('https://'))return {accepted:false,error:'Voice gateway is not configured.'};try{const response=await fetch(url,{method:'POST',signal:AbortSignal.timeout(20000),headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({recipients:items.map(item=>item.phone),message})});return {accepted:response.ok};}catch{return {accepted:false,error:'Voice gateway request failed.'};}}
 async function dispatchAlertQueue(){
-  const queued=db.prepare("SELECT a.*,w.phone,w.consent_at FROM automated_alerts a JOIN workers w ON w.id=a.worker_id WHERE a.status IN ('queued','scheduled') AND a.scheduled_at<=? ORDER BY a.scheduled_at LIMIT 200").all(now()),ready=[];
-  for(const row of queued){if(!row.consent_at){db.prepare("UPDATE automated_alerts SET status='skipped',reason='Consent withdrawn before dispatch.' WHERE id=?").run(row.id);continue;}ready.push({...row,phone:normalizePhone(row.phone)});}
+  const queued=db.prepare("SELECT a.*,w.phone,w.consent_at,w.shift_start,w.shift_end FROM automated_alerts a JOIN workers w ON w.id=a.worker_id WHERE a.status IN ('queued','scheduled') AND a.scheduled_at<=? ORDER BY a.scheduled_at LIMIT 200").all(now()),ready=[];
+  for(const row of queued){if(!row.consent_at){db.prepare("UPDATE automated_alerts SET status='skipped',reason='Consent withdrawn before dispatch.' WHERE id=?").run(row.id);continue;}let timezone='Asia/Dhaka';try{timezone=JSON.parse(row.input_context).weather?.timezone||timezone;}catch{}if(!workerIsOnShift(row,new Date(),timezone)){db.prepare("UPDATE automated_alerts SET status='skipped',reason='Outside the worker shift at send time.' WHERE id=?").run(row.id);continue;}ready.push({...row,phone:normalizePhone(row.phone)});}
   const sendable=[];
   for(const row of ready){if(!row.phone)continue;let message=row.message;if(row.alert_type==='rain_2h'&&!row.floor){let eta=null;try{eta=Number(JSON.parse(row.input_context).weather?.rainEtaMinutes);}catch{}const elapsed=Math.max(0,(now()-row.created_at)/60);if(!Number.isFinite(eta)||elapsed>=eta){db.prepare("UPDATE automated_alerts SET status='skipped',reason='Rain forecast window passed before dispatch.' WHERE id=?").run(row.id);continue;}message=renderAlertTemplate('rain_2h',{minutes:Math.max(1,Math.round(eta-elapsed))});db.prepare('UPDATE automated_alerts SET message=? WHERE id=?').run(message,row.id);}sendable.push({...row,message});}
-  const groups=await dispatchAlertGroups(sendable.map(row=>({id:row.id,phone:row.phone,message:row.message,channel:row.channel})),{smsSender:async entries=>{const result=await sendTextBeeMessages(entries,entries[0]?.message||'JibonGuard safety alert');return {accepted:result.accepted};},voiceSender:voiceAlertSender});
-  for(const group of groups)for(const item of group.items){const accepted=group.sms.accepted||group.voice.accepted,status=accepted?'sent':'failed',sentAt=accepted?now():null,extra=group.channel.includes('voice')&&!group.voice.accepted?` Voice: ${group.voice.error||'not accepted'}.`:'';db.prepare('UPDATE automated_alerts SET status=?,sent_at=?,reason=reason||? WHERE id=?').run(status,sentAt,extra,item.id);}
+  const groups=await dispatchAlertGroups(sendable.map(row=>({id:row.id,phone:row.phone,message:row.message,channel:row.channel})),{smsSender:async entries=>{const result=await sendTextBeeMessages(entries,entries[0]?.message||'JibonGuard safety alert');return {accepted:result.accepted};}});
+  for(const group of groups)for(const item of group.items){const accepted=group.sms.accepted,status=accepted?'sent':'failed',sentAt=accepted?now():null;db.prepare('UPDATE automated_alerts SET status=?,sent_at=? WHERE id=?').run(status,sentAt,item.id);}
   for(const row of ready.filter(item=>!item.phone))db.prepare("UPDATE automated_alerts SET status='failed',reason=reason||' Worker phone number is invalid.' WHERE id=?").run(row.id);
   return groups.length;
 }
@@ -734,7 +978,7 @@ async function runAlertAutomationTick(){
     }catch(error){console.error(`Alert automation failed for site ${site.id}: ${error.message}`);}
   }await dispatchAlertQueue();}catch(error){console.error(`Alert automation cycle failed: ${error.message}`);}finally{alertSchedulerRunning=false;}
 }
-jobRunner.register('alert_automation', runAlertAutomationTick, { jitterMs: 20000 });
+jobRunner.register('alert_automation', runAlertAutomationTick, { jitterMs: 0 });
 async function runAlertAutomation(){ await jobRunner.execute('alert_automation'); }
 async function sendTextBeeMessages(entries,messageTemplate) {
   const apiKey=(process.env.TEXTBEE_API_KEY||process.env.TEXTBEE_DEV_API||'').trim();
@@ -769,14 +1013,15 @@ EMERGENCY_CODES['0'].reply=`জীবনগার্ড নির্দেশি
 function workerWelcomeText(worker) {
   return `জীবনগার্ড: ${worker.name}, আপনার নিবন্ধন সম্পন্ন হয়েছে।\nজরুরি বার্তার নির্দেশিকা:\n${FORMATTED_EMERGENCY_MANUAL}`;
 }
-async function sendWorkerWelcomeMessages(workers) {
-  const entries=workers.map(worker=>({phone:normalizePhone(worker.phone),message:workerWelcomeText(worker)})).filter(entry=>entry.phone);
+async function sendWorkerWelcomeMessages(workers, organizationId) {
   if(!(process.env.TEXTBEE_API_KEY||process.env.TEXTBEE_DEV_API||'').trim())return {status:'not_configured',recipient_count:0};
+  const entries=[];
+  for(const worker of workers){const timezone=worker.siteId?await timezoneForSite(worker.siteId,organizationId):'Asia/Dhaka';if(workerIsOnShift(worker,new Date(),timezone)){const phone=normalizePhone(worker.phone);if(phone)entries.push({phone,message:workerWelcomeText(worker)});}}
   let accepted=0;
   for(let start=0;start<entries.length;start+=50){const result=await sendTextBeeMessages(entries.slice(start,start+50),'জীবনগার্ড কর্মী নিবন্ধন');if(result.accepted)accepted+=entries.slice(start,start+50).length;}
-  return {status:accepted===entries.length&&entries.length?'queued':accepted?'partial':entries.length?'failed':'not_configured',recipient_count:accepted};
+  return {status:accepted===entries.length&&entries.length?'queued':accepted?'partial':entries.length?'failed':'outside_shift',recipient_count:accepted,skipped_outside_shift:workers.length-entries.length};
 }
-async function sendWorkerWelcomeSms(worker) { return sendWorkerWelcomeMessages([worker]); }
+async function sendWorkerWelcomeSms(worker, organizationId) { return sendWorkerWelcomeMessages([worker],organizationId); }
 async function syncEmergencySms({seed=false}={}) {
   const apiKey=(process.env.TEXTBEE_API_KEY||process.env.TEXTBEE_DEV_API||'').trim();
   if(!apiKey)return {configured:false,received:0};
@@ -833,39 +1078,69 @@ async function pollEmergencySms() {
   }catch(error){console.error(`Emergency SMS poll failed (${error.name})`);}
   finally{emergencySmsPollRunning=false;}
 }
+const WORKLOAD_LEVELS=['Light','Standard','Heavy'];
+function normalizeWorkloadLevels(value) {
+  if(value===undefined)return [...WORKLOAD_LEVELS];
+  if(!Array.isArray(value)||!value.length||value.some(level=>!WORKLOAD_LEVELS.includes(level)))return null;
+  return [...new Set(value)];
+}
 function consentedRecipients(org, siteId) {
-  const rows=db.prepare('SELECT name,phone FROM workers WHERE organization_id=? AND site_id=? AND consent_at IS NOT NULL').all(org,siteId), map=new Map();
-  for (const row of rows) { const phone=normalizePhone(row.phone); if(phone&&!map.has(phone))map.set(phone,{phone,name:row.name}); }
-  return [...map.values()];
+  const rows=db.prepare('SELECT id AS worker_id,name,phone,workload,shift_start,shift_end FROM workers WHERE organization_id=? AND site_id=? AND consent_at IS NOT NULL').all(org,siteId);
+  return rows.map(row=>({...row,phone:normalizePhone(row.phone)})).filter(row=>row.phone);
 }
 app.post('/api/breaks',csrfAndOrigin,requireUser,async(req,res)=>{
-  const d=req.body, alertType=String(d.alert_type||'break').trim(), title=BREAK_ALERTS[alertType]||String(d.title||'').trim(), siteId=String(d.site_id||'').trim(), date=String(d.break_date||'').trim(), time=String(d.break_time||'').trim(), status=String(d.status||'logged').trim(), duration=Number(d.duration_minutes);
+  const d=req.body, alertType=String(d.alert_type||'break').trim(), title=BREAK_ALERTS[alertType]||String(d.title||'').trim(), siteId=String(d.site_id||'').trim(), date=String(d.break_date||'').trim(), time=String(d.break_time||'').trim(), status=String(d.status||'logged').trim(), duration=Number(d.duration_minutes),workloadLevels=normalizeWorkloadLevels(d.workload_levels);
+  if(!workloadLevels)return sendError(res,400,'Choose at least one valid workload level for the safety message.');
   if (!['break','rain','storm','earthquake'].includes(alertType)||!title||title.length>120||!/^\d{4}-\d{2}-\d{2}$/.test(date)||!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)||!Number.isInteger(duration)||duration<1||duration>240||!['logged','scheduled'].includes(status)) return sendError(res,400,'Enter a break name, site, valid date and time, and duration from 1 to 240 minutes.');
   const [year,month,day]=date.split('-').map(Number),validDate=new Date(Date.UTC(year,month-1,day));
   if(validDate.getUTCFullYear()!==year||validDate.getUTCMonth()!==month-1||validDate.getUTCDate()!==day)return sendError(res,400,'Enter a valid break date.');
-  const site=db.prepare('SELECT name FROM sites WHERE id=? AND organization_id=?').get(siteId,req.user.organization_id);
+  const site=db.prepare('SELECT id,name,latitude,longitude FROM sites WHERE id=? AND organization_id=?').get(siteId,req.user.organization_id);
   if (!site) return sendError(res,400,'Choose a worksite from your saved Sites list.');
-  const recipients=consentedRecipients(req.user.organization_id,siteId), workerCount=db.prepare('SELECT COUNT(*) AS count FROM workers WHERE organization_id=?').get(req.user.organization_id).count,id=token(12),stamp=now();
-  db.prepare(`INSERT INTO break_logs(id,organization_id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at)
-    VALUES(?,?,?,?,?,?,?,?,?,'manual',?,'',?)`).run(id,req.user.organization_id,title,site.name,date,time,duration,workerCount,status,alertType,stamp);
+  const siteConsented=consentedRecipients(req.user.organization_id,siteId),consented=siteConsented.filter(worker=>workloadLevels.includes(worker.workload));
+  const timezone=status==='logged'?await timezoneForSite(siteId,req.user.organization_id):null;
+  const inShift=status==='logged'?consented.filter(worker=>workerIsOnShift(worker,new Date(),timezone)):consented;
+  const recipients=[...new Map(inShift.map(worker=>[worker.phone,worker])).values()];
+  const workerCount=db.prepare('SELECT COUNT(*) AS count FROM workers WHERE organization_id=?').get(req.user.organization_id).count,id=token(12),stamp=now();
+  const parsedSchedule=Number(d.scheduled_at), scheduledAt=Number.isFinite(parsedSchedule)&&parsedSchedule>0?Math.floor(parsedSchedule):Math.floor(new Date(`${date}T${time}:00`).getTime()/1000);
+  if(!Number.isFinite(scheduledAt)||scheduledAt<=now())return sendError(res,400,'Choose a date and time later than the current time.');
+  db.prepare(`INSERT INTO break_logs(id,organization_id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at,workload_levels)
+    VALUES(?,?,?,?,?,?,?,?,?,'manual',?,'',?,?)`).run(id,req.user.organization_id,title,site.name,date,time,duration,workerCount,status,alertType,stamp,JSON.stringify(workloadLevels));
   const record=db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at FROM break_logs WHERE id=?').get(id);
-  res.status(201).json({break:record,sms:await sendTextBeeBreakSms(recipients,record)});
+  if(status==='scheduled'){
+    const count=queueBreakSms(req.user.organization_id,id,recipients,{...record,scheduled_at:scheduledAt},scheduledAt);
+    return res.status(201).json({break:record,sms:{status:'scheduled',recipient_count:count,message:count?`SMS queued for ${date} at ${time} for selected workload levels.`:'Safety log scheduled; no consented workers in the selected workload levels are assigned to this site.'}});
+  }
+  const sms=await sendTextBeeBreakSms(recipients,{...record,scheduled_at:scheduledAt});
+  if(siteConsented.length&&!consented.length)sms.message='Break saved, but no consented worker at this site matches the selected workload levels.';
+  else if(consented.length&&!recipients.length)sms.message='Break saved, but no selected worker is currently within their shift; no SMS was sent.';
+  res.status(201).json({break:record,sms});
 });
-app.put('/api/breaks',csrfAndOrigin,requireUser,(req,res)=>{
+app.put('/api/breaks',csrfAndOrigin,requireUser,async(req,res)=>{
   const id=String(req.query.id||'').trim();
   if(!id)return sendError(res,400,'Choose a break log to update.');
-  const existing=db.prepare('SELECT id,source FROM break_logs WHERE id=? AND organization_id=?').get(id,req.user.organization_id);
+  const existing=db.prepare('SELECT id,source,status FROM break_logs WHERE id=? AND organization_id=?').get(id,req.user.organization_id);
   if(!existing)return sendError(res,404,'Break log not found.');
   if(existing.source!=='manual')return sendError(res,403,'AI-created safety logs are read-only.');
-  const d=req.body,alertType=String(d.alert_type||'break').trim(),title=BREAK_ALERTS[alertType]||String(d.title||'').trim(),siteId=String(d.site_id||'').trim(),date=String(d.break_date||'').trim(),time=String(d.break_time||'').trim(),status=String(d.status||'logged').trim(),duration=Number(d.duration_minutes);
+  const d=req.body,alertType=String(d.alert_type||'break').trim(),title=BREAK_ALERTS[alertType]||String(d.title||'').trim(),siteId=String(d.site_id||'').trim(),date=String(d.break_date||'').trim(),time=String(d.break_time||'').trim(),status=String(d.status||'logged').trim(),duration=Number(d.duration_minutes),workloadLevels=normalizeWorkloadLevels(d.workload_levels);
+  if(!workloadLevels)return sendError(res,400,'Choose at least one valid workload level for the safety message.');
   if(!['break','rain','storm','earthquake'].includes(alertType)||!title||title.length>120||!/^(\d{4})-(\d{2})-(\d{2})$/.test(date)||!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)||!Number.isInteger(duration)||duration<1||duration>240||!['logged','scheduled'].includes(status))return sendError(res,400,'Enter a valid action, worksite, date, time, and duration from 1 to 240 minutes.');
   const [year,month,day]=date.split('-').map(Number),validDate=new Date(Date.UTC(year,month-1,day));
   if(validDate.getUTCFullYear()!==year||validDate.getUTCMonth()!==month-1||validDate.getUTCDate()!==day)return sendError(res,400,'Enter a valid break date.');
-  const site=db.prepare('SELECT name FROM sites WHERE id=? AND organization_id=?').get(siteId,req.user.organization_id);
+  const site=db.prepare('SELECT id,name,latitude,longitude FROM sites WHERE id=? AND organization_id=?').get(siteId,req.user.organization_id);
   if(!site)return sendError(res,400,'Choose a worksite from your saved Sites list.');
+  const parsedSchedule=Number(d.scheduled_at),scheduledAt=Number.isFinite(parsedSchedule)&&parsedSchedule>0?Math.floor(parsedSchedule):Math.floor(new Date(`${date}T${time}:00`).getTime()/1000);
+  if(!Number.isFinite(scheduledAt)||scheduledAt<=now())return sendError(res,400,'Choose a date and time later than the current time.');
   const workerCount=db.prepare('SELECT COUNT(*) AS count FROM workers WHERE organization_id=?').get(req.user.organization_id).count;
-  db.prepare('UPDATE break_logs SET title=?,site=?,break_date=?,break_time=?,duration_minutes=?,worker_count=?,status=?,alert_type=? WHERE id=? AND organization_id=? AND source=\'manual\'').run(title,site.name,date,time,duration,workerCount,status,alertType,id,req.user.organization_id);
-  const record=db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at FROM break_logs WHERE id=? AND organization_id=?').get(id,req.user.organization_id);
+  db.prepare('UPDATE break_logs SET title=?,site=?,break_date=?,break_time=?,duration_minutes=?,worker_count=?,status=?,alert_type=?,workload_levels=? WHERE id=? AND organization_id=? AND source=\'manual\'').run(title,site.name,date,time,duration,workerCount,status,alertType,JSON.stringify(workloadLevels),id,req.user.organization_id);
+  const record=db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,workload_levels,created_at FROM break_logs WHERE id=? AND organization_id=?').get(id,req.user.organization_id);
+  if(existing.status==='scheduled'||status==='scheduled'){
+    db.prepare("DELETE FROM scheduled_break_sms WHERE break_id=? AND organization_id=? AND status='scheduled'").run(id,req.user.organization_id);
+    if(status==='scheduled'){
+      const siteRow=db.prepare('SELECT id FROM sites WHERE id=? AND organization_id=?').get(siteId,req.user.organization_id);
+      const count=queueBreakSms(req.user.organization_id,id,consentedRecipients(req.user.organization_id,siteRow.id).filter(worker=>workloadLevels.includes(worker.workload)),{...record,scheduled_at:scheduledAt},scheduledAt);
+      return res.json({break:record,sms:{status:'scheduled',recipient_count:count,message:`SMS queue updated for ${date} at ${time} for selected workload levels.`}});
+    }
+  }
   res.json({break:record});
 });
 app.post('/api/breaks/ai-schedule',csrfAndOrigin,requireUser,async(req,res)=>{
@@ -889,10 +1164,10 @@ app.post('/api/breaks/ai-schedule',csrfAndOrigin,requireUser,async(req,res)=>{
     }catch(error){console.error(`AI schedule skipped ${site.id}: ${error.name}`);errors.push(error.message);}
   }
   if (!pending.length) { if(errors.length)return sendError(res,502,errors[0]); return res.json({created:[],message:'AI found no suitable weather-based break to schedule, or weather/Gemini was unavailable.'}); }
-  const created=[],jobs=[];let already=0,workerCount=db.prepare('SELECT COUNT(*) AS count FROM workers WHERE organization_id=?').get(req.user.organization_id).count;
-  for(const item of pending){const duplicate=db.prepare("SELECT 1 FROM break_logs WHERE organization_id=? AND site=? AND break_date=? AND break_time=? AND source='ai' LIMIT 1").get(req.user.organization_id,item.site.name,item.date,item.time);if(duplicate){already++;continue;}const id=token(12);db.prepare(`INSERT INTO break_logs(id,organization_id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at) VALUES(?,?,?,?,?,?,?,?, 'scheduled','ai',?,?,?)`).run(id,req.user.organization_id,item.title,item.site.name,item.date,item.time,item.duration,workerCount,item.alert_type,item.rationale,now());const record=db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at FROM break_logs WHERE id=?').get(id);created.push(record);jobs.push(sendTextBeeBreakSms(consentedRecipients(req.user.organization_id,item.site.id),record));}
-  const sms=await Promise.all(jobs),suffix=already?` ${already} matching AI log(s) already existed.`:'';
-  res.status(201).json({created,sms,message:`AI scheduled ${created.length} weather-based break log(s).${suffix}`});
+  const created=[],sms=[];let already=0,workerCount=db.prepare('SELECT COUNT(*) AS count FROM workers WHERE organization_id=?').get(req.user.organization_id).count;
+  for(const item of pending){const duplicate=db.prepare("SELECT 1 FROM break_logs WHERE organization_id=? AND site=? AND break_date=? AND break_time=? AND source='ai' LIMIT 1").get(req.user.organization_id,item.site.name,item.date,item.time);if(duplicate){already++;continue;}const id=token(12);db.prepare(`INSERT INTO break_logs(id,organization_id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at) VALUES(?,?,?,?,?,?,?,?, 'scheduled','ai',?,?,?)`).run(id,req.user.organization_id,item.title,item.site.name,item.date,item.time,item.duration,workerCount,item.alert_type,item.rationale,now());const record=db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at FROM break_logs WHERE id=?').get(id);created.push(record);const at=Math.floor(new Date(`${item.date}T${item.time}:00Z`).getTime()/1000),count=queueBreakSms(req.user.organization_id,id,consentedRecipients(req.user.organization_id,item.site.id),{...record,scheduled_at:at},at);sms.push({status:'scheduled',recipient_count:count});}
+  const suffix=already?` ${already} matching AI log(s) already existed.`:'';
+  res.status(201).json({created,sms,message:`AI scheduled ${created.length} weather-based break log(s); worker messages are queued for their break times.${suffix}`});
 });
 
 app.use('/api', (req, res) => sendError(res, 404, 'Not found.'));
@@ -915,6 +1190,8 @@ app.listen(PORT, HOST, () => {
   const emergencyPoll=setInterval(()=>void pollEmergencySms(),30000);emergencyPoll.unref();
   const alertFirstRun=setTimeout(()=>void runAlertAutomation(),5000);alertFirstRun.unref();
   const alertPoll=setInterval(()=>void runAlertAutomation(),ALERT_CONFIG.intervalMs);alertPoll.unref();
+  const breakSmsFirstRun=setTimeout(()=>void dispatchScheduledBreakSms(),3000);breakSmsFirstRun.unref();
+  const breakSmsPoll=setInterval(()=>void dispatchScheduledBreakSms(),15000);breakSmsPoll.unref();
 });
 
 

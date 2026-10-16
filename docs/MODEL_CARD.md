@@ -2,7 +2,7 @@
 
 ## Intended use
 
-Optional short-horizon weather decision support for Bangladesh worksites. Outputs can add precautionary notice; they must never suppress deterministic heat, rain, lightning, official-advisory, or emergency-code actions.
+Optional short-horizon weather decision support for Bangladesh worksites. Outputs can add precautionary notice; they must never suppress deterministic heat, rain, lightning or emergency-code actions.
 
 ## Data and evaluation
 

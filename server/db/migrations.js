@@ -13,12 +13,6 @@ const migrations = [
       CREATE TABLE IF NOT EXISTS org_ai_features(organization_id TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,settings_json TEXT NOT NULL DEFAULT '{}',updated_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS feature_flags(flag_key TEXT PRIMARY KEY,env_name TEXT NOT NULL,default_enabled INTEGER NOT NULL DEFAULT 0,description TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS bangla_templates(template_key TEXT PRIMARY KEY,text TEXT NOT NULL,review_status TEXT NOT NULL DEFAULT 'pending_native_review',updated_at INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS official_advisories(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,source TEXT NOT NULL,external_id TEXT,content_hash TEXT NOT NULL,hazard TEXT NOT NULL,severity TEXT NOT NULL,areas_json TEXT NOT NULL,issued_at INTEGER NOT NULL,valid_from INTEGER NOT NULL,valid_to INTEGER NOT NULL,headline TEXT NOT NULL,body TEXT NOT NULL,source_url TEXT NOT NULL,raw_json TEXT NOT NULL DEFAULT '{}',created_at INTEGER NOT NULL,created_by TEXT NOT NULL);
-      CREATE UNIQUE INDEX IF NOT EXISTS advisory_external_dedupe_idx ON official_advisories(organization_id,source,external_id) WHERE external_id IS NOT NULL;
-      CREATE INDEX IF NOT EXISTS advisory_active_idx ON official_advisories(organization_id,valid_from,valid_to);
-      CREATE TABLE IF NOT EXISTS official_feed_status(feed_key TEXT PRIMARY KEY,last_success_at INTEGER,last_error TEXT NOT NULL DEFAULT '',items_fetched INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS advisory_crosschecks(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE,advisory_id TEXT REFERENCES official_advisories(id) ON DELETE SET NULL,heat_category TEXT NOT NULL,agreement TEXT NOT NULL,checked_at INTEGER NOT NULL);
-      CREATE INDEX IF NOT EXISTS crosschecks_org_time_idx ON advisory_crosschecks(organization_id,checked_at DESC);
       CREATE TABLE IF NOT EXISTS nowcast_snapshots(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE,observed_at INTEGER NOT NULL,features_json TEXT NOT NULL,forecast_json TEXT NOT NULL,model_version TEXT NOT NULL,fallback INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS nowcast_predictions(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,site_id TEXT NOT NULL REFERENCES sites(id) ON DELETE CASCADE,snapshot_id TEXT NOT NULL REFERENCES nowcast_snapshots(id) ON DELETE CASCADE,target_at INTEGER NOT NULL,horizon_minutes INTEGER NOT NULL,rain_probability REAL,apparent_c REAL,heat_crossing INTEGER,baseline_json TEXT NOT NULL DEFAULT '{}',actual_rain INTEGER,actual_apparent_c REAL,scored_at INTEGER,created_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS nowcast_predictions_site_target_idx ON nowcast_predictions(site_id,target_at);
@@ -31,6 +25,30 @@ const migrations = [
       CREATE TABLE IF NOT EXISTS safety_reports(id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,period_kind TEXT NOT NULL,period_start TEXT NOT NULL,period_end TEXT NOT NULL,facts_json TEXT NOT NULL,findings_json TEXT NOT NULL,narrative_en TEXT NOT NULL,narrative_bn TEXT NOT NULL,ai_generated INTEGER NOT NULL DEFAULT 0,model TEXT NOT NULL DEFAULT '',prompt_version TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(organization_id,period_kind,period_start,period_end));
       CREATE INDEX IF NOT EXISTS safety_reports_org_period_idx ON safety_reports(organization_id,period_kind,period_start DESC);
       CREATE TABLE IF NOT EXISTS feature_job_state(job_key TEXT PRIMARY KEY,last_run_at INTEGER,last_status TEXT NOT NULL DEFAULT 'never',last_error TEXT NOT NULL DEFAULT '',updated_at INTEGER NOT NULL);
+    `,
+  },
+  {
+    version: 2,
+    name: 'remove_official_advisories_and_voice_calls',
+    sql: `
+      DROP TABLE IF EXISTS advisory_crosschecks;
+      DROP TABLE IF EXISTS official_feed_status;
+      DROP TABLE IF EXISTS official_advisories;
+      DROP INDEX IF EXISTS advisory_external_dedupe_idx;
+      DROP INDEX IF EXISTS advisory_active_idx;
+      DROP INDEX IF EXISTS crosschecks_org_time_idx;
+      DELETE FROM feature_flags WHERE flag_key='official_advisories';
+      UPDATE org_ai_features SET settings_json=json_remove(settings_json,'$.officialAdvisories');
+      UPDATE workers SET channel_preference='sms' WHERE channel_preference IN ('voice','sms+voice');
+      ALTER TABLE workers DROP COLUMN voice_first;
+      ALTER TABLE workers DROP COLUMN channel_preference;
+    `,
+  },
+  {
+    version: 3,
+    name: 'sms_history_deletion_markers',
+    sql: `
+      CREATE TABLE IF NOT EXISTS sms_deleted_messages(organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,id TEXT NOT NULL,deleted_at INTEGER NOT NULL,PRIMARY KEY(organization_id,id));
     `,
   },
 ];
@@ -47,6 +65,11 @@ export function runMigrations(db, { databasePath, development = true, clock = ()
     db.exec('BEGIN IMMEDIATE');
     try {
       db.exec('CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at INTEGER NOT NULL)');
+      if (migration.version === 2) {
+        const workerColumns = db.prepare('PRAGMA table_info(workers)').all().map(row => row.name);
+        if (!workerColumns.includes('channel_preference')) db.exec("ALTER TABLE workers ADD COLUMN channel_preference TEXT NOT NULL DEFAULT 'sms'");
+        if (!workerColumns.includes('voice_first')) db.exec('ALTER TABLE workers ADD COLUMN voice_first INTEGER NOT NULL DEFAULT 0');
+      }
       for (const [table, column, declaration] of [
         ['sites', 'division', "TEXT NOT NULL DEFAULT ''"],
         ['sites', 'district', "TEXT NOT NULL DEFAULT ''"],
@@ -58,7 +81,7 @@ export function runMigrations(db, { databasePath, development = true, clock = ()
         if (!columns.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`);
       }
       db.exec(migration.sql);
-      db.prepare("INSERT OR IGNORE INTO feature_flags(flag_key,env_name,default_enabled,description) VALUES('nowcast','NOWCAST_ENABLED',0,'Short-horizon local weather nowcast'),('break_planner','SMART_BREAK_SCHEDULER_ENABLED',0,'Safety-constrained crew break planning'),('triage','AI_TRIAGE_ENABLED',0,'Optional AI assistance for unclassified symptom SMS'),('reports','AI_SAFETY_REPORTS_ENABLED',0,'Daily and weekly aggregated safety reports'),('official_advisories','OFFICIAL_ADVISORIES_ENABLED',1,'Official advisories and manual entries')").run();
+      db.prepare("INSERT OR IGNORE INTO feature_flags(flag_key,env_name,default_enabled,description) VALUES('nowcast','NOWCAST_ENABLED',0,'Short-horizon local weather nowcast'),('break_planner','SMART_BREAK_SCHEDULER_ENABLED',0,'Safety-constrained crew break planning'),('triage','AI_TRIAGE_ENABLED',0,'Optional AI assistance for unclassified symptom SMS'),('reports','AI_SAFETY_REPORTS_ENABLED',0,'Daily and weekly aggregated safety reports')").run();
       db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)').run(migration.version, migration.name, clock());
       db.exec('COMMIT');
     } catch (error) {

@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "concurrently -k \"node --watch server.js\" \"vite\"",
+    "dev": "concurrently -k \"node --watch-path=server.js --watch-path=server --watch-path=.env server.js\" \"vite\"",
     "build": "vite build",
     "test": "node --test server/alerts/*.test.js server/features.test.js",
     "start": "npm run build && node server.js",

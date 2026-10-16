@@ -5,9 +5,9 @@ import { decideAlerts } from './index.js';
 import { callAlertAi } from './ai.js';
 import { dispatchAlertGroups } from './gateway.js';
 
-const config = { ...ALERT_CONFIG, enabled: true, aiEnabled: false, baseHeatTriggerC: 34, workloadOffsets: { Light: 0, Standard: 2, Moderate: 2, Heavy: 4, 'Very Heavy': 6 }, rainLeadMinutes: 120, rainProbability: 60, cooldownMinutes: 40, dailyCap: 2, quietHours: { start: '20:00', end: '06:00' }, staleWeatherMinutes: 45 };
+const config = { ...ALERT_CONFIG, enabled: true, aiEnabled: false, baseHeatTriggerC: 34, workloadOffsets: { Light: 0, Standard: 2, Moderate: 2, Heavy: 4 }, rainLeadMinutes: 120, rainProbability: 60, cooldownMinutes: 40, dailyCap: 2, quietHours: { start: '20:00', end: '06:00' }, staleWeatherMinutes: 45 };
 const context = (overrides = {}) => ({
-  worker: { id: 'worker_1', workload: 'Light', riskLevel: '', consentStatus: 'consented', shiftStart: '07:00', shiftEnd: '17:00', continuousHours: 1, voiceFirst: false, ...overrides.worker },
+  worker: { id: 'worker_1', workload: 'Light', riskLevel: '', consentStatus: 'consented', shiftStart: '07:00', shiftEnd: '17:00', continuousHours: 1, ...overrides.worker },
   site: { id: 'site_1', shadeAvailable: true, waterAvailable: true, ...overrides.site },
   weather: { apparentC: 28, temperatureC: 28, dataAgeMinutes: 5, currentPrecipitation: 0, rainProbability: 0, rainEtaMinutes: null, lightning: false, ...overrides.weather },
   state: { alertsSentToday: 0, ...overrides.state }, now: overrides.now || new Date('2026-10-13T10:00:00Z'),
@@ -86,13 +86,12 @@ test('AI cannot skip an existing floor alert, and the prompt omits names and pho
   assert.doesNotMatch(sentPrompt,/worker_1/);
 });
 
-test('identical team SMS is grouped; an unavailable voice-only channel falls back to SMS',async()=>{
+test('identical team SMS is grouped for a single SMS dispatch',async()=>{
   let smsCalls=0;
-  const result=await dispatchAlertGroups([{id:'one',phone:'+8801700000001',message:'Same message',channel:'sms'},{id:'two',phone:'+8801700000002',message:'Same message',channel:'sms'},{id:'three',phone:'+8801700000003',message:'Urgent',channel:'voice'}],{smsSender:async recipients=>{smsCalls++;return {accepted:recipients.length>0};},voiceSender:async()=>({accepted:false})});
-  assert.equal(result.length,2);
+  const result=await dispatchAlertGroups([{id:'one',phone:'+8801700000001',message:'Same message',channel:'sms'},{id:'two',phone:'+8801700000002',message:'Same message',channel:'sms'}],{smsSender:async recipients=>{smsCalls++;return {accepted:recipients.length>0};}});
+  assert.equal(result.length,1);
   assert.equal(result[0].recipients.length,2);
-  assert.equal(result[1].smsFallback,true);
-  assert.equal(smsCalls,2);
+  assert.equal(smsCalls,1);
 });
 
 test('invalid, empty and timed-out model responses fall back without throwing', async () => {
