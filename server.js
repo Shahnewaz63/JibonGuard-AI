@@ -19,6 +19,7 @@ import { createMeteringService, estimateGeminiTokens } from './server/billing/me
 import { calculateSmsSegments } from './server/billing/smsSegments.js';
 import { rebuildUsageRollups } from './server/billing/rollups.js';
 import { checkFeatureAccess, checkResourceLimit } from './server/billing/entitlements.js';
+import { canTransitionSubscription } from './server/billing/subscriptionState.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 for (const line of (existsSync(path.join(__dirname, '.env')) ? readFileSync(path.join(__dirname, '.env'), 'utf8') : '').split(/\r?\n/)) {
@@ -185,6 +186,7 @@ const requireUser = (req, res, next) => {
 };
 const requirePlanFeature = feature => (req,res,next) => {
   const access=checkFeatureAccess(db,req.user.organization_id,feature);
+  if(feature==='data_export'&&access.status==='suspended')return next();
   if(access.allowed)return next();
   return res.status(402).json({error:'This feature is not included in your current plan.',code:'PLAN_FEATURE_REQUIRED',feature,plan_id:access.planId,status:access.status,billing_url:'/billing'});
 };
@@ -478,6 +480,152 @@ app.get('/api/admin/usage',requireAdmin,adminPermission('usage_read'),(req,res)=
 app.get('/api/admin/rates',requireAdmin,adminPermission('billing_read'),(_req,res)=>{
   res.set('Cache-Control','no-store').json({costs:db.prepare('SELECT * FROM cost_rates ORDER BY effective_from DESC LIMIT 500').all(),prices:db.prepare('SELECT * FROM price_rates ORDER BY effective_from DESC LIMIT 500').all()});
 });
+const ADMIN_BILLING_SETTINGS=new Set(['currency','tax_rate_bps','prices_include_tax','invoice_prefix','invoice_next_sequence','grace_period_days','safety_alerts_exempt_from_limits','default_plan_id','payment_instructions']);
+app.get('/api/admin/settings/billing',requireAdmin,adminPermission('settings_write'),(_req,res)=>{
+  const settings=Object.fromEntries(db.prepare('SELECT setting_key,value_json FROM billing_settings').all().filter(row=>ADMIN_BILLING_SETTINGS.has(row.setting_key)).map(row=>{try{return [row.setting_key,JSON.parse(row.value_json)];}catch{return [row.setting_key,null];}}));res.set('Cache-Control','no-store').json({settings});
+});
+app.put('/api/admin/settings/billing',adminCsrfAndOrigin,requireAdmin,adminPermission('settings_write'),(req,res)=>{
+  const input=req.body?.settings,reason=String(req.body?.reason||'').trim().slice(0,500);if(!input||typeof input!=='object'||Array.isArray(input)||!reason)return sendError(res,422,'Provide billing settings and an audit reason.');
+  const allowed=Object.fromEntries(Object.entries(input).filter(([key])=>ADMIN_BILLING_SETTINGS.has(key)));if(Object.keys(allowed).length!==Object.keys(input).length)return sendError(res,422,'Unknown billing setting.');
+  if(allowed.currency!==undefined&&!/^[A-Z]{3}$/.test(String(allowed.currency).toUpperCase()))return sendError(res,422,'Currency must be a three-letter code.');
+  if(allowed.tax_rate_bps!==undefined&&(!Number.isInteger(allowed.tax_rate_bps)||allowed.tax_rate_bps<0||allowed.tax_rate_bps>10000))return sendError(res,422,'Tax rate must be between 0 and 10000 basis points.');
+  if(allowed.prices_include_tax!==undefined&&typeof allowed.prices_include_tax!=='boolean'||allowed.safety_alerts_exempt_from_limits!==undefined&&typeof allowed.safety_alerts_exempt_from_limits!=='boolean')return sendError(res,422,'Boolean billing settings must be true or false.');
+  if(allowed.invoice_prefix!==undefined&&(typeof allowed.invoice_prefix!=='string'||allowed.invoice_prefix.length>24||!/^[A-Za-z0-9-]*$/.test(allowed.invoice_prefix)))return sendError(res,422,'Invoice prefix must contain up to 24 letters, digits or hyphens.');
+  if(allowed.invoice_next_sequence!==undefined&&(!Number.isSafeInteger(Number(allowed.invoice_next_sequence))||Number(allowed.invoice_next_sequence)<1))return sendError(res,422,'Invoice sequence must be a positive whole number.');
+  if(allowed.grace_period_days!==undefined&&(!Number.isInteger(allowed.grace_period_days)||allowed.grace_period_days<0||allowed.grace_period_days>90))return sendError(res,422,'Grace period must be between 0 and 90 days.');
+  if(allowed.default_plan_id!==undefined&&!db.prepare('SELECT id FROM plans WHERE id=?').get(String(allowed.default_plan_id)))return sendError(res,422,'Default plan does not exist.');
+  if(allowed.payment_instructions!==undefined&&(typeof allowed.payment_instructions!=='string'||allowed.payment_instructions.length>3000))return sendError(res,422,'Payment instructions must be 3000 characters or fewer.');
+  const stamp=now(),before={};for(const [key,value] of Object.entries(allowed))before[key]=billingSetting(key,null);
+  db.exec('BEGIN IMMEDIATE');try{for(const [key,value] of Object.entries(allowed))db.prepare('INSERT INTO billing_settings(setting_key,value_json,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json,updated_by=excluded.updated_by,updated_at=excluded.updated_at').run(key,JSON.stringify(key==='currency'?String(value).toUpperCase():value),req.admin.id,stamp);writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'billing.settings_updated',targetType:'billing_settings',targetId:'global',ip:req.ip||'',userAgent:req.get('user-agent')||'',before,after:allowed,reason,now:stamp});db.exec('COMMIT');}catch(error){db.exec('ROLLBACK');throw error;}
+  res.json({settings:Object.fromEntries(Object.entries(allowed).map(([key,value])=>[key,key==='currency'?String(value).toUpperCase():value]))});
+});
+app.get('/api/pricing',(_req,res)=>{
+  const plans=db.prepare("SELECT * FROM plans WHERE status='active' AND sample_values=0 ORDER BY sort_order,name").all();
+  const items=plans.map(plan=>({...plan,prices:db.prepare('SELECT billing_cycle,amount_minor,currency FROM plan_prices WHERE plan_id=? ORDER BY billing_cycle,effective_from DESC').all(plan.id).filter((row,index,rows)=>rows.findIndex(other=>other.billing_cycle===row.billing_cycle)===index),limits:Object.fromEntries(db.prepare('SELECT limit_key,value,unlimited FROM plan_limits WHERE plan_id=?').all(plan.id).map(row=>[row.limit_key,{value:row.value,unlimited:Boolean(row.unlimited)}])),features:Object.fromEntries(db.prepare('SELECT feature_key,enabled FROM plan_features WHERE plan_id=?').all(plan.id).map(row=>[row.feature_key,Boolean(row.enabled)]))}));
+  res.set('Cache-Control','no-store').json({plans:items});
+});
+function billingSetting(key,fallback){try{return JSON.parse(db.prepare('SELECT value_json FROM billing_settings WHERE setting_key=?').get(key)?.value_json??JSON.stringify(fallback));}catch{return fallback;}}
+function createPlanInvoice({organizationId,subscriptionId,planName,amountMinor,currency,stamp}){
+  const next=Number(billingSetting('invoice_next_sequence',1)),prefix=String(billingSetting('invoice_prefix','JG-'));
+  if(!Number.isSafeInteger(next)||next<1||!Number.isSafeInteger(amountMinor)||amountMinor<0)throw new Error('Invoice numbering or amount settings are invalid.');
+  const taxRate=Number(billingSetting('tax_rate_bps',0)),inclusive=billingSetting('prices_include_tax',false);if(!Number.isInteger(taxRate)||taxRate<0||taxRate>10000)throw new Error('Tax settings are invalid.');
+  const denominator=BigInt(inclusive?10000+taxRate:10000),numerator=BigInt(amountMinor)*BigInt(taxRate),tax=Number((numerator+denominator/2n)/denominator),total=inclusive?amountMinor:amountMinor+tax;if(!Number.isSafeInteger(total))throw new Error('Invoice amount exceeds the supported range.');
+  const id=token(18),number=`${prefix}${String(next).padStart(6,'0')}`;
+  db.prepare("UPDATE billing_settings SET value_json=?,updated_at=? WHERE setting_key='invoice_next_sequence'").run(JSON.stringify(String(next+1)),stamp);
+  db.prepare("INSERT INTO invoices(id,organization_id,subscription_id,invoice_number,status,currency,subtotal_minor,tax_minor,total_minor,issued_at,due_at,billing_details_json,created_at) VALUES(?,?,?,?,'open',?,?,?,?,?,?,?,?)").run(id,organizationId,subscriptionId,number,currency,amountMinor,tax,total,stamp,stamp+7*86400,JSON.stringify(db.prepare('SELECT legal_name,address,tax_id FROM organization_billing_details WHERE organization_id=?').get(organizationId)||{}),stamp);
+  db.prepare('INSERT INTO invoice_lines(id,invoice_id,description,line_type,quantity,unit_amount_minor,amount_minor,metadata_json) VALUES(?,?,?,?,?,?,?,?)').run(token(16),id,`${planName} subscription`, 'plan_fee',1,amountMinor,amountMinor,JSON.stringify({subscription_id:subscriptionId}));
+  return id;
+}
+app.get('/api/billing',requireUser,(req,res)=>{
+  const org=req.user.organization_id,subscription=db.prepare("SELECT s.*,p.name AS plan_name FROM subscriptions s JOIN plans p ON p.id=s.plan_id WHERE s.organization_id=? ORDER BY s.created_at DESC LIMIT 1").get(org);
+  const invoices=db.prepare('SELECT id,invoice_number,status,currency,subtotal_minor,tax_minor,total_minor,amount_paid_minor,issued_at,due_at,paid_at FROM invoices WHERE organization_id=? ORDER BY issued_at DESC LIMIT 100').all(org);
+  const payments=db.prepare('SELECT id,invoice_id,adapter,status,amount_minor,currency,transaction_ref,created_at,verified_at FROM payments WHERE organization_id=? ORDER BY created_at DESC LIMIT 100').all(org);
+  const details=db.prepare('SELECT legal_name,address,tax_id FROM organization_billing_details WHERE organization_id=?').get(org)||{legal_name:'',address:'',tax_id:''};
+  const instructions=JSON.parse(db.prepare("SELECT value_json FROM billing_settings WHERE setting_key='payment_instructions'").get()?.value_json||'"Manual payment instructions are not configured."');
+  const resources={workers:Number(db.prepare('SELECT COUNT(*) AS n FROM workers WHERE organization_id=?').get(org).n),sites:Number(db.prepare('SELECT COUNT(*) AS n FROM sites WHERE organization_id=?').get(org).n)},usage=subscription?db.prepare('SELECT event_type,SUM(quantity) AS quantity,SUM(cost_minor) AS cost_minor,SUM(price_minor) AS price_minor FROM usage_events WHERE organization_id=? AND created_at>=? AND created_at<? GROUP BY event_type').all(org,subscription.current_period_start,Math.min(now(),subscription.current_period_end)):[];
+  const entitlements=getOrganizationEntitlements(db,org);
+  res.set('Cache-Control','no-store').json({subscription:subscription||null,invoices,payments,billing_details:details,payment_instructions:instructions,resources,limits:entitlements.limits,features:entitlements.features,usage});
+});
+app.put('/api/billing/details',csrfAndOrigin,requireUser,(req,res)=>{
+  const details={legal_name:String(req.body.legal_name||'').trim().slice(0,160),address:String(req.body.address||'').trim().slice(0,500),tax_id:String(req.body.tax_id||'').trim().slice(0,80)};
+  db.prepare('INSERT INTO organization_billing_details(organization_id,legal_name,address,tax_id,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(organization_id) DO UPDATE SET legal_name=excluded.legal_name,address=excluded.address,tax_id=excluded.tax_id,updated_at=excluded.updated_at').run(req.user.organization_id,details.legal_name,details.address,details.tax_id,now());
+  res.json({billing_details:details});
+});
+app.get('/api/billing/invoices/:id',requireUser,(req,res)=>{
+  const invoice=db.prepare('SELECT * FROM invoices WHERE id=? AND organization_id=?').get(req.params.id,req.user.organization_id);if(!invoice)return sendError(res,404,'Invoice not found.');
+  res.set('Cache-Control','no-store').json({invoice,lines:db.prepare('SELECT description,line_type,quantity,unit_amount_minor,amount_minor FROM invoice_lines WHERE invoice_id=?').all(invoice.id)});
+});
+app.post('/api/billing/subscription/cancel',csrfAndOrigin,requireUser,(req,res)=>{
+  const org=req.user.organization_id,sub=db.prepare("SELECT * FROM subscriptions WHERE organization_id=? AND status IN ('trialing','active','past_due') ORDER BY created_at DESC LIMIT 1").get(org);if(!sub)return sendError(res,404,'No cancellable subscription was found.');
+  if(sub.cancel_at_period_end)return res.json({subscription:sub,message:'Cancellation is already scheduled.'});
+  const stamp=now(),reason=String(req.body.reason||'Customer requested cancellation.').trim().slice(0,500);db.prepare('UPDATE subscriptions SET cancel_at_period_end=1,updated_at=? WHERE id=?').run(stamp,sub.id);db.prepare('INSERT INTO subscription_events(id,subscription_id,organization_id,event_type,from_status,to_status,reason,created_at) VALUES(?,?,?,?,?,?,?,?)').run(token(16),sub.id,org,'cancellation_scheduled',sub.status,sub.status,reason,stamp);
+  res.json({subscription:db.prepare('SELECT * FROM subscriptions WHERE id=?').get(sub.id)});
+});
+app.post('/api/billing/subscription/reactivate',csrfAndOrigin,requireUser,(req,res)=>{
+  const org=req.user.organization_id,sub=db.prepare("SELECT * FROM subscriptions WHERE organization_id=? AND status IN ('trialing','active','past_due') AND cancel_at_period_end=1 ORDER BY created_at DESC LIMIT 1").get(org);if(!sub)return sendError(res,404,'No scheduled cancellation was found.');
+  const stamp=now();db.prepare('UPDATE subscriptions SET cancel_at_period_end=0,updated_at=? WHERE id=?').run(stamp,sub.id);db.prepare('INSERT INTO subscription_events(id,subscription_id,organization_id,event_type,from_status,to_status,reason,created_at) VALUES(?,?,?,?,?,?,?,?)').run(token(16),sub.id,org,'cancellation_reversed',sub.status,sub.status,'Customer reactivated subscription.',stamp);res.json({subscription:db.prepare('SELECT * FROM subscriptions WHERE id=?').get(sub.id)});
+});
+app.post('/api/billing/payments',csrfAndOrigin,requireUser,(req,res)=>{
+  const org=req.user.organization_id,invoiceId=String(req.body.invoice_id||''),transactionRef=String(req.body.transaction_ref||'').trim(),proofRef=String(req.body.proof_ref||'').trim();
+  if(!transactionRef||transactionRef.length>160||proofRef.length>500)return sendError(res,422,'Enter a transaction reference and an optional short proof reference.');
+  const invoice=db.prepare("SELECT * FROM invoices WHERE id=? AND organization_id=? AND status='open'").get(invoiceId,org);
+  if(!invoice)return sendError(res,404,'Open invoice not found.');
+  const already=db.prepare("SELECT id FROM payments WHERE invoice_id=? AND status='pending'").get(invoiceId);if(already)return sendError(res,409,'A payment for this invoice is already awaiting review.');
+  const id=token(18),stamp=now();try{db.prepare("INSERT INTO payments(id,invoice_id,organization_id,adapter,status,amount_minor,currency,transaction_ref,proof_ref,created_at) VALUES(?,?,?,'manual','pending',?,?,?,?,?)").run(id,invoice.id,org,invoice.total_minor-invoice.amount_paid_minor,invoice.currency,transactionRef,proofRef,stamp);}catch(error){if(error.code==='SQLITE_CONSTRAINT_UNIQUE')return sendError(res,409,'That transaction reference has already been submitted.');throw error;}
+  res.status(201).json({payment:{id,status:'pending',amount_minor:invoice.total_minor-invoice.amount_paid_minor,currency:invoice.currency}});
+});
+app.get('/api/admin/invoices',requireAdmin,adminPermission('billing_read'),(req,res)=>{
+  const limit=Math.min(100,Math.max(1,Number.parseInt(req.query.limit,10)||50)),offset=Math.max(0,Number.parseInt(req.query.offset,10)||0);
+  const items=db.prepare('SELECT i.*,o.name AS organization_name FROM invoices i JOIN organizations o ON o.id=i.organization_id ORDER BY i.issued_at DESC LIMIT ? OFFSET ?').all(limit,offset);
+  res.json({items,total:Number(db.prepare('SELECT COUNT(*) AS n FROM invoices').get().n||0),limit,offset});
+});
+app.get('/api/admin/subscriptions',requireAdmin,adminPermission('billing_read'),(req,res)=>{
+  const status=String(req.query.status||'');if(status&&!['trialing','active','past_due','suspended','cancelled','expired'].includes(status))return sendError(res,422,'Unknown subscription status.');
+  const where=status?'WHERE s.status=?':'';const items=db.prepare(`SELECT s.*,o.name AS organization_name,p.name AS plan_name FROM subscriptions s JOIN organizations o ON o.id=s.organization_id JOIN plans p ON p.id=s.plan_id ${where} ORDER BY s.created_at DESC LIMIT 200`).all(...(status?[status]:[]));res.json({items});
+});
+app.post('/api/admin/subscriptions',adminCsrfAndOrigin,requireAdmin,adminPermission('billing_write'),(req,res)=>{
+  const org=String(req.body.organization_id||''),planId=String(req.body.plan_id||''),cycle=req.body.billing_cycle,status=req.body.status||'active',reason=String(req.body.reason||'').trim().slice(0,500);
+  const plan=readAdminPlan(planId);if(!db.prepare('SELECT id FROM organizations WHERE id=?').get(org)||!plan)return sendError(res,404,'Organization or plan not found.');
+  if(!['monthly','yearly'].includes(cycle)||!['trialing','active','past_due'].includes(status)||!reason)return sendError(res,422,'Choose a valid billing cycle and initial status, with an audit reason.');
+  const price=req.body.price_minor===undefined?plan.prices.find(item=>item.billing_cycle===cycle):{amount_minor:req.body.price_minor,currency:req.body.currency||plan.prices[0]?.currency||'BDT'};
+  if(!price||!Number.isSafeInteger(price.amount_minor)||price.amount_minor<0||!/^[A-Z]{3}$/.test(String(price.currency).toUpperCase()))return sendError(res,422,'The selected plan has no valid price for that billing cycle.');
+  const stamp=now(),id=token(18),duration=cycle==='yearly'?31536000:2592000,periodEnd=stamp+duration;
+  db.exec('BEGIN IMMEDIATE');try{
+    const previous=db.prepare("SELECT * FROM subscriptions WHERE organization_id=? AND status IN ('trialing','active','past_due','suspended') ORDER BY created_at DESC LIMIT 1").get(org);
+    if(previous){db.prepare("UPDATE subscriptions SET status='cancelled',cancel_at_period_end=0,updated_at=? WHERE id=?").run(stamp,previous.id);db.prepare('INSERT INTO subscription_events(id,subscription_id,organization_id,event_type,from_status,to_status,reason,created_at) VALUES(?,?,?,?,?,?,?,?)').run(token(16),previous.id,org,'replaced',previous.status,'cancelled',reason,stamp);}
+    db.prepare('INSERT INTO subscriptions(id,organization_id,plan_id,status,billing_cycle,price_minor,currency,current_period_start,current_period_end,trial_end,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(id,org,planId,status,cycle,price.amount_minor,String(price.currency).toUpperCase(),stamp,periodEnd,status==='trialing'?periodEnd:null,stamp,stamp);
+    db.prepare('INSERT INTO subscription_events(id,subscription_id,organization_id,event_type,to_status,details_json,reason,created_at) VALUES(?,?,?,?,?,?,?,?)').run(token(16),id,org,'assigned',status,JSON.stringify({plan_id:planId,billing_cycle:cycle,price_minor:price.amount_minor}),reason,stamp);
+    writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'subscription.assigned',targetType:'subscription',targetId:id,ip:req.ip||'',userAgent:req.get('user-agent')||'',after:{organization_id:org,plan_id:planId,status,billing_cycle:cycle,price_minor:price.amount_minor,currency:price.currency},reason,now:stamp});db.exec('COMMIT');
+  }catch(error){db.exec('ROLLBACK');throw error;}
+  res.status(201).json({subscription:db.prepare('SELECT * FROM subscriptions WHERE id=?').get(id)});
+});
+app.patch('/api/admin/subscriptions/:id/status',adminCsrfAndOrigin,requireAdmin,adminPermission('billing_write'),(req,res)=>{
+  const current=db.prepare('SELECT * FROM subscriptions WHERE id=?').get(req.params.id);if(!current)return sendError(res,404,'Subscription not found.');
+  const target=String(req.body.status||''),reason=String(req.body.reason||'').trim().slice(0,500);if(!reason)return sendError(res,422,'Include a reason for the subscription status change.');
+  if(!canTransitionSubscription(current.status,target))return sendError(res,409,`Subscription cannot transition from ${current.status} to ${target}.`);
+  const stamp=now();db.exec('BEGIN IMMEDIATE');try{
+    db.prepare('UPDATE subscriptions SET status=?,updated_at=?,grace_end=? WHERE id=?').run(target,stamp,target==='past_due'?stamp+7*86400:null,current.id);
+    db.prepare('INSERT INTO subscription_events(id,subscription_id,organization_id,event_type,from_status,to_status,reason,created_at) VALUES(?,?,?,?,?,?,?,?)').run(token(16),current.id,current.organization_id,'status_changed',current.status,target,reason,stamp);
+    writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'subscription.status_changed',targetType:'subscription',targetId:current.id,ip:req.ip||'',userAgent:req.get('user-agent')||'',before:{status:current.status},after:{status:target},reason,now:stamp});db.exec('COMMIT');
+  }catch(error){db.exec('ROLLBACK');throw error;}
+  res.json({subscription:db.prepare('SELECT * FROM subscriptions WHERE id=?').get(current.id)});
+});
+app.post('/api/admin/invoices',adminCsrfAndOrigin,requireAdmin,adminPermission('billing_write'),(req,res)=>{
+  const org=String(req.body.organization_id||''),subscriptionId=req.body.subscription_id?String(req.body.subscription_id):null,lines=req.body.lines;
+  if(!db.prepare('SELECT id FROM organizations WHERE id=?').get(org))return sendError(res,404,'Organization not found.');
+  if(subscriptionId&&!db.prepare('SELECT id FROM subscriptions WHERE id=? AND organization_id=?').get(subscriptionId,org))return sendError(res,422,'Subscription does not belong to this organization.');
+  if(!Array.isArray(lines)||!lines.length||lines.length>50)return sendError(res,422,'Add between 1 and 50 invoice lines.');
+  const normalized=[];for(const line of lines){const description=String(line.description||'').trim(),quantity=line.quantity,unit=line.unit_amount_minor;if(!description||description.length>240||!Number.isSafeInteger(quantity)||quantity<1||quantity>1000000||!Number.isSafeInteger(unit)||unit<0||unit>100000000000)return sendError(res,422,'Invoice lines need a description, positive whole quantity, and nonnegative integer unit amount.');normalized.push({description,quantity,unit,amount:quantity*unit});}
+  const subtotal=normalized.reduce((sum,line)=>sum+line.amount,0);if(!Number.isSafeInteger(subtotal))return sendError(res,422,'Invoice total exceeds the supported amount.');
+  const taxBps=Number(JSON.parse(db.prepare("SELECT value_json FROM billing_settings WHERE setting_key='tax_rate_bps'").get()?.value_json||'0'));if(!Number.isInteger(taxBps)||taxBps<0||taxBps>10000)return sendError(res,503,'Billing tax configuration is invalid.');
+  const currency=String(req.body.currency||db.prepare("SELECT value_json FROM billing_settings WHERE setting_key='currency'").get()?.value_json||'"BDT"').replaceAll('"','').toUpperCase();if(!/^[A-Z]{3}$/.test(currency))return sendError(res,422,'Use a valid three-letter currency code.');
+  const inclusive=JSON.parse(db.prepare("SELECT value_json FROM billing_settings WHERE setting_key='prices_include_tax'").get()?.value_json||'false'),taxDenominator=BigInt(inclusive?10000+taxBps:10000),taxNumerator=BigInt(subtotal)*BigInt(taxBps),tax=Number((taxNumerator+taxDenominator/2n)/taxDenominator),total=inclusive?subtotal:subtotal+tax;if(!Number.isSafeInteger(total))return sendError(res,422,'Invoice total exceeds the supported amount.');
+  const stamp=now(),id=token(18),seqRow=db.prepare("SELECT value_json FROM billing_settings WHERE setting_key='invoice_next_sequence'").get(),sequence=Number(JSON.parse(seqRow?.value_json||'1')),prefix=String(JSON.parse(db.prepare("SELECT value_json FROM billing_settings WHERE setting_key='invoice_prefix'").get()?.value_json||'"JG-"'));
+  if(!Number.isSafeInteger(sequence)||sequence<1)return sendError(res,503,'Invoice sequence configuration is invalid.');
+  const number=`${prefix}${String(sequence).padStart(6,'0')}`;
+  db.exec('BEGIN IMMEDIATE');try{
+    db.prepare("UPDATE billing_settings SET value_json=?,updated_by=?,updated_at=? WHERE setting_key='invoice_next_sequence'").run(JSON.stringify(String(sequence+1)),req.admin.id,stamp);
+    db.prepare("INSERT INTO invoices(id,organization_id,subscription_id,invoice_number,status,currency,subtotal_minor,tax_minor,total_minor,issued_at,due_at,billing_details_json,created_at) VALUES(?,?,?,?,'open',?,?,?,?,?,?,?,?)").run(id,org,subscriptionId,number,currency,subtotal,tax,total,stamp,Number.isSafeInteger(req.body.due_at)?req.body.due_at:null,JSON.stringify(db.prepare('SELECT legal_name,address,tax_id FROM organization_billing_details WHERE organization_id=?').get(org)||{}),stamp);
+    const insert=db.prepare('INSERT INTO invoice_lines(id,invoice_id,description,line_type,quantity,unit_amount_minor,amount_minor,metadata_json) VALUES(?,?,?,?,?,?,?,?)');for(const line of normalized)insert.run(token(16),id,line.description,'manual',line.quantity,line.unit,line.amount,'{}');
+    writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'invoice.created',targetType:'invoice',targetId:id,ip:req.ip||'',userAgent:req.get('user-agent')||'',after:{invoice_number:number,organization_id:org,total_minor:total,currency},reason:String(req.body.reason||''),now:stamp});db.exec('COMMIT');
+  }catch(error){db.exec('ROLLBACK');throw error;}
+  res.status(201).json({invoice:db.prepare('SELECT * FROM invoices WHERE id=?').get(id),lines:db.prepare('SELECT * FROM invoice_lines WHERE invoice_id=?').all(id)});
+});
+app.get('/api/admin/payments',requireAdmin,adminPermission('billing_read'),(req,res)=>res.json({items:db.prepare('SELECT p.*,o.name AS organization_name,i.invoice_number FROM payments p JOIN organizations o ON o.id=p.organization_id JOIN invoices i ON i.id=p.invoice_id ORDER BY p.created_at DESC LIMIT 200').all()}));
+app.post('/api/admin/payments/:id/review',adminCsrfAndOrigin,requireAdmin,adminPermission('billing_write'),(req,res)=>{
+  const payment=db.prepare("SELECT p.*,i.status AS invoice_status,i.total_minor,i.amount_paid_minor,i.subscription_id FROM payments p JOIN invoices i ON i.id=p.invoice_id WHERE p.id=? AND p.adapter='manual'").get(req.params.id);if(!payment)return sendError(res,404,'Manual payment not found.');if(payment.status!=='pending')return sendError(res,409,'Payment has already been reviewed.');
+  const action=req.body.action,reason=String(req.body.reason||'').trim().slice(0,500);if(!['approve','reject'].includes(action)||!reason)return sendError(res,422,'Choose approve or reject and include a review reason.');
+  const stamp=now();db.exec('BEGIN IMMEDIATE');try{
+    const status=action==='approve'?'succeeded':'rejected';db.prepare('UPDATE payments SET status=?,verified_by=?,verified_at=? WHERE id=? AND status=\'pending\'').run(status,req.admin.id,stamp,payment.id);
+    if(action==='approve'){
+      const paid=Math.min(payment.total_minor,payment.amount_paid_minor+payment.amount_minor),complete=paid>=payment.total_minor;
+      db.prepare('UPDATE invoices SET amount_paid_minor=?,status=?,paid_at=? WHERE id=?').run(paid,complete?'paid':'open',complete?stamp:null,payment.invoice_id);
+      if(complete&&payment.subscription_id){const sub=db.prepare('SELECT * FROM subscriptions WHERE id=?').get(payment.subscription_id);if(sub){const periodEnd=stamp+(sub.billing_cycle==='yearly'?31536000:2592000);db.prepare("UPDATE subscriptions SET status='active',current_period_start=?,current_period_end=?,grace_end=NULL,updated_at=? WHERE id=?").run(stamp,periodEnd,stamp,sub.id);db.prepare('INSERT INTO subscription_events(id,subscription_id,organization_id,event_type,from_status,to_status,reason,created_at) VALUES(?,?,?,?,?,?,?,?)').run(token(16),sub.id,sub.organization_id,'payment_verified',sub.status,'active',reason,stamp);}}
+    }
+    writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:action==='approve'?'payment.approved':'payment.rejected',targetType:'payment',targetId:payment.id,ip:req.ip||'',userAgent:req.get('user-agent')||'',before:{status:'pending'},after:{status:action==='approve'?'succeeded':'rejected'},reason,now:stamp});db.exec('COMMIT');
+  }catch(error){db.exec('ROLLBACK');throw error;}
+  res.json({payment:db.prepare('SELECT * FROM payments WHERE id=?').get(payment.id)});
+});
 app.post('/api/admin/rates/costs',adminCsrfAndOrigin,requireAdmin,adminPermission('billing_write'),(req,res)=>{
   const input=req.body||{},eventType=String(input.event_type||''),provider=String(input.provider||'').trim().toLowerCase(),model=String(input.model||'').trim(),unit=String(input.unit||''),currency=String(input.currency||'BDT').toUpperCase(),amount=input.unit_cost_minor;
   if(!METERED_EVENT_TYPES.has(eventType)||!provider||provider.length>80||model.length>100||!METERED_UNITS.has(unit)||!Number.isSafeInteger(amount)||amount<0||!/^[A-Z]{3}$/.test(currency))return sendError(res,422,'Enter a valid event, provider, unit, integer cost in minor units, and currency.');
@@ -655,6 +803,13 @@ app.post('/api/auth/signup', csrfAndOrigin, async (req, res) => {
   if (!/^\d+$/.test(workerCount) || Number(workerCount) > 1_000_000) return sendError(res, 400, 'Enter an estimated worker count from 0 to 1,000,000.');
   if (typeof password !== 'string' || password.length < PASSWORD_MIN || password.length > 128) return sendError(res, 400, `Use a password between ${PASSWORD_MIN} and 128 characters.`);
   if (d.privacy_consent !== true) return sendError(res, 400, 'Please review and accept the privacy notice and terms.');
+  const selectedSlug=String(d.plan_slug||'').trim(),billingCycle=String(d.billing_cycle||'monthly');
+  if(!['monthly','yearly'].includes(billingCycle))return sendError(res,422,'Choose a valid billing cycle.');
+  let selectedPlan;
+  if(selectedSlug){selectedPlan=db.prepare("SELECT * FROM plans WHERE slug=? AND status='active' AND sample_values=0").get(selectedSlug);if(!selectedPlan)return sendError(res,422,'That plan is not currently available.');}
+  else{const defaultPlanId=String(billingSetting('default_plan_id','legacy-default'));selectedPlan=db.prepare('SELECT * FROM plans WHERE id=?').get(defaultPlanId)||db.prepare("SELECT * FROM plans WHERE id='legacy-default'").get();}
+  const selectedPrice=db.prepare('SELECT amount_minor,currency FROM plan_prices WHERE plan_id=? AND billing_cycle=? ORDER BY effective_from DESC,version DESC LIMIT 1').get(selectedPlan.id,billingCycle);
+  if(!selectedPrice)return sendError(res,422,'That plan does not have a price for the selected billing cycle.');
   const ids = token(18), organizationId = token(18), stamp = now(), { passwordHash, passwordSalt } = await hashPassword(password);
   let challenge;
   try {
@@ -662,11 +817,15 @@ app.post('/api/auth/signup', csrfAndOrigin, async (req, res) => {
     db.prepare('INSERT INTO organizations(id,name,organization_type,phone,estimated_workers,created_at) VALUES(?,?,?,?,?,?)').run(organizationId, organization, type, phone, Number(workerCount), stamp);
     db.prepare(`INSERT INTO users(id,organization_id,full_name,email,phone,password_hash,password_salt,role,privacy_notice_version,privacy_consent_at,email_verified_at,created_at)
       VALUES(?,?,?,?,?,?,?,'organization_owner','2026-10-01',?,NULL,?)`).run(ids, organizationId, name, email, phone, passwordHash, passwordSalt, stamp, stamp);
+    const trialing=selectedPlan.trial_days>0,subscriptionId=token(18),periodLength=billingCycle==='yearly'?31536000:2592000,periodEnd=trialing?stamp+selectedPlan.trial_days*86400:stamp+periodLength,subscriptionStatus=trialing?'trialing':selectedPrice.amount_minor===0?'active':'past_due';
+    db.prepare('INSERT INTO subscriptions(id,organization_id,plan_id,status,billing_cycle,price_minor,currency,current_period_start,current_period_end,trial_end,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(subscriptionId,organizationId,selectedPlan.id,subscriptionStatus,billingCycle,selectedPrice.amount_minor,selectedPrice.currency,stamp,periodEnd,trialing?periodEnd:null,stamp,stamp);
+    db.prepare('INSERT INTO subscription_events(id,subscription_id,organization_id,event_type,to_status,details_json,reason,created_at) VALUES(?,?,?,?,?,?,?,?)').run(token(16),subscriptionId,organizationId,'signup_subscription',subscriptionStatus,JSON.stringify({plan_id:selectedPlan.id,billing_cycle:billingCycle}),selectedSlug?'Customer chose plan at signup.':'Default plan assigned at signup.',stamp);
+    if(subscriptionStatus==='past_due')createPlanInvoice({organizationId,subscriptionId,planName:selectedPlan.name,amountMinor:selectedPrice.amount_minor,currency:selectedPrice.currency,stamp});
     challenge=issueAuthOtp(ids,'signup');
     db.exec('COMMIT');
   } catch (error) { try{db.exec('ROLLBACK');}catch{} if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return sendError(res, 409, 'An account with these details already exists.'); throw error; }
   try { await emailAuthOtp({email,full_name:name},challenge,'signup'); }
-  catch { db.prepare('DELETE FROM organizations WHERE id=?').run(organizationId); return sendError(res,502,'We could not deliver the verification code, so the account was not created. Check the SMTP settings and try again.'); }
+  catch { try{db.exec('BEGIN IMMEDIATE');db.prepare('DELETE FROM invoice_lines WHERE invoice_id IN (SELECT id FROM invoices WHERE organization_id=?)').run(organizationId);db.prepare('DELETE FROM invoices WHERE organization_id=?').run(organizationId);db.prepare('DELETE FROM subscription_events WHERE organization_id=?').run(organizationId);db.prepare('DELETE FROM subscriptions WHERE organization_id=?').run(organizationId);db.prepare('DELETE FROM organizations WHERE id=?').run(organizationId);db.exec('COMMIT');}catch{try{db.exec('ROLLBACK');}catch{}}return sendError(res,502,'We could not deliver the verification code, so the account was not created. Check the SMTP settings and try again.'); }
   res.status(201).json({ otp_required:true,purpose:'signup',challenge_id:challenge.challengeId,email,resend_after:OTP_RESEND_COOLDOWN_SECONDS,message:'We emailed a 6-digit verification code. Enter it to finish creating your account.' });
 });
 

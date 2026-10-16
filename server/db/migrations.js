@@ -127,6 +127,11 @@ const migrations = [
       UPDATE plan_features SET enabled=1 WHERE plan_id='legacy-default' AND feature_key IN ('ai_chat','ai_alert_automation','simulator','csv_import','data_export','break_planner','nowcasting','heat_triage','ai_reports','official_advisories');
     `,
   },
+  {
+    version: 6,
+    name: 'manual_payment_reference_idempotency',
+    sql: `CREATE UNIQUE INDEX IF NOT EXISTS payments_manual_reference_unique_idx ON payments(transaction_ref) WHERE adapter='manual' AND transaction_ref<>'';`,
+  },
 ];
 
 export function runMigrations(db, { databasePath, development = true, clock = () => Math.floor(Date.now() / 1000) } = {}) {

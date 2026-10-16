@@ -38,13 +38,22 @@
 - New plans still need operator-reviewed feature and limit settings before activation. Not all expensive provider calls are yet preflighted against quota, and customer billing pages and subscription lifecycle workflows remain outstanding.
 - Phase 3 verification on Node v26.7.0: `npm test` passes 29/29; `npm run build` passes.
 
+## 2026-10-17 — Phase 4 billing workflow (partial)
+
+- Added active-plan public pricing data and `/pricing`; signup accepts an explicitly selected active plan. Paid signups receive an open plan invoice and begin in `past_due`; trial plans begin in `trialing`; nontrial zero-price plans begin active. Signups without a selected plan receive the configured default plan.
+- Added organization billing summary, usage meters, billing details, invoices, payment-reference submission, cancellation scheduling/reactivation, and print-to-PDF invoice view. Admin APIs now create subscriptions and invoices, review manual payments, change subscription state, and configure core billing settings with audit records.
+- Manual payment approval marks an invoice paid and activates the associated subscription. Invoice numbers increment inside the same transaction as invoice creation. Manual transaction references have a unique index. No online gateway is implemented.
+- Renewal, trial reminder, dunning, cancellation-at-period-end, refunds, coupons, and scheduled invoice jobs remain unimplemented. Billing settings currently have an API but no dedicated admin settings screen. Subscription upgrade/downgrade is also pending.
+- Phase 4 partial verification on Node v26.7.0: `npm test` passes 29/29; `npm run build` passes. No live database or payment provider was exercised.
+
 ### Status
 
 - Phase 0: audit documented; the active SQLite file was not opened. A truly read-only live schema inventory is still required.
 - Phase 1: foundation delivered; remaining items include admin account management UI/API, QR enrollment, admin password reset, stronger re-auth action wiring, and security review.
 - Phase 2: major existing SMS, AI, weather, geocoding, and email provider paths are wired; voice usage and provider delivery reconciliation remain open.
-- Phase 3: core feature gates and worker/site caps are wired. Preflight quota enforcement across every provider dispatch and public pricing/billing pages are not complete.
-- Later work remains: subscription lifecycle, invoices/manual payments, customer billing pages, remaining admin modules, deletion workflows, analytics, smoke/seed tools, and complete operating docs.
+- Phase 3: core feature gates and worker/site caps are wired. Preflight quota enforcement across every provider dispatch remains incomplete.
+- Phase 4: manual billing path is partial. Online gateway, scheduled billing lifecycle, refunds/coupons and the billing settings UI remain incomplete.
+- Later work remains: remaining admin modules, deletion workflows, analytics, smoke/seed tools, and complete operating docs.
 
 ## 2026-10-14 — Initial audit and scope
 
