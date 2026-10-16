@@ -31,11 +31,20 @@
 - Added idempotent daily/monthly rollup rebuilds plus worker/site/verified-user snapshots, registered in the existing job runner. The initial rollup covers 400 days and runs on startup and the configurable interval.
 - Phase 2 verification on Node v26.7.0: `npm test` passes 26/26; `npm run build` passes. The latest full verification is after the rollup changes; rerun before commit.
 
+## 2026-10-17 — Phase 3 entitlement enforcement
+
+- Added subscription feature and limit resolution, including organization-level feature/limit overrides and status checks. Migration v5 adds the feature override column for databases that already applied v4 and enables existing products on the Legacy plan.
+- Enforced plan access for AI chat, simulator, CSV import, data export, and speech endpoints. Worker imports and individual worker/site creation now check plan resource limits before inserting. Emergency dispatch remains on the existing safety path.
+- New plans still need operator-reviewed feature and limit settings before activation. Not all expensive provider calls are yet preflighted against quota, and customer billing pages and subscription lifecycle workflows remain outstanding.
+- Phase 3 verification on Node v26.7.0: `npm test` passes 29/29; `npm run build` passes.
+
 ### Status
 
 - Phase 0: audit documented; the active SQLite file was not opened. A truly read-only live schema inventory is still required.
 - Phase 1: foundation delivered; remaining items include admin account management UI/API, QR enrollment, admin password reset, stronger re-auth action wiring, and security review.
-- Phase 2: major existing SMS, AI, weather, geocoding, and email provider paths are wired; voice usage and provider delivery reconciliation remain open. Phase 3 and later entitlement enforcement, billing lifecycle, payments, customer pages, remaining admin modules, deletion workflows, analytics, smoke/seed tools, and complete operating docs remain outstanding.
+- Phase 2: major existing SMS, AI, weather, geocoding, and email provider paths are wired; voice usage and provider delivery reconciliation remain open.
+- Phase 3: core feature gates and worker/site caps are wired. Preflight quota enforcement across every provider dispatch and public pricing/billing pages are not complete.
+- Later work remains: subscription lifecycle, invoices/manual payments, customer billing pages, remaining admin modules, deletion workflows, analytics, smoke/seed tools, and complete operating docs.
 
 ## 2026-10-14 — Initial audit and scope
 

@@ -13,7 +13,7 @@ test('versioned migration is additive and idempotent', () => {
   db.exec('CREATE TABLE organizations(id TEXT PRIMARY KEY); INSERT INTO organizations(id) VALUES(\'org-legacy\'); CREATE TABLE workers(id TEXT PRIMARY KEY); CREATE TABLE sites(id TEXT PRIMARY KEY); CREATE TABLE official_advisories(id TEXT PRIMARY KEY); INSERT INTO official_advisories(id) VALUES(\'keep-me\');');
   runMigrations(db, { development: false, clock: () => 100 });
   runMigrations(db, { development: false, clock: () => 200 });
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get().n, 4);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get().n, 5);
   assert.equal(db.prepare('SELECT plan_id FROM subscriptions WHERE organization_id=?').get('org-legacy').plan_id, 'legacy-default');
   assert.equal(db.prepare('SELECT unlimited FROM plan_limits WHERE plan_id=? AND limit_key=?').get('legacy-default','workers').unlimited, 1);
   assert.equal(db.prepare('PRAGMA table_info(sites)').all().some(row => row.name === 'emergency_contact_phone'), true);

@@ -18,6 +18,7 @@ import { FEATURE_KEYS } from './server/billing/features.js';
 import { createMeteringService, estimateGeminiTokens } from './server/billing/metering.js';
 import { calculateSmsSegments } from './server/billing/smsSegments.js';
 import { rebuildUsageRollups } from './server/billing/rollups.js';
+import { checkFeatureAccess, checkResourceLimit } from './server/billing/entitlements.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 for (const line of (existsSync(path.join(__dirname, '.env')) ? readFileSync(path.join(__dirname, '.env'), 'utf8') : '').split(/\r?\n/)) {
@@ -181,6 +182,17 @@ const requireUser = (req, res, next) => {
   req.user = sessionUser(req);
   if (!req.user) return sendError(res, 401, 'Sign in to continue.');
   next();
+};
+const requirePlanFeature = feature => (req,res,next) => {
+  const access=checkFeatureAccess(db,req.user.organization_id,feature);
+  if(access.allowed)return next();
+  return res.status(402).json({error:'This feature is not included in your current plan.',code:'PLAN_FEATURE_REQUIRED',feature,plan_id:access.planId,status:access.status,billing_url:'/billing'});
+};
+const enforceResourceLimit = (req,res,key,current,adding=1) => {
+  const result=checkResourceLimit(db,req.user.organization_id,key,current,adding);
+  if(result.allowed)return true;
+  sendError(res,402,`Your plan's ${key} limit would be exceeded. Review your plan or remove existing resources.`);
+  return false;
 };
 const adminSessionUser = req => {
   const opaque = parseCookies(req)[ADMIN_SESSION_COOKIE];
@@ -566,7 +578,7 @@ app.get('/api/alerts/automated',requireUser,(req,res)=>{
   const delayed=[...ALERT_WEATHER_STATUS.entries()].some(([key,value])=>key.startsWith(`${req.user.organization_id}:`)&&value.delayed);
   res.set('Cache-Control','no-store').json({items,counts:{sent:counts.sent||0,skipped:counts.skipped||0,scheduled:counts.scheduled||0},weatherDelayed:delayed});
 });
-app.post('/api/alerts/simulate',csrfAndOrigin,requireUser,async(req,res)=>{
+app.post('/api/alerts/simulate',csrfAndOrigin,requireUser,requirePlanFeature('simulator'),async(req,res)=>{
   const siteId=String(req.body.site_id||''),temperatureC=Number(req.body.temperature_c),rainEtaRaw=req.body.rain_eta_minutes,timeOfDay=String(req.body.time_of_day||'12:00');
   if(!/^([01]\d|2[0-3]):[0-5]\d$/.test(timeOfDay)||!Number.isFinite(temperatureC)||temperatureC<0||temperatureC>60||!(rainEtaRaw===''||rainEtaRaw==null||(Number.isFinite(Number(rainEtaRaw))&&Number(rainEtaRaw)>=0&&Number(rainEtaRaw)<=360)))return sendError(res,400,'Choose a valid temperature, rain ETA, and time of day.');
   const site=db.prepare('SELECT * FROM sites WHERE id=? AND organization_id=?').get(siteId,req.user.organization_id);if(!site)return sendError(res,404,'Worksite not found.');if(site.latitude==null||site.longitude==null)return sendError(res,422,'Add coordinates to this worksite before simulating weather alerts.');
@@ -620,7 +632,7 @@ app.get('/api/sms', requireUser, async (req, res) => {
     res.set('Cache-Control','no-store').json({messages,configured:true,synced,receivedFromTextbee:receivedMessages.length,receivedMatched});
   } catch { return sendError(res,502,'Could not reach TextBee. Try syncing again shortly.'); }
 });
-app.get('/api/privacy/export', requireUser, (req, res) => {
+app.get('/api/privacy/export', requireUser, requirePlanFeature('data_export'), (req, res) => {
   const organization = db.prepare('SELECT name,organization_type,phone,address,estimated_workers,created_at FROM organizations WHERE id=?').get(req.user.organization_id);
   const privacy = db.prepare('SELECT privacy_notice_version,privacy_consent_at,created_at FROM users WHERE id=?').get(req.user.id);
   const workers = db.prepare('SELECT id,name,phone,site,site_id,job_type,workload,risk_level,shift_start,shift_end,age_group,has_personal_risk_factor,outdoor_minutes,last_break,consent_at,consent_method,created_at,updated_at FROM workers WHERE organization_id=? ORDER BY name COLLATE NOCASE').all(req.user.organization_id);
@@ -876,17 +888,21 @@ function addWorker(data, org, stamp = now()) {
 }
 app.post('/api/workers', csrfAndOrigin, requireUser, async (req, res) => {
   try {
+    const current=db.prepare('SELECT COUNT(*) AS n FROM workers WHERE organization_id=?').get(req.user.organization_id).n;
+    if(!enforceResourceLimit(req,res,'workers',current))return;
     const worker=addWorker(req.body,req.user.organization_id),sms=await sendWorkerWelcomeSms(worker,req.user.organization_id);
     res.status(201).json({worker,sms});
   }
   catch (error) { sendError(res, error.status || (error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 409 : 400), error.message || 'Could not save worker.'); }
 });
-app.post('/api/workers/import', csrfAndOrigin, requireUser, async (req, res) => {
+app.post('/api/workers/import', csrfAndOrigin, requireUser, requirePlanFeature('csv_import'), async (req, res) => {
   const rows = req.body.workers;
   if (!Array.isArray(rows) || !rows.length || rows.length > 500) return sendError(res, 400, 'Choose a CSV with between 1 and 500 worker rows.');
   try {
     const normalized = rows.map(row => workerValues(row, req.user.organization_id));
     if (normalized.some(row => !row)) return sendError(res, 400, 'The CSV contains invalid worker data. Check name, phone, site, job type, workload, and shift times (use HH:mm or Excel times such as 7:00:00 AM); no rows were imported.');
+    const existingCount=db.prepare('SELECT COUNT(*) AS n FROM workers WHERE organization_id=?').get(req.user.organization_id).n;
+    if(!enforceResourceLimit(req,res,'workers',existingCount,normalized.length))return;
     const stamp = now(),registered=[]; db.exec('BEGIN IMMEDIATE');
     try {
       const keys=new Set();
@@ -938,6 +954,7 @@ app.post('/api/sites', csrfAndOrigin, requireUser, (req, res) => {
   const values = siteValues(req.body);
   if (!values) return sendError(res, 400, 'Enter a worksite name (up to 120 characters), keep the address under 500 characters, and provide both valid coordinates if setting a map location.');
   const id = token(12), stamp = now();
+  if(!enforceResourceLimit(req,res,'sites',db.prepare('SELECT COUNT(*) AS n FROM sites WHERE organization_id=?').get(req.user.organization_id).n))return;
   try {
     db.prepare('INSERT INTO sites(id,organization_id,name,address,latitude,longitude,division,district,emergency_contact_phone,shade_available,water_available,rest_area,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id, req.user.organization_id, values.name, values.address, values.latitude, values.longitude,values.division,values.district,values.emergencyContactPhone,values.shadeAvailable?1:0,values.waterAvailable?1:0,values.restArea?1:0, stamp, stamp);
     res.status(201).json({ site: db.prepare('SELECT id,name,address,latitude,longitude,division,district,emergency_contact_phone,shade_available,water_available,rest_area,created_at,updated_at FROM sites WHERE id=?').get(id) });
@@ -1105,6 +1122,7 @@ async function geminiGenerate(contents, instruction, jsonResponse = false, { org
   return answer;
 }
 app.post('/api/ai/chat', csrfAndOrigin, requireUser, async (req,res) => {
+  if(!checkFeatureAccess(db,req.user.organization_id,'ai_chat').allowed)return sendError(res,402,'AI chat is not included in your current plan.');
   if (!rateAllowed(req,'gemini-chat',20,3600)) return sendError(res,429,'Chat limit reached. Try again in a little while.');
   const messages=req.body.messages;
   if (!Array.isArray(messages)||!messages.length||messages.length>12) return sendError(res,400,'Send a short chat message and try again.');
@@ -1134,7 +1152,7 @@ app.post('/api/ai/chat', csrfAndOrigin, requireUser, async (req,res) => {
   const instruction="You are JibonGuard's in-app assistant. Help organization administrators understand the dashboard, site weather, worker consent, break logs, and practical heat and weather safety. Be concise and clear. Do not claim to see private organization records or live weather unless supplied in the conversation. Never give a medical diagnosis or claim an emergency is safe; direct urgent situations to local emergency services and official instructions. Do not ask for passwords, API keys, or personal worker details.";
   try { res.json({ reply:await geminiGenerate(contents,instruction,false,{organizationId:req.user.organization_id,feature:'chat'}) }); } catch(error) { sendError(res,503,error.message); }
 });
-app.post('/api/ai/speech', csrfAndOrigin, requireUser, async (req,res) => {
+app.post('/api/ai/speech', csrfAndOrigin, requireUser, requirePlanFeature('voice_alerts'), async (req,res) => {
   if (!rateAllowed(req,'gemini-speech',30,3600)) return sendError(res,429,'Speech limit reached. Try again in a little while.');
   const text=typeof req.body.text==='string'?req.body.text.trim():'';
   const voice=String(req.body.voice||'Kore');
@@ -1153,7 +1171,7 @@ app.post('/api/ai/speech', csrfAndOrigin, requireUser, async (req,res) => {
   if(!audioPart)return sendError(res,503,'Gemini returned no speech audio. Check TTS model access and try again.');
   res.set('Cache-Control','no-store').json({audio:audioPart.inlineData.data,mime_type:audioPart.inlineData.mimeType||'audio/wav'});
 });
-app.post('/api/ai/live-token', csrfAndOrigin, requireUser, async (req,res) => {
+app.post('/api/ai/live-token', csrfAndOrigin, requireUser, requirePlanFeature('voice_alerts'), async (req,res) => {
   if (!rateAllowed(req,'gemini-live-token',10,3600)) return sendError(res,429,'Live voice is temporarily limited. Try again in a little while.');
   if (!GEMINI_API_KEY) return sendError(res,503,'Gemini is not configured. Set GEMINI_API_KEY in the server .env file.');
   let response;

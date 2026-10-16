@@ -120,6 +120,13 @@ const migrations = [
         SELECT 'legacy-'||o.id,o.id,'legacy-default','active','monthly',0,'BDT',unixepoch(),253402300799,unixepoch(),unixepoch() FROM organizations o;
     `,
   },
+  {
+    version: 5,
+    name: 'organization_entitlement_overrides',
+    sql: `
+      UPDATE plan_features SET enabled=1 WHERE plan_id='legacy-default' AND feature_key IN ('ai_chat','ai_alert_automation','simulator','csv_import','data_export','break_planner','nowcasting','heat_triage','ai_reports','official_advisories');
+    `,
+  },
 ];
 
 export function runMigrations(db, { databasePath, development = true, clock = () => Math.floor(Date.now() / 1000) } = {}) {
@@ -138,6 +145,10 @@ export function runMigrations(db, { databasePath, development = true, clock = ()
         const workerColumns = db.prepare('PRAGMA table_info(workers)').all().map(row => row.name);
         if (!workerColumns.includes('channel_preference')) db.exec("ALTER TABLE workers ADD COLUMN channel_preference TEXT NOT NULL DEFAULT 'sms'");
         if (!workerColumns.includes('voice_first')) db.exec('ALTER TABLE workers ADD COLUMN voice_first INTEGER NOT NULL DEFAULT 0');
+      }
+      if (migration.version === 5) {
+        const columns = db.prepare('PRAGMA table_info(subscriptions)').all().map(row => row.name);
+        if (!columns.includes('features_override_json')) db.exec("ALTER TABLE subscriptions ADD COLUMN features_override_json TEXT NOT NULL DEFAULT '{}'");
       }
       for (const [table, column, declaration] of [
         ['sites', 'division', "TEXT NOT NULL DEFAULT ''"],
