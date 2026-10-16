@@ -10,11 +10,12 @@ import { createGeminiClient } from './ai/geminiClient.js';
 
 test('versioned migration is additive and idempotent', () => {
   const db = new DatabaseSync(':memory:');
-  db.exec('CREATE TABLE organizations(id TEXT PRIMARY KEY); CREATE TABLE workers(id TEXT PRIMARY KEY); CREATE TABLE sites(id TEXT PRIMARY KEY); CREATE TABLE official_advisories(id TEXT PRIMARY KEY); INSERT INTO official_advisories(id) VALUES(\'keep-me\');');
+  db.exec('CREATE TABLE organizations(id TEXT PRIMARY KEY); INSERT INTO organizations(id) VALUES(\'org-legacy\'); CREATE TABLE workers(id TEXT PRIMARY KEY); CREATE TABLE sites(id TEXT PRIMARY KEY); CREATE TABLE official_advisories(id TEXT PRIMARY KEY); INSERT INTO official_advisories(id) VALUES(\'keep-me\');');
   runMigrations(db, { development: false, clock: () => 100 });
   runMigrations(db, { development: false, clock: () => 200 });
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get().n, 4);
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM subscriptions WHERE plan_id=?').get('legacy-default').n, 0);
+  assert.equal(db.prepare('SELECT plan_id FROM subscriptions WHERE organization_id=?').get('org-legacy').plan_id, 'legacy-default');
+  assert.equal(db.prepare('SELECT unlimited FROM plan_limits WHERE plan_id=? AND limit_key=?').get('legacy-default','workers').unlimited, 1);
   assert.equal(db.prepare('PRAGMA table_info(sites)').all().some(row => row.name === 'emergency_contact_phone'), true);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='ai_calls'").get().n, 1);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='official_advisories'").get().n, 1);
@@ -71,11 +72,15 @@ test('job runner locks overlapping work and isolates errors per site', async () 
 });
 
 test('shared Gemini client times out/falls back and logs only feature metadata', async () => {
-  const rows = [];
+  const rows = [],meterEvents=[];
   const db = { prepare(sql) { return { run(...args) { rows.push({ sql, args }); } }; } };
-  const call = createGeminiClient({ apiKey: 'secret', db, retries: 0, fetchImpl: async () => ({ ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"answer":true}' }] } }] }) }) });
+  const call = createGeminiClient({ apiKey: 'secret', db, meterUsage:event=>meterEvents.push(event), retries: 0, fetchImpl: async () => ({ ok: true, json: async () => ({ usageMetadata:{promptTokenCount:12,candidatesTokenCount:3},candidates: [{ content: { parts: [{ text: '{"answer":true}' }] } }] }) }) });
   const result = await call({ feature: 'triage', promptVersion: 'v1', system: 'Return JSON', payload: { symptom: 'dizzy', name: 'PII should not be logged' }, validate: value => value.answer === true, organizationId: 'org-1' });
   assert.equal(result.ok, true);
   assert.equal(rows.length, 1);
   assert.doesNotMatch(rows[0].sql + JSON.stringify(rows[0].args), /dizzy|PII should not be logged/);
+  assert.equal(meterEvents[0].tokensInput,12);
+  assert.equal(meterEvents[0].tokensOutput,3);
+  assert.equal(meterEvents[0].estimated,false);
+  assert.equal(meterEvents[0].eventType,'ai_call');
 });

@@ -23,11 +23,19 @@
 - Fixed two alert-path behaviors uncovered by the baseline suite: a successful AI skip can no longer suppress a deterministic floor alert, and AI tests now explicitly enable the AI decision layer. The empty AI result test now uses an empty eligible-worker set, matching strict output validation.
 - Phase 1 verification on Node v26.7.0: `npm test` passes 25/25 including a temporary-database admin-auth integration test; `npm run build` passes. Runtime Node 24 compatibility is still unverified.
 
+## 2026-10-17 — Phase 2 provider metering
+
+- Wired usage recording to TextBee outbound and inbound paths, shared Gemini alert decisions, dashboard chat/break suggestions, Gemini speech, Open-Meteo, Photon/Nominatim, and SMTP. Existing alert decisions remain protected if usage recording fails. Voice gateway call sites do not exist; Gemini Live client-side consumption cannot currently be observed by the API.
+- Implemented GSM-7 and UCS-2 segment counts at outbound send boundaries, including multipart thresholds. AI token usage reads Gemini usage metadata and otherwise uses a labelled character estimator. AI rates are calculated with per-million divisors and split input/output model rates.
+- Added effective rate-card create endpoints and admin screens. No provider prices are seeded. Included quota is subtracted before `charge_overage`; failed outbound SMS is not customer-priced. The plan's `block` policy is not yet enforced before provider calls and remains a Phase 3 gap.
+- Added idempotent daily/monthly rollup rebuilds plus worker/site/verified-user snapshots, registered in the existing job runner. The initial rollup covers 400 days and runs on startup and the configurable interval.
+- Phase 2 verification on Node v26.7.0: `npm test` passes 26/26; `npm run build` passes. The latest full verification is after the rollup changes; rerun before commit.
+
 ### Status
 
 - Phase 0: audit documented; the active SQLite file was not opened. A truly read-only live schema inventory is still required.
 - Phase 1: foundation delivered; remaining items include admin account management UI/API, QR enrollment, admin password reset, stronger re-auth action wiring, and security review.
-- Phase 2 and later: provider metering is not yet wired into real SMS/AI/weather/geocoding/email/voice paths; rate editing, rollup jobs, entitlements, billing lifecycle, payments, customer pages, admin modules, deletion workflows, analytics, smoke/seed tools, and complete operating docs remain outstanding.
+- Phase 2: major existing SMS, AI, weather, geocoding, and email provider paths are wired; voice usage and provider delivery reconciliation remain open. Phase 3 and later entitlement enforcement, billing lifecycle, payments, customer pages, remaining admin modules, deletion workflows, analytics, smoke/seed tools, and complete operating docs remain outstanding.
 
 ## 2026-10-14 — Initial audit and scope
 

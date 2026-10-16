@@ -11,7 +11,12 @@ export function groupAlertRecipients(items) {
 export async function dispatchAlertGroups(items, { smsSender }) {
   const results = [];
   for (const group of groupAlertRecipients(items)) {
-    const recipients = [...new Map(group.items.map(item => [item.phone, { phone: item.phone, message: group.message }])).values()];
+    const recipientMap = new Map();
+    for (const item of group.items) {
+      if (!recipientMap.has(item.phone)) recipientMap.set(item.phone, { phone: item.phone, message: group.message, referenceIds: [] });
+      if (item.id) recipientMap.get(item.phone).referenceIds.push(String(item.id));
+    }
+    const recipients = [...recipientMap.values()];
     const sms = await smsSender(recipients, group.message);
     results.push({ ...group, recipients, sms });
   }

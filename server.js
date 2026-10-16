@@ -15,6 +15,9 @@ import { decryptTotpSecret, encryptTotpSecret, newTotpSecret, verifyTotp } from 
 import { writeAdminAudit } from './server/billing/audit.js';
 import { hasPermission } from './server/billing/permissions.js';
 import { FEATURE_KEYS } from './server/billing/features.js';
+import { createMeteringService, estimateGeminiTokens } from './server/billing/metering.js';
+import { calculateSmsSegments } from './server/billing/smsSegments.js';
+import { rebuildUsageRollups } from './server/billing/rollups.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 for (const line of (existsSync(path.join(__dirname, '.env')) ? readFileSync(path.join(__dirname, '.env'), 'utf8') : '').split(/\r?\n/)) {
@@ -98,6 +101,9 @@ for(const row of db.prepare('SELECT id,workload_levels FROM break_logs').all()){
 }
 runMigrations(db, { databasePath: DB_PATH, development: !IS_PRODUCTION });
 const jobRunner = createJobRunner({ db });
+const metering = createMeteringService(db, { logger: console, defaultCurrency: 'BDT' });
+const USAGE_ROLLUP_INTERVAL_MS=Math.max(60000,Number(process.env.BILLING_ROLLUP_INTERVAL_MS||86400000));
+jobRunner.register('usage_rollups',()=>rebuildUsageRollups(db));
 db.prepare("UPDATE sms_messages SET emergency_status='historic' WHERE direction='received' AND emergency_status=''").run();
 for (const row of db.prepare("SELECT DISTINCT organization_id,site FROM workers WHERE trim(site)<>'' AND site_id IS NULL").all()) {
   let site = db.prepare('SELECT id FROM sites WHERE organization_id=? AND name=? COLLATE NOCASE').get(row.organization_id, row.site);
@@ -308,7 +314,9 @@ app.post('/api/admin/auth/totp/setup',adminCsrfAndOrigin,requireAdminSetup,(req,
   if(!enable.changes)return sendError(res,409,'Two-factor authentication changed in another session.');
   const insert=db.prepare('INSERT INTO admin_recovery_codes(id,admin_id,code_hash,created_at) VALUES(?,?,?,?)');
   for(const recovery of codes)insert.run(token(16),req.admin.id,hashToken(recovery),stamp);
-  db.prepare('UPDATE admin_sessions SET expires_at=?,reauth_at=? WHERE token_hash=?').run(stamp+ADMIN_SESSION_LIFETIME,stamp,hashToken(parseCookies(req)[ADMIN_SESSION_COOKIE]));
+  const currentSession=hashToken(parseCookies(req)[ADMIN_SESSION_COOKIE]);
+  db.prepare('DELETE FROM admin_sessions WHERE admin_id=? AND token_hash<>?').run(req.admin.id,currentSession);
+  db.prepare('UPDATE admin_sessions SET expires_at=?,reauth_at=? WHERE token_hash=?').run(stamp+ADMIN_SESSION_LIFETIME,stamp,currentSession);
   writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'admin.totp_enabled',targetType:'admin_user',targetId:req.admin.id,ip:req.ip||'',userAgent:req.get('user-agent')||'',after:{recoveryCodesCreated:codes.length},now:stamp});
   res.set('Cache-Control','no-store').json({enabled:true,recovery_codes:codes});
 });
@@ -360,7 +368,7 @@ app.get('/api/admin/plans',requireAdmin,adminPermission('plans_read'),(_req,res)
 });
 const readAdminPlan=id=>{
   const plan=db.prepare('SELECT * FROM plans WHERE id=?').get(id);if(!plan)return null;
-  return {...plan,prices:db.prepare('SELECT * FROM plan_prices WHERE plan_id=? ORDER BY effective_from DESC,billing_cycle').all(id),limits:Object.fromEntries(db.prepare('SELECT limit_key,value,unlimited FROM plan_limits WHERE plan_id=?').all(id).map(row=>[row.limit_key,{value:row.value,unlimited:Boolean(row.unlimited)}])),features:Object.fromEntries(db.prepare('SELECT feature_key,enabled FROM plan_features WHERE plan_id=?').all(id).map(row=>[row.feature_key,Boolean(row.enabled)]))};
+  return {...plan,prices:db.prepare('SELECT * FROM plan_prices WHERE plan_id=? ORDER BY effective_from DESC,billing_cycle').all(id),limits:Object.fromEntries(db.prepare('SELECT limit_key,value,unlimited FROM plan_limits WHERE plan_id=?').all(id).map(row=>[row.limit_key,{value:row.value,unlimited:Boolean(row.unlimited)}])),features:Object.fromEntries(db.prepare('SELECT feature_key,enabled FROM plan_features WHERE plan_id=?').all(id).map(row=>[row.feature_key,Boolean(row.enabled)])),overage:db.prepare('SELECT policy,warning_80,warning_100 FROM plan_overage_settings WHERE plan_id=?').get(id)||{policy:'soft_warn',warning_80:80,warning_100:100}};
 };
 function normalizePlanSettings(input){
   if(input.limits!==undefined){
@@ -375,6 +383,10 @@ function normalizePlanSettings(input){
     if(!input.features||typeof input.features!=='object'||Array.isArray(input.features))return {error:'Plan features must be an object.'};
     for(const [key,value] of Object.entries(input.features))if(!FEATURE_KEYS.includes(key)||typeof value!=='boolean')return {error:`Unknown or invalid plan feature: ${key}.`};
   }
+  if(input.overage!==undefined){
+    const overage=input.overage;
+    if(!overage||typeof overage!=='object'||Array.isArray(overage)||!['block','charge_overage','soft_warn'].includes(overage.policy)||!Number.isInteger(overage.warning_80)||overage.warning_80<1||overage.warning_80>100||!Number.isInteger(overage.warning_100)||overage.warning_100<overage.warning_80||overage.warning_100>200)return {error:'Overage policy or warning thresholds are invalid.'};
+  }
   return {};
 }
 function savePlanSettings(planId,input,stamp){
@@ -383,6 +395,7 @@ function savePlanSettings(planId,input,stamp){
     db.prepare('INSERT INTO plan_limits(plan_id,limit_key,value,unlimited,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(plan_id,limit_key) DO UPDATE SET value=excluded.value,unlimited=excluded.unlimited,updated_at=excluded.updated_at').run(planId,key,limit.unlimited?null:limit.value,limit.unlimited?1:0,stamp);
   }
   for(const [key,enabled] of Object.entries(input.features||{}))db.prepare('INSERT INTO plan_features(plan_id,feature_key,enabled,updated_at) VALUES(?,?,?,?) ON CONFLICT(plan_id,feature_key) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at').run(planId,key,enabled?1:0,stamp);
+  if(input.overage)db.prepare('INSERT INTO plan_overage_settings(plan_id,policy,warning_80,warning_100,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(plan_id) DO UPDATE SET policy=excluded.policy,warning_80=excluded.warning_80,warning_100=excluded.warning_100,updated_at=excluded.updated_at').run(planId,input.overage.policy,input.overage.warning_80,input.overage.warning_100,stamp);
 }
 app.get('/api/admin/plans/:id',requireAdmin,adminPermission('plans_read'),(req,res)=>{
   const plan=readAdminPlan(req.params.id);if(!plan)return sendError(res,404,'Plan not found.');
@@ -435,6 +448,39 @@ app.patch('/api/admin/plans/:id',adminCsrfAndOrigin,requireAdmin,adminPermission
     db.exec('COMMIT');
   }catch(error){db.exec('ROLLBACK');throw error;}
   res.json({plan:readAdminPlan(existing.id)});
+});
+const METERED_EVENT_TYPES=new Set(['sms_outbound','sms_inbound','voice_call','voice_seconds','ai_call','weather_api_call','geocode_call','email_sent']);
+const METERED_UNITS=new Set(['segment','message','second','input_1m_tokens','output_1m_tokens','call','email','token']);
+app.get('/api/admin/usage',requireAdmin,adminPermission('usage_read'),(req,res)=>{
+  const limit=Math.min(100,Math.max(1,Number.parseInt(req.query.limit,10)||50)),offset=Math.max(0,Number.parseInt(req.query.offset,10)||0),filters=[],args=[];
+  if(req.query.organization_id){filters.push('u.organization_id=?');args.push(String(req.query.organization_id).slice(0,120));}
+  if(req.query.event_type){filters.push('u.event_type=?');args.push(String(req.query.event_type).slice(0,80));}
+  if(req.query.from){const from=Number(req.query.from);if(Number.isSafeInteger(from)){filters.push('u.created_at>=?');args.push(from);}}
+  if(req.query.to){const to=Number(req.query.to);if(Number.isSafeInteger(to)){filters.push('u.created_at<?');args.push(to);}}
+  const where=filters.length?`WHERE ${filters.join(' AND ')}`:'';
+  const total=Number(db.prepare(`SELECT COUNT(*) AS n FROM usage_events u ${where}`).get(...args).n||0);
+  const items=db.prepare(`SELECT u.id,u.organization_id,o.name AS organization_name,u.site_id,u.event_type,u.provider,u.feature,u.quantity,u.unit,u.status,u.category,u.tokens_input,u.tokens_output,u.tokens_total,u.latency_ms,u.estimated,u.unit_cost_minor,u.unit_price_minor,u.cost_minor,u.price_minor,u.currency,u.model,u.created_at
+    FROM usage_events u JOIN organizations o ON o.id=u.organization_id ${where} ORDER BY u.created_at DESC LIMIT ? OFFSET ?`).all(...args,limit,offset);
+  res.set('Cache-Control','no-store').json({items,total,limit,offset});
+});
+app.get('/api/admin/rates',requireAdmin,adminPermission('billing_read'),(_req,res)=>{
+  res.set('Cache-Control','no-store').json({costs:db.prepare('SELECT * FROM cost_rates ORDER BY effective_from DESC LIMIT 500').all(),prices:db.prepare('SELECT * FROM price_rates ORDER BY effective_from DESC LIMIT 500').all()});
+});
+app.post('/api/admin/rates/costs',adminCsrfAndOrigin,requireAdmin,adminPermission('billing_write'),(req,res)=>{
+  const input=req.body||{},eventType=String(input.event_type||''),provider=String(input.provider||'').trim().toLowerCase(),model=String(input.model||'').trim(),unit=String(input.unit||''),currency=String(input.currency||'BDT').toUpperCase(),amount=input.unit_cost_minor;
+  if(!METERED_EVENT_TYPES.has(eventType)||!provider||provider.length>80||model.length>100||!METERED_UNITS.has(unit)||!Number.isSafeInteger(amount)||amount<0||!/^[A-Z]{3}$/.test(currency))return sendError(res,422,'Enter a valid event, provider, unit, integer cost in minor units, and currency.');
+  const effective=Number(input.effective_from),effectiveFrom=Number.isSafeInteger(effective)?effective:now(),previous=db.prepare('SELECT unit_cost_minor,currency,effective_from FROM cost_rates WHERE event_type=? AND provider=? AND model=? AND unit=? ORDER BY effective_from DESC LIMIT 1').get(eventType,provider,model,unit),id=token(18),stamp=now();
+  db.prepare('INSERT INTO cost_rates(id,event_type,provider,model,unit,unit_cost_minor,currency,effective_from,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)').run(id,eventType,provider,model,unit,amount,currency,effectiveFrom,req.admin.id,stamp);
+  writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'cost_rate.created',targetType:'cost_rate',targetId:id,ip:req.ip||'',userAgent:req.get('user-agent')||'',before:previous||null,after:{event_type:eventType,provider,model,unit,unit_cost_minor:amount,currency,effective_from:effectiveFrom},reason:String(input.reason||''),now:stamp});
+  res.status(201).json({id,effective_from:effectiveFrom});
+});
+app.post('/api/admin/rates/prices',adminCsrfAndOrigin,requireAdmin,adminPermission('billing_write'),(req,res)=>{
+  const input=req.body||{},eventType=String(input.event_type||''),feature=String(input.feature||''),unit=String(input.unit||''),currency=String(input.currency||'BDT').toUpperCase(),amount=input.unit_price_minor;
+  if(!METERED_EVENT_TYPES.has(eventType)||feature.length>80||!METERED_UNITS.has(unit)||!Number.isSafeInteger(amount)||amount<0||!/^[A-Z]{3}$/.test(currency))return sendError(res,422,'Enter a valid event, feature, unit, integer price in minor units, and currency.');
+  const effective=Number(input.effective_from),effectiveFrom=Number.isSafeInteger(effective)?effective:now(),previous=db.prepare('SELECT unit_price_minor,currency,effective_from FROM price_rates WHERE event_type=? AND feature=? AND unit=? ORDER BY effective_from DESC LIMIT 1').get(eventType,feature,unit),id=token(18),stamp=now();
+  db.prepare('INSERT INTO price_rates(id,event_type,feature,unit,unit_price_minor,currency,effective_from,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)').run(id,eventType,feature,unit,amount,currency,effectiveFrom,req.admin.id,stamp);
+  writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'price_rate.created',targetType:'price_rate',targetId:id,ip:req.ip||'',userAgent:req.get('user-agent')||'',before:previous||null,after:{event_type:eventType,feature,unit,unit_price_minor:amount,currency,effective_from:effectiveFrom},reason:String(input.reason||''),now:stamp});
+  res.status(201).json({id,effective_from:effectiveFrom});
 });
 app.get('/api/admin/audit',requireAdmin,adminPermission('audit_read'),(req,res)=>{
   const limit=Math.min(100,Math.max(1,Number.parseInt(req.query.limit,10)||50)),offset=Math.max(0,Number.parseInt(req.query.offset,10)||0);
@@ -507,7 +553,7 @@ function sanitizeAlertSettings(input,base=defaultAlertSettings()){
   const clock=value=>/^([01]\d|2[0-3]):[0-5]\d$/.test(String(value||''))?String(value):null;
   return {enabled:input.enabled===true,aiEnabled:input.aiEnabled===true,baseHeatTriggerC:n(input.baseHeatTriggerC,base.baseHeatTriggerC,28,42),workloadOffsets:offsets,rainLeadMinutes:n(input.rainLeadMinutes,base.rainLeadMinutes,15,360),rainProbability:n(input.rainProbability,base.rainProbability,1,100),cooldownMinutes:n(input.cooldownMinutes,base.cooldownMinutes,1,1440),dailyCap:n(input.dailyCap,base.dailyCap,1,100),quietHours:{start:clock(input.quietHours?.start)||base.quietHours.start,end:clock(input.quietHours?.end)||base.quietHours.end}};
 }
-function runtimeAlertConfig(settings){return {...ALERT_CONFIG,...settings,enabled:ALERT_CONFIG.enabled&&settings.enabled,aiEnabled:ALERT_CONFIG.aiEnabled&&settings.aiEnabled,apiKey:GEMINI_API_KEY,model:ALERT_CONFIG.model,db,organizationId:null};}
+function runtimeAlertConfig(settings){return {...ALERT_CONFIG,...settings,enabled:ALERT_CONFIG.enabled&&settings.enabled,aiEnabled:ALERT_CONFIG.aiEnabled&&settings.aiEnabled,apiKey:GEMINI_API_KEY,model:ALERT_CONFIG.model,db,meterUsage:event=>metering.recordUsage(event),organizationId:null};}
 app.get('/api/alerts/settings',requireUser,(req,res)=>res.set('Cache-Control','no-store').json({settings:alertSettingsFor(req.user.organization_id),aiAvailable:Boolean(ALERT_CONFIG.aiEnabled&&GEMINI_API_KEY),automationAvailable:ALERT_CONFIG.enabled}));
 app.put('/api/alerts/settings',csrfAndOrigin,requireUser,(req,res)=>{
   const current=alertSettingsFor(req.user.organization_id),settings=sanitizeAlertSettings(req.body,current),org=req.user.organization_id;
@@ -565,7 +611,9 @@ app.get('/api/sms', requireUser, async (req, res) => {
       const matched=phoneKeys(direction==='received'?sender:recipient).some(phone=>numbers.has(phone));
       if (!matched || !item._id || !['sent','received'].includes(direction) || hiddenMessageIds.has(String(item._id))) continue;
       const stamp = direction==='received'?(item.receivedAt||item.createdAt):(item.sentAt||item.requestedAt||item.createdAt);
+      const providerId=String(item._id),already=db.prepare('SELECT 1 FROM sms_messages WHERE organization_id=? AND id=?').get(req.user.organization_id,providerId);
       upsert.run(String(item._id),req.user.organization_id,direction,sender,recipient,String(item.message||''),String(item.status||'unknown'),String(item.device?.name||''),stamp||new Date().toISOString(),now()); synced++;
+      if(direction==='received'&&!already){const content=String(item.message||''),emergency=Boolean(emergencySmsCode(content));metering.recordUsage({organizationId:req.user.organization_id,eventType:'sms_inbound',provider:'textbee',feature:emergency?'emergency_code':'inbound',quantity:1,unit:'message',status:String(item.status||'received'),category:emergency?'emergency':'routine',metadata:{segments:calculateSmsSegments(content).segments},refType:'provider_message',refId:providerId,idempotencyKey:`sms-in:${req.user.organization_id}:${providerId}`});}
       if(direction==='received')receivedMatched++;
     }
     const messages=[...db.prepare('SELECT id,direction,sender,recipient,message,status,device_name,message_at FROM sms_messages WHERE organization_id=? ORDER BY message_at DESC LIMIT 250').all(req.user.organization_id),...queuedMessages()].sort((a,b)=>Date.parse(b.message_at)-Date.parse(a.message_at)).slice(0,250);
@@ -720,10 +768,13 @@ function safeNext(value) {
   return typeof value === 'string' && value.startsWith('/') && !value.startsWith('//') && !/[\\\r\n]/.test(value) ? value : '/dashboard.html';
 }
 async function sendEmail(recipient, subject, body) {
+  const started=Date.now(),organizationId=db.prepare('SELECT organization_id FROM users WHERE email=? COLLATE NOCASE').get(String(recipient||''))?.organization_id||null,requestId=token(16);
+  const recordEmail=(status,free=false)=>{if(organizationId)metering.recordUsage({organizationId,eventType:'email_sent',provider:'smtp',feature:'account_email',quantity:1,unit:'email',status,unitCostMinor:free?0:undefined,unitPriceMinor:free?0:undefined,latencyMs:Date.now()-started,idempotencyKey:`email:${requestId}`});};
   const host = process.env.SMTP_HOST;
   if (!host) {
     if (IS_PRODUCTION) throw new Error('Email delivery is not configured.');
     console.log(`\n[development email] To: ${recipient}\nSubject: ${subject}\n${body}\n`);
+    recordEmail('development_logged',true);
     return;
   }
   const { default: nodemailer } = await import('nodemailer');
@@ -759,7 +810,9 @@ async function sendEmail(recipient, subject, body) {
     let relayResponse = String(result.response || '').replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[email]').replace(/[\r\n\t]+/g, ' ').slice(0, 240);
     for (const secret of [process.env.SMTP_USER, process.env.SMTP_PASSWORD]) if (secret) relayResponse = relayResponse.split(secret).join('[redacted]');
     console.info('SMTP accepted message:', JSON.stringify({ messageId: result.messageId, response: relayResponse || 'accepted by relay' }));
+    recordEmail('accepted');
   } catch (error) {
+    recordEmail('failed');
     // Log provider diagnostics only; never include credentials, recipient, or message content.
     let response = String(error.response || '').replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[email]').replace(/[\r\n\t]+/g, ' ').slice(0, 240);
     for (const secret of [process.env.SMTP_USER, process.env.SMTP_PASSWORD]) if (secret) response = response.split(secret).join('[redacted]');
@@ -942,15 +995,19 @@ function weatherSummary(code) {
   const summaries = { 0:'Clear sky',1:'Mainly clear',2:'Partly cloudy',3:'Overcast',45:'Fog',48:'Depositing rime fog',51:'Light drizzle',53:'Drizzle',55:'Heavy drizzle',56:'Light freezing drizzle',57:'Freezing drizzle',61:'Light rain',63:'Rain',65:'Heavy rain',66:'Light freezing rain',67:'Freezing rain',71:'Light snow',73:'Snow',75:'Heavy snow',77:'Snow grains',80:'Light rain showers',81:'Rain showers',82:'Heavy rain showers',85:'Light snow showers',86:'Snow showers',95:'Thunderstorm',96:'Thunderstorm with light hail',99:'Thunderstorm with heavy hail' };
   return summaries[Number(code)] || 'Conditions unavailable';
 }
-async function openMeteo(site, forecastDays = 1) {
+async function openMeteo(site, forecastDays = 1, organizationId = null) {
   const params = new URLSearchParams({ latitude: site.latitude, longitude: site.longitude,
     current: 'temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m',
     hourly: 'temperature_2m,relative_humidity_2m,apparent_temperature,precipitation_probability,precipitation,weather_code,wind_speed_10m,shortwave_radiation',
     forecast_days: String(forecastDays), timezone: 'auto', temperature_unit: 'celsius', wind_speed_unit: 'ms', precipitation_unit: 'mm' });
   const host = OPEN_METEO_API_KEY ? 'customer-api.open-meteo.com' : 'api.open-meteo.com';
   if (OPEN_METEO_API_KEY) params.set('apikey', OPEN_METEO_API_KEY);
-  const response = await fetch(`https://${host}/v1/forecast?${params}`, { signal: AbortSignal.timeout(15000), headers: { Accept: 'application/json', 'User-Agent': 'JibonGuard/1.0' } });
+  const started=Date.now(),orgId=organizationId||db.prepare('SELECT organization_id FROM sites WHERE id=?').get(site.id)?.organization_id||null;
+  let response;
+  try{response=await fetch(`https://${host}/v1/forecast?${params}`, { signal: AbortSignal.timeout(15000), headers: { Accept: 'application/json', 'User-Agent': 'JibonGuard/1.0' } });}
+  catch(error){if(orgId)metering.recordUsage({organizationId:orgId,siteId:site.id,eventType:'weather_api_call',provider:'open_meteo',feature:'weather',quantity:1,unit:'call',status:'failed',idempotencyKey:`weather:${token(16)}`});throw error;}
   const raw = await response.json().catch(() => ({}));
+  if(orgId)metering.recordUsage({organizationId:orgId,siteId:site.id,eventType:'weather_api_call',provider:'open_meteo',feature:'weather',quantity:1,unit:'call',status:response.ok&&raw.current?'success':'failed',latencyMs:Date.now()-started,idempotencyKey:`weather:${token(16)}`});
   if (!response.ok || !raw.current) throw new Error(response.status === 429 ? 'Open-Meteo request limit reached. Weather will be available again shortly.' : response.status === 401 || response.status === 403 ? 'Open-Meteo rejected the customer API key. Check OPEN_METEO_API_KEY in .env.' : raw.reason || `Open-Meteo could not return weather right now (HTTP ${response.status}).`);
   return raw;
 }
@@ -960,7 +1017,7 @@ async function timezoneForSite(siteId, organizationId) {
   const weather=ALERT_WEATHER_CACHE.get(siteId)?.raw;
   if(weather?.timezone){SITE_TIMEZONES.set(siteId,{value:weather.timezone,expires:Date.now()+6*3600000});return weather.timezone;}
   const site=db.prepare('SELECT id,latitude,longitude FROM sites WHERE id=? AND organization_id=?').get(siteId,organizationId);
-  if(site?.latitude!=null&&site?.longitude!=null){try{const raw=await openMeteo(site);if(raw.timezone){SITE_TIMEZONES.set(siteId,{value:raw.timezone,expires:Date.now()+6*3600000});return raw.timezone;}}catch{}}
+  if(site?.latitude!=null&&site?.longitude!=null){try{const raw=await openMeteo(site,1,organizationId);if(raw.timezone){SITE_TIMEZONES.set(siteId,{value:raw.timezone,expires:Date.now()+6*3600000});return raw.timezone;}}catch{}}
   return 'Asia/Dhaka';
 }
 function workerIsOnShift(worker, at=new Date(), timezone='Asia/Dhaka') {
@@ -991,7 +1048,7 @@ app.get('/api/sites/:siteId/weather', requireUser, async (req, res) => {
   if (site.latitude == null || site.longitude == null) return sendError(res, 422, "Add this site's latitude and longitude in Site settings to load weather.");
   const cacheKey = `${site.id}:${site.latitude}:${site.longitude}`, cached = WEATHER_CACHE.get(cacheKey);
   if (cached && cached.expires > Date.now()) return res.json({ site_id: site.id, weather: cached.value, cached: true });
-  try { const result = shapeWeather(await openMeteo(site)); WEATHER_CACHE.set(cacheKey, { expires:Date.now()+600000,value:result }); res.json({ site_id:site.id,weather:result,cached:false }); }
+  try { const result = shapeWeather(await openMeteo(site,1,req.user.organization_id)); WEATHER_CACHE.set(cacheKey, { expires:Date.now()+600000,value:result }); res.json({ site_id:site.id,weather:result,cached:false }); }
   catch (error) { sendError(res, 502, error.message || "Could not reach Open-Meteo. Check the server's internet connection and try again."); }
 });
 app.get('/api/geocode/search', requireUser, async (req, res) => {
@@ -999,8 +1056,10 @@ app.get('/api/geocode/search', requireUser, async (req, res) => {
   if (query.length < 2 || query.length > 200) return sendError(res, 400, 'Enter at least 2 characters to search for a place.');
   const key = `search:${query.toLocaleLowerCase()}`, cached = GEO_CACHE.get(key);
   if (cached && cached.expires > Date.now()) return res.json(cached.value);
+  const requestId=token(16),started=Date.now();let metered=false;
   try {
     const response = await fetch(`https://photon.komoot.io/api/?${new URLSearchParams({q:query,limit:'5',lang:'en'})}`, { signal:AbortSignal.timeout(8000),headers:{Accept:'application/json','User-Agent':`JibonGuard/1.0 (${PUBLIC_ORIGIN})`} });
+    metering.recordUsage({organizationId:req.user.organization_id,eventType:'geocode_call',provider:'photon',feature:'search',quantity:1,unit:'call',status:response.ok?'success':'failed',latencyMs:Date.now()-started,idempotencyKey:`geocode:${requestId}`});metered=true;
     if (!response.ok) return sendError(res, 502, `Place search failed (HTTP ${response.status}). Try again shortly.`);
     const json = await response.json(), results = (json.features || []).flatMap(feature => {
       const [longitude,latitude] = feature.geometry?.coordinates || [], p = feature.properties || {};
@@ -1009,33 +1068,39 @@ app.get('/api/geocode/search', requireUser, async (req, res) => {
       return [{ latitude,longitude,name:name.slice(0,120),display_name:[...new Set(address)].join(', ').slice(0,500) }];
     });
     const value = { results }; GEO_CACHE.set(key,{expires:Date.now()+86400000,value}); res.json(value);
-  } catch { sendError(res, 502, 'Could not retrieve place suggestions. Check your connection or select a point directly on the map.'); }
+  } catch { if(!metered)metering.recordUsage({organizationId:req.user.organization_id,eventType:'geocode_call',provider:'photon',feature:'search',quantity:1,unit:'call',status:'failed',latencyMs:Date.now()-started,idempotencyKey:`geocode:${requestId}`});sendError(res, 502, 'Could not retrieve place suggestions. Check your connection or select a point directly on the map.'); }
 });
 app.get('/api/geocode/reverse', requireUser, async (req, res) => {
   const latitude = Number(req.query.lat), longitude = Number(req.query.lon);
   if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || Math.abs(latitude)>90 || Math.abs(longitude)>180) return sendError(res, 400, 'Choose a valid point on the map.');
   const key = `reverse:${latitude.toFixed(5)},${longitude.toFixed(5)}`, cached = GEO_CACHE.get(key);
   if (cached && cached.expires>Date.now()) return res.json(cached.value);
+  const requestId=token(16),started=Date.now();let metered=false;
   try {
     const params=new URLSearchParams({format:'jsonv2',lat:String(latitude),lon:String(longitude),zoom:'18',addressdetails:'1'});
     const response=await fetch(`https://nominatim.openstreetmap.org/reverse?${params}`,{signal:AbortSignal.timeout(10000),headers:{Accept:'application/json','User-Agent':`JibonGuard/1.0 (site location picker; ${PUBLIC_ORIGIN})`,Referer:`${PUBLIC_ORIGIN}/dashboard.html`}});
+    metering.recordUsage({organizationId:req.user.organization_id,eventType:'geocode_call',provider:'nominatim',feature:'reverse',quantity:1,unit:'call',status:response.ok?'success':'failed',latencyMs:Date.now()-started,idempotencyKey:`geocode:${requestId}`});metered=true;
     const result=await response.json(); if(!response.ok||!result.display_name)return sendError(res,response.status===404?404:502,'Could not retrieve this place from OpenStreetMap. You can still save the coordinates.');
     const address=result.address||{}, name=result.name||address.building||address.amenity||address.road||address.neighbourhood||address.suburb||address.village||address.town||address.city||'';
     const value={latitude,longitude,display_name:result.display_name,name:String(name).slice(0,120),address}; GEO_CACHE.set(key,{expires:Date.now()+604800000,value}); res.json(value);
-  } catch { sendError(res, 502, 'Could not retrieve this place from OpenStreetMap. You can still save the coordinates.'); }
+  } catch { if(!metered)metering.recordUsage({organizationId:req.user.organization_id,eventType:'geocode_call',provider:'nominatim',feature:'reverse',quantity:1,unit:'call',status:'failed',latencyMs:Date.now()-started,idempotencyKey:`geocode:${requestId}`});sendError(res, 502, 'Could not retrieve this place from OpenStreetMap. You can still save the coordinates.'); }
 });
 
-async function geminiGenerate(contents, instruction, jsonResponse = false) {
+async function geminiGenerate(contents, instruction, jsonResponse = false, { organizationId = null, feature = 'chat' } = {}) {
   if (!GEMINI_API_KEY) throw new Error('Gemini is not configured. Set GEMINI_API_KEY in the server .env file.');
+  const started=Date.now(),inputText=`${instruction}\n${JSON.stringify(contents)}`;
+  const recordGemini=(status,usage,latency)=>metering.recordUsage({organizationId,eventType:'ai_call',provider:'gemini',feature,quantity:usage.inputTokens+usage.outputTokens,unit:'token',rateDivisor:1000000,tokensInput:usage.inputTokens,tokensOutput:usage.outputTokens,estimated:usage.estimated,status,model:GEMINI_MODEL,latencyMs:latency,metadata:{estimated:usage.estimated},idempotencyKey:`gemini:${token(16)}`});
   const generationConfig = { maxOutputTokens:700 };
   if (GEMINI_MODEL.startsWith('gemini-3')) generationConfig.thinkingConfig={thinkingLevel:GEMINI_MODEL==='gemini-3.5-flash-lite'?'minimal':'low'};
   if (jsonResponse) generationConfig.responseMimeType='application/json';
   let response;
   try { response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`,{method:'POST',signal:AbortSignal.timeout(50000),headers:{'x-goog-api-key':GEMINI_API_KEY,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({systemInstruction:{parts:[{text:instruction}]},contents,generationConfig})}); }
-  catch { throw new Error("Could not connect to Gemini. Check the server's internet connection."); }
+  catch { const usage={...estimateGeminiTokens(inputText,''),outputTokens:0};recordGemini('failed',usage,Date.now()-started);throw new Error("Could not connect to Gemini. Check the server's internet connection."); }
   const result=await response.json().catch(()=>({}));
-  if (!response.ok) { const detail=String(result.error?.message||'').replace(/\s+/g,' ').slice(0,240); throw new Error(`Gemini returned HTTP ${response.status}.${detail?` ${detail}`:' Check the server key, model and API quota.'}`); }
   const candidate=result.candidates?.[0]||{}, answer=(candidate.content?.parts||[]).map(part=>part.text||'').join('\n').trim();
+  const metadata=result.usageMetadata||{},estimate=estimateGeminiTokens(inputText,answer),usage={inputTokens:Number.isSafeInteger(metadata.promptTokenCount)?metadata.promptTokenCount:estimate.inputTokens,outputTokens:Number.isSafeInteger(metadata.candidatesTokenCount)?metadata.candidatesTokenCount:estimate.outputTokens,estimated:!Number.isSafeInteger(metadata.promptTokenCount)||!Number.isSafeInteger(metadata.candidatesTokenCount)};
+  if (!response.ok) { recordGemini('failed',usage,Date.now()-started);const detail=String(result.error?.message||'').replace(/\s+/g,' ').slice(0,240); throw new Error(`Gemini returned HTTP ${response.status}.${detail?` ${detail}`:' Check the server key, model and API quota.'}`); }
+  recordGemini(answer?'success':'failed',usage,Date.now()-started);
   if (!answer) throw new Error(`Gemini returned no text${candidate.finishReason?` (${candidate.finishReason})`:''}. Check the model/key or rephrase the prompt.`);
   return answer;
 }
@@ -1067,7 +1132,7 @@ app.post('/api/ai/chat', csrfAndOrigin, requireUser, async (req,res) => {
     }
   }
   const instruction="You are JibonGuard's in-app assistant. Help organization administrators understand the dashboard, site weather, worker consent, break logs, and practical heat and weather safety. Be concise and clear. Do not claim to see private organization records or live weather unless supplied in the conversation. Never give a medical diagnosis or claim an emergency is safe; direct urgent situations to local emergency services and official instructions. Do not ask for passwords, API keys, or personal worker details.";
-  try { res.json({ reply:await geminiGenerate(contents,instruction) }); } catch(error) { sendError(res,503,error.message); }
+  try { res.json({ reply:await geminiGenerate(contents,instruction,false,{organizationId:req.user.organization_id,feature:'chat'}) }); } catch(error) { sendError(res,503,error.message); }
 });
 app.post('/api/ai/speech', csrfAndOrigin, requireUser, async (req,res) => {
   if (!rateAllowed(req,'gemini-speech',30,3600)) return sendError(res,429,'Speech limit reached. Try again in a little while.');
@@ -1076,13 +1141,15 @@ app.post('/api/ai/speech', csrfAndOrigin, requireUser, async (req,res) => {
   if(!text||text.length>5000)return sendError(res,400,'Choose a reply with 1 to 5,000 characters to read aloud.');
   if(!['Kore','Puck','Charon','Aoede'].includes(voice))return sendError(res,400,'Choose one of the available assistant voices.');
   if(!GEMINI_API_KEY)return sendError(res,503,'Gemini is not configured. Set GEMINI_API_KEY in the server .env file.');
-  let response;
+  let response;const started=Date.now(),estimatedInput=estimateGeminiTokens(text,'');
   try{
     response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_TTS_MODEL)}:generateContent`,{method:'POST',signal:AbortSignal.timeout(60000),headers:{'x-goog-api-key':GEMINI_API_KEY,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({contents:[{role:'user',parts:[{text,speech_metadata:{style:'Clear, calm, conversational delivery.'}}]}],generationConfig:{responseModalities:['AUDIO'],speechConfig:{voiceConfig:{voice}}}})});
-  }catch{return sendError(res,503,"Could not connect to Gemini speech. Check the server's internet connection.");}
+  }catch{metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:estimatedInput.inputTokens,unit:'token',rateDivisor:1000000,tokensInput:estimatedInput.inputTokens,tokensOutput:0,estimated:true,status:'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});return sendError(res,503,"Could not connect to Gemini speech. Check the server's internet connection.");}
   const result=await response.json().catch(()=>({}));
-  if(!response.ok){const detail=String(result.error?.message||'').replace(/\s+/g,' ').slice(0,220);return sendError(res,503,`Gemini speech returned HTTP ${response.status}.${detail?` ${detail}`:' Check TTS model access and API quota.'}`);}
+  const usageMeta=result.usageMetadata||{},tokensInput=Number.isSafeInteger(usageMeta.promptTokenCount)?usageMeta.promptTokenCount:estimatedInput.inputTokens,tokensOutput=Number.isSafeInteger(usageMeta.candidatesTokenCount)?usageMeta.candidatesTokenCount:0,estimated=!Number.isSafeInteger(usageMeta.promptTokenCount)||!Number.isSafeInteger(usageMeta.candidatesTokenCount);
+  if(!response.ok){metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:tokensInput+tokensOutput,unit:'token',rateDivisor:1000000,tokensInput,tokensOutput,estimated,status:'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});const detail=String(result.error?.message||'').replace(/\s+/g,' ').slice(0,220);return sendError(res,503,`Gemini speech returned HTTP ${response.status}.${detail?` ${detail}`:' Check TTS model access and API quota.'}`);}
   const audioPart=(result.candidates?.[0]?.content?.parts||[]).find(part=>part.inlineData?.data);
+  metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:tokensInput+tokensOutput,unit:'token',rateDivisor:1000000,tokensInput,tokensOutput,estimated,status:audioPart?'success':'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});
   if(!audioPart)return sendError(res,503,'Gemini returned no speech audio. Check TTS model access and try again.');
   res.set('Cache-Control','no-store').json({audio:audioPart.inlineData.data,mime_type:audioPart.inlineData.mimeType||'audio/wav'});
 });
@@ -1099,7 +1166,7 @@ app.post('/api/ai/live-token', csrfAndOrigin, requireUser, async (req,res) => {
   res.set('Cache-Control','no-store').json({token:result.name,model:'models/gemini-3.8-live'});
 });
 
-async function sendTextBeeBreakSms(recipients, record) {
+async function sendTextBeeBreakSms(recipients, record, usageContext={}) {
   if (!recipients.length) return { status:'no_recipients',recipient_count:0,message:'No consented workers with usable phone numbers are assigned to this site.' };
   const apiKey=(process.env.TEXTBEE_API_KEY||process.env.TEXTBEE_DEV_API||'').trim(), subscription=(process.env.TEXTBEE_SIM_SUBSCRIPTION_ID||process.env.SIM_SUBSCRIPTION_ID||'').trim(), base=(process.env.TEXTBEE_BASE_URL||'https://api.textbee.dev/api/v1').replace(/\/$/,'');
   if (!apiKey) return {status:'not_configured',recipient_count:0,message:'Break saved, but SMS is not configured. Set TEXTBEE_API_KEY in JibonGuard AI/.env.'};
@@ -1123,12 +1190,13 @@ async function sendTextBeeBreakSms(recipients, record) {
     const messageTemplate=({break:'পানি পান ও ছায়ায় বিরতি',rain:'বৃষ্টি সতর্কতা',storm:'ঝড় সতর্কতা',earthquake:'ভূমিকম্প সতর্কতা'})[record.alert_type]||'নিরাপত্তা সতর্কতা';
     const response=await fetch(`${base}/gateway/send-bulk-sms`,{method:'POST',signal:AbortSignal.timeout(20000),headers:{'x-api-key':apiKey,'Content-Type':'application/json',Accept:'application/json','User-Agent':'JibonGuard/1.0 (site break notifications)'},body:JSON.stringify({messages,messageTemplate})});
     const result=await response.json().catch(()=>({}));
-    if (!response.ok) { const detail=String(result.message||result.error?.message||result.data?.message||'').replace(/\s+/g,' ').slice(0,180); return {status:'failed',recipient_count:0,message:response.status===401?'Break saved, but TextBee rejected the API key. Check TEXTBEE_API_KEY.':response.status===429?"Break saved, but TextBee's sending limit was reached.":`Break saved, but TextBee returned HTTP ${response.status}.${detail?` ${detail}`:' Check that a default device is enabled and online.'}`}; }
+    if (!response.ok) {meterSmsAttempt(recipients,usageContext,'failed',token(16));const detail=String(result.message||result.error?.message||result.data?.message||'').replace(/\s+/g,' ').slice(0,180); return {status:'failed',recipient_count:0,message:response.status===401?'Break saved, but TextBee rejected the API key. Check TEXTBEE_API_KEY.':response.status===429?"Break saved, but TextBee's sending limit was reached.":`Break saved, but TextBee returned HTTP ${response.status}.${detail?` ${detail}`:' Check that a default device is enabled and online.'}`}; }
     const accepted=result.data?.success===true||Number(result.data?.successCount)>0;
-    if (!accepted) { const failed=Number(result.data?.failureCount)||0; return {status:'failed',recipient_count:0,message:failed?`Break saved, but TextBee could not queue ${failed} SMS. Check device status and recipient numbers.`:'Break saved, but TextBee did not confirm the batch. Check that a default sending device is enabled and online.'}; }
+    if (!accepted) {meterSmsAttempt(recipients,usageContext,'failed',token(16));const failed=Number(result.data?.failureCount)||0; return {status:'failed',recipient_count:0,message:failed?`Break saved, but TextBee could not queue ${failed} SMS. Check device status and recipient numbers.`:'Break saved, but TextBee did not confirm the batch. Check that a default sending device is enabled and online.'}; }
     const acceptedCount=Number(result.data?.recipientCount||result.data?.successCount)||recipients.length;
+    meterSmsAttempt(recipients,usageContext,'queued',token(16));
     return {status:'queued',recipient_count:acceptedCount,message:`TextBee accepted ${acceptedCount} personalized SMS message(s) into its queue.`};
-  } catch { return {status:'failed',recipient_count:0,message:'Break saved, but the TextBee request timed out or failed. Retry shortly.'}; }
+  } catch { meterSmsAttempt(recipients,usageContext,'failed',token(16));return {status:'failed',recipient_count:0,message:'Break saved, but the TextBee request timed out or failed. Retry shortly.'}; }
 }
 function queueBreakSms(orgId, breakId, recipients, record, scheduledAt) {
   const insert=db.prepare("INSERT INTO scheduled_break_sms(id,organization_id,break_id,worker_id,workload,recipient,message,scheduled_at,status,created_at) VALUES(?,?,?,?,?,?,?,?,'scheduled',?)");
@@ -1159,10 +1227,10 @@ async function dispatchScheduledBreakSms() {
         else if(workloadLevels.length&&!workloadLevels.includes(worker.workload))error='Worker workload is no longer selected for this alert.';
         else if(!workerIsOnShift(worker,new Date(),timezone))error='Worker is outside their shift at send time.';
         if(error){db.prepare("UPDATE scheduled_break_sms SET status='failed',error=? WHERE id=? AND organization_id=? AND status='sending'").run(error,row.id,item.organization_id);continue;}
-        recipients.push({phone:row.recipient,name:worker.name});
+        recipients.push({phone:row.recipient,name:worker.name,refId:row.id});
       }
       if(!recipients.length)continue;
-      const result=await sendTextBeeBreakSms(recipients,{...record,status:'scheduled',scheduled_at:item.scheduled_at});
+      const result=await sendTextBeeBreakSms(recipients,{...record,status:'scheduled',scheduled_at:item.scheduled_at},{organizationId:item.organization_id,feature:'break_planner'});
       const success=result.status==='queued';
       db.prepare("UPDATE scheduled_break_sms SET status=?,sent_at=?,error=? WHERE break_id=? AND organization_id=? AND status='sending'").run(success?'sent':'failed',success?now():null,success?'':result.message,item.break_id,item.organization_id);
     }
@@ -1193,7 +1261,7 @@ function emergencySmsCode(message) {
 function weatherSlotIndex(times,currentTime){const current=String(currentTime||'').slice(0,16);return Math.max(0,times.findIndex(value=>String(value)>=current));}
 async function buildAlertContexts(site,organizationId,config,{simulation=null}={}){
   let raw,age=0,delayed=false;
-  try{raw=await openMeteo(site,2);ALERT_WEATHER_CACHE.set(site.id,{raw,fetchedAt:Date.now()});}
+  try{raw=await openMeteo(site,2,organizationId);ALERT_WEATHER_CACHE.set(site.id,{raw,fetchedAt:Date.now()});}
   catch(error){const cached=ALERT_WEATHER_CACHE.get(site.id);if(cached){raw=cached.raw;age=(Date.now()-cached.fetchedAt)/60000;delayed=age>config.staleWeatherMinutes;}else{raw={current:{},hourly:{time:[]},timezone:'UTC'};age=config.staleWeatherMinutes+1;delayed=true;}console.error(`Alert weather fetch failed ${site.id}: ${error.name}`);}
   ALERT_WEATHER_STATUS.set(`${organizationId}:${site.id}`,{delayed,age,updatedAt:Date.now()});
   const current=raw.current||{},hourly=raw.hourly||{},times=hourly.time||[],start=weatherSlotIndex(times,current.time),slots=[];
@@ -1218,7 +1286,7 @@ async function dispatchAlertQueue(){
   for(const row of queued){if(!row.consent_at){db.prepare("UPDATE automated_alerts SET status='skipped',reason='Consent withdrawn before dispatch.' WHERE id=?").run(row.id);continue;}let timezone='Asia/Dhaka';try{timezone=JSON.parse(row.input_context).weather?.timezone||timezone;}catch{}if(!workerIsOnShift(row,new Date(),timezone)){db.prepare("UPDATE automated_alerts SET status='skipped',reason='Outside the worker shift at send time.' WHERE id=?").run(row.id);continue;}ready.push({...row,phone:normalizePhone(row.phone)});}
   const sendable=[];
   for(const row of ready){if(!row.phone)continue;let message=row.message;if(row.alert_type==='rain_2h'&&!row.floor){let eta=null;try{eta=Number(JSON.parse(row.input_context).weather?.rainEtaMinutes);}catch{}const elapsed=Math.max(0,(now()-row.created_at)/60);if(!Number.isFinite(eta)||elapsed>=eta){db.prepare("UPDATE automated_alerts SET status='skipped',reason='Rain forecast window passed before dispatch.' WHERE id=?").run(row.id);continue;}message=renderAlertTemplate('rain_2h',{minutes:Math.max(1,Math.round(eta-elapsed))});db.prepare('UPDATE automated_alerts SET message=? WHERE id=?').run(message,row.id);}sendable.push({...row,message});}
-  const groups=await dispatchAlertGroups(sendable.map(row=>({id:row.id,phone:row.phone,message:row.message,channel:row.channel})),{smsSender:async entries=>{const result=await sendTextBeeMessages(entries,entries[0]?.message||'JibonGuard safety alert');return {accepted:result.accepted};}});
+  const groups=await dispatchAlertGroups(sendable.map(row=>({id:row.id,phone:row.phone,message:row.message,channel:row.channel})),{smsSender:async entries=>{const refs=new Set(entries.flatMap(entry=>entry.referenceIds||[])),related=sendable.filter(row=>refs.has(row.id)),result=await sendTextBeeMessages(entries,entries[0]?.message||'JibonGuard safety alert',{organizationId:sendable[0]?.organization_id,siteId:sendable[0]?.site_id,feature:'ai_alert_automation',category:related.some(row=>row.floor||row.alert_type==='lightning')?'safety':'routine'});return {accepted:result.accepted};}});
   for(const group of groups)for(const item of group.items){const accepted=group.sms.accepted,status=accepted?'sent':'failed',sentAt=accepted?now():null;db.prepare('UPDATE automated_alerts SET status=?,sent_at=? WHERE id=?').run(status,sentAt,item.id);}
   for(const row of ready.filter(item=>!item.phone))db.prepare("UPDATE automated_alerts SET status='failed',reason=reason||' Worker phone number is invalid.' WHERE id=?").run(row.id);
   return groups.length;
@@ -1240,18 +1308,30 @@ async function runAlertAutomationTick(){
 }
 jobRunner.register('alert_automation', runAlertAutomationTick, { jitterMs: 0 });
 async function runAlertAutomation(){ await jobRunner.execute('alert_automation'); }
-async function sendTextBeeMessages(entries,messageTemplate) {
+function meterSmsAttempt(entries,{organizationId,siteId=null,category='routine',feature='sms'},status,attemptId=token(16)){
+  if(!organizationId)return;
+  const unique=new Map();for(const entry of entries){const key=`${entry.phone}\0${entry.message}`;if(!unique.has(key))unique.set(key,entry);}
+  for(const entry of unique.values()){
+    const sms=calculateSmsSegments(entry.message||''),refs=[...(entry.referenceIds||[]),...(entry.refId?[entry.refId]:[])].map(String).sort();
+    const reference=refs.length?refs.map(ref=>usageContext.refPrefix?`${usageContext.refPrefix}:${ref}`:ref).join(','):attemptId;
+    metering.recordUsage({organizationId,siteId,eventType:'sms_outbound',provider:'textbee',feature,quantity:sms.segments,unit:'segment',status,category,unitPriceMinor:status==='failed'?0:undefined,refType:refs.length?'send_attempt':'provider_attempt',refId:reference,metadata:{encoding:sms.encoding,units:sms.units,category},idempotencyKey:`sms-out:${organizationId}:${attemptId}:${reference}`});
+  }
+}
+async function sendTextBeeMessages(entries,messageTemplate,usageContext={}) {
   const apiKey=(process.env.TEXTBEE_API_KEY||process.env.TEXTBEE_DEV_API||'').trim();
   const base=(process.env.TEXTBEE_BASE_URL||'https://api.textbee.dev/api/v1').replace(/\/$/,'');
   const subscription=(process.env.TEXTBEE_SIM_SUBSCRIPTION_ID||process.env.SIM_SUBSCRIPTION_ID||'').trim();
   if(!apiKey||!base.startsWith('https://')||!entries.length)return {accepted:false};
+  const attemptId=token(16),started=Date.now();
   const byText=new Map();for(const entry of entries){if(!byText.has(entry.message))byText.set(entry.message,new Set());byText.get(entry.message).add(entry.phone);}
   const messages=[...byText].map(([message,phones])=>({recipients:[...phones],message,...(subscription&&/^\d+$/.test(subscription)?{simSubscriptionId:Number(subscription)}:{})}));
   try {
     const response=await fetch(`${base}/gateway/send-bulk-sms`,{method:'POST',signal:AbortSignal.timeout(20000),headers:{'x-api-key':apiKey,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({messages,messageTemplate})});
     const result=await response.json().catch(()=>({}));
-    return {accepted:response.ok&&(result.data?.success===true||Number(result.data?.successCount)>0||Number(result.data?.recipientCount)>0),result};
-  } catch { return {accepted:false}; }
+    const accepted=response.ok&&(result.data?.success===true||Number(result.data?.successCount)>0||Number(result.data?.recipientCount)>0);
+    meterSmsAttempt(entries,usageContext,accepted?'queued':'failed',attemptId);
+    return {accepted,result,latencyMs:Date.now()-started};
+  } catch { meterSmsAttempt(entries,usageContext,'failed',attemptId);return {accepted:false}; }
 }
 const EMERGENCY_MANUAL='বিপদে শুধু সংখ্যা লিখে পাঠান: ১ দুর্ঘটনা/সাহায্য, ২ আগুন, ৩ গরমে অসুস্থ, ৪ সহকর্মী অজ্ঞান/গুরুতর অসুস্থ, ৫ বিদ্যুৎ বিপদ, ৬ পড়ে যাওয়া/ধস, ৭ ঝড়/বজ্রপাত, ৮ গ্যাস লিক/বিষাক্ত ধোঁয়া, ৯ অন্য জরুরি সমস্যা। ০ লিখলে এই নির্দেশিকা পাবেন। জীবন বিপন্ন হলে ৯৯৯ এ কল করুন।';
 const FORMATTED_EMERGENCY_MANUAL=[
@@ -1276,9 +1356,9 @@ function workerWelcomeText(worker) {
 async function sendWorkerWelcomeMessages(workers, organizationId) {
   if(!(process.env.TEXTBEE_API_KEY||process.env.TEXTBEE_DEV_API||'').trim())return {status:'not_configured',recipient_count:0};
   const entries=[];
-  for(const worker of workers){const timezone=worker.siteId?await timezoneForSite(worker.siteId,organizationId):'Asia/Dhaka';if(workerIsOnShift(worker,new Date(),timezone)){const phone=normalizePhone(worker.phone);if(phone)entries.push({phone,message:workerWelcomeText(worker)});}}
+  for(const worker of workers){const timezone=worker.siteId?await timezoneForSite(worker.siteId,organizationId):'Asia/Dhaka';if(workerIsOnShift(worker,new Date(),timezone)){const phone=normalizePhone(worker.phone);if(phone)entries.push({phone,message:workerWelcomeText(worker),refId:worker.id});}}
   let accepted=0;
-  for(let start=0;start<entries.length;start+=50){const result=await sendTextBeeMessages(entries.slice(start,start+50),'জীবনগার্ড কর্মী নিবন্ধন');if(result.accepted)accepted+=entries.slice(start,start+50).length;}
+  for(let start=0;start<entries.length;start+=50){const result=await sendTextBeeMessages(entries.slice(start,start+50),'জীবনগার্ড কর্মী নিবন্ধন',{organizationId,feature:'worker_registration',category:'routine'});if(result.accepted)accepted+=entries.slice(start,start+50).length;}
   return {status:accepted===entries.length&&entries.length?'queued':accepted?'partial':entries.length?'failed':'outside_shift',recipient_count:accepted,skipped_outside_shift:workers.length-entries.length};
 }
 async function sendWorkerWelcomeSms(worker, organizationId) { return sendWorkerWelcomeMessages([worker],organizationId); }
@@ -1303,7 +1383,8 @@ async function syncEmergencySms({seed=false}={}) {
     const orgs=new Map();for(const worker of matches){if(!orgs.has(worker.organization_id))orgs.set(worker.organization_id,[]);orgs.get(worker.organization_id).push(worker);}
     for(const [orgId,orgMatches] of orgs){
       const stamp=item.receivedAt||item.createdAt||new Date().toISOString();
-      insert.run(id,orgId,sender,String(item.message||''),String(item.status||'received'),String(item.device?.name||''),stamp,now());
+      const inserted=insert.run(id,orgId,sender,String(item.message||''),String(item.status||'received'),String(item.device?.name||''),stamp,now());
+      if(inserted.changes){const content=String(item.message||''),emergency=Boolean(emergencySmsCode(content));metering.recordUsage({organizationId:orgId,eventType:'sms_inbound',provider:'textbee',feature:emergency?'emergency_code':'inbound',quantity:1,unit:'message',status:String(item.status||'received'),category:emergency?'emergency':'routine',metadata:{segments:calculateSmsSegments(content).segments},refType:'provider_message',refId:id,idempotencyKey:`sms-in:${orgId}:${id}`});}
       if(seed&&Date.now()-Date.parse(item.createdAt||stamp)>120000){db.prepare("UPDATE sms_messages SET emergency_status='historic' WHERE organization_id=? AND id=? AND emergency_status=''").run(orgId,id);continue;}
       if(seed)db.prepare("UPDATE sms_messages SET emergency_status='' WHERE organization_id=? AND id=? AND emergency_status='historic'").run(orgId,id);
       const code=emergencySmsCode(item.message);if(!code)continue;
@@ -1311,16 +1392,16 @@ async function syncEmergencySms({seed=false}={}) {
       try{
         const senderWorker=orgMatches[0],siteId=senderWorker.site_id;
         if(code==='0'){
-          const sent=await sendTextBeeMessages([{phone:normalizePhone(sender)||normalizePhone(orgMatches[0].phone),message:EMERGENCY_CODES[code].reply}],'জরুরি নির্দেশিকা');
+          const sent=await sendTextBeeMessages([{phone:normalizePhone(sender)||normalizePhone(orgMatches[0].phone),message:EMERGENCY_CODES[code].reply,refId:`${id}:reply`}],'জরুরি নির্দেশিকা',{organizationId:orgId,siteId,feature:'emergency_code',category:'emergency'});
           db.prepare('UPDATE sms_messages SET emergency_status=? WHERE organization_id=? AND id=?').run(sent.accepted?'queued':'failed',orgId,id);handled++;continue;
         }
         const siteWorkers=db.prepare('SELECT name,phone FROM workers WHERE organization_id=? AND site_id=?').all(orgId,siteId);
-        const recipients=[...new Map(siteWorkers.map(worker=>[normalizePhone(worker.phone),{phone:normalizePhone(worker.phone),name:worker.name}]).filter(([phone])=>phone)).values()];
+        const recipients=[...new Map(siteWorkers.map(worker=>[normalizePhone(worker.phone),{phone:normalizePhone(worker.phone),name:worker.name,refId:`${id}:${worker.id}`}]).filter(([phone])=>phone)).values()];
         const sendersPhone=normalizePhone(sender);
         const bengaliCode=code.replace(/[0-9]/g,digit=>BANGLA_DIGITS[Number(digit)]);
         const broadcast=`জরুরি সতর্কতা: ${senderWorker.name} ${senderWorker.site} কর্মস্থল থেকে ${bengaliCode} নম্বরের বার্তা দিয়েছেন (${EMERGENCY_CODES[code].label})। ${EMERGENCY_CODES[code].reply} জীবন বিপন্ন হলে ৯৯৯ এ কল করুন।`;
-        const batch=[{phone:sendersPhone||normalizePhone(senderWorker.phone),message:EMERGENCY_CODES[code].reply},...recipients.map(worker=>({phone:worker.phone,message:broadcast}))];
-        const sent=await sendTextBeeMessages(batch,'জীবনগার্ড জরুরি সতর্কতা');
+        const batch=[{phone:sendersPhone||normalizePhone(senderWorker.phone),message:EMERGENCY_CODES[code].reply,refId:`${id}:reply`},...recipients.map(worker=>({phone:worker.phone,message:broadcast,refId:worker.refId}))];
+        const sent=await sendTextBeeMessages(batch,'জীবনগার্ড জরুরি সতর্কতা',{organizationId:orgId,siteId,feature:'emergency_code',category:'emergency'});
         db.prepare('UPDATE sms_messages SET emergency_status=? WHERE organization_id=? AND id=?').run(sent.accepted?'queued':'failed',orgId,id);handled++;
       }catch(error){db.prepare("UPDATE sms_messages SET emergency_status='failed' WHERE organization_id=? AND id=?").run(orgId,id);console.error(`Emergency SMS processing failed (${error.name})`);}
     }
@@ -1359,7 +1440,7 @@ app.post('/api/breaks',csrfAndOrigin,requireUser,async(req,res)=>{
   const siteConsented=consentedRecipients(req.user.organization_id,siteId),consented=siteConsented.filter(worker=>workloadLevels.includes(worker.workload));
   const timezone=status==='logged'?await timezoneForSite(siteId,req.user.organization_id):null;
   const inShift=status==='logged'?consented.filter(worker=>workerIsOnShift(worker,new Date(),timezone)):consented;
-  const recipients=[...new Map(inShift.map(worker=>[worker.phone,worker])).values()];
+  const recipients=[...new Map(inShift.map(worker=>[worker.phone,{...worker,refId:worker.id}])).values()];
   const workerCount=db.prepare('SELECT COUNT(*) AS count FROM workers WHERE organization_id=?').get(req.user.organization_id).count,id=token(12),stamp=now();
   const parsedSchedule=Number(d.scheduled_at), scheduledAt=Number.isFinite(parsedSchedule)&&parsedSchedule>0?Math.floor(parsedSchedule):Math.floor(new Date(`${date}T${time}:00`).getTime()/1000);
   if(!Number.isFinite(scheduledAt)||scheduledAt<=now())return sendError(res,400,'Choose a date and time later than the current time.');
@@ -1370,7 +1451,7 @@ app.post('/api/breaks',csrfAndOrigin,requireUser,async(req,res)=>{
     const count=queueBreakSms(req.user.organization_id,id,recipients,{...record,scheduled_at:scheduledAt},scheduledAt);
     return res.status(201).json({break:record,sms:{status:'scheduled',recipient_count:count,message:count?`SMS queued for ${date} at ${time} for selected workload levels.`:'Safety log scheduled; no consented workers in the selected workload levels are assigned to this site.'}});
   }
-  const sms=await sendTextBeeBreakSms(recipients,{...record,scheduled_at:scheduledAt});
+  const sms=await sendTextBeeBreakSms(recipients,{...record,scheduled_at:scheduledAt},{organizationId:req.user.organization_id,siteId:site.id,refPrefix:id,feature:alertType==='break'?'break_reminder':'safety_alert',category:alertType==='break'?'routine':'safety'});
   if(siteConsented.length&&!consented.length)sms.message='Break saved, but no consented worker at this site matches the selected workload levels.';
   else if(consented.length&&!recipients.length)sms.message='Break saved, but no selected worker is currently within their shift; no SMS was sent.';
   res.status(201).json({break:record,sms});
@@ -1412,10 +1493,10 @@ app.post('/api/breaks/ai-schedule',csrfAndOrigin,requireUser,async(req,res)=>{
   const pending=[], errors=[];
   for (const site of sites.filter(item=>item.latitude!=null&&item.longitude!=null)) {
     try {
-      const weather=await openMeteo(site),current=weather.current,hourly=weather.hourly||{},forecast=(hourly.time||[]).slice(0,24).filter((_,i)=>i%2===0).map((time,i)=>({time,temperature_c:(hourly.temperature_2m||[])[i*2],feels_like_c:(hourly.apparent_temperature||[])[i*2],rain_probability_percent:(hourly.precipitation_probability||[])[i*2],weather_code:(hourly.weather_code||[])[i*2],wind_speed_m_s:(hourly.wind_speed_10m||[])[i*2]}));
+      const weather=await openMeteo(site,1,req.user.organization_id),current=weather.current,hourly=weather.hourly||{},forecast=(hourly.time||[]).slice(0,24).filter((_,i)=>i%2===0).map((time,i)=>({time,temperature_c:(hourly.temperature_2m||[])[i*2],feels_like_c:(hourly.apparent_temperature||[])[i*2],rain_probability_percent:(hourly.precipitation_probability||[])[i*2],weather_code:(hourly.weather_code||[])[i*2],wind_speed_m_s:(hourly.wind_speed_10m||[])[i*2]}));
       const context={site:site.name,address:site.address,timezone:weather.timezone||'UTC',current:{temperature_2m:current.temperature_2m,apparent_temperature:current.apparent_temperature,relative_humidity_2m:current.relative_humidity_2m,precipitation:current.precipitation,weather_code:current.weather_code,wind_speed_10m:current.wind_speed_10m,wind_gusts_10m:current.wind_gusts_10m},next_hours:forecast};
       const instruction='Recommend at most one safety log using only supplied Open-Meteo data. Return JSON with action (schedule or no_schedule), alert_type (break, rain, or storm), duration_minutes (10, 15, or 20), rationale (under 35 words). Use storm for thunderstorms or dangerous wind, rain for substantial rain risk, and a routine water/shade break for dangerous heat. Choose no_schedule only when no safety action is warranted. Never invent observations.';
-      const decision=JSON.parse(await geminiGenerate([{role:'user',parts:[{text:JSON.stringify(context)}]}],instruction,true));
+      const decision=JSON.parse(await geminiGenerate([{role:'user',parts:[{text:JSON.stringify(context)}]}],instruction,true,{organizationId:req.user.organization_id,feature:'break_suggestion'}));
       const code=Number(current.weather_code),gusts=Number(current.wind_gusts_10m),apparent=Number(current.apparent_temperature),maxRain=Math.max(0,...forecast.map(item=>Number(item.rain_probability_percent)||0));
       if([95,96,99].includes(code)||gusts>=20)Object.assign(decision,{action:'schedule',alert_type:'storm'});else if(maxRain>=70)Object.assign(decision,{action:'schedule',alert_type:'rain'});else if(apparent>=35)Object.assign(decision,{action:'schedule',alert_type:'break'});
       if(decision.action!=='schedule'||!['break','rain','storm'].includes(decision.alert_type))continue;
@@ -1452,6 +1533,8 @@ app.listen(PORT, HOST, () => {
   const alertPoll=setInterval(()=>void runAlertAutomation(),ALERT_CONFIG.intervalMs);alertPoll.unref();
   const breakSmsFirstRun=setTimeout(()=>void dispatchScheduledBreakSms(),3000);breakSmsFirstRun.unref();
   const breakSmsPoll=setInterval(()=>void dispatchScheduledBreakSms(),15000);breakSmsPoll.unref();
+  const rollupFirstRun=setTimeout(()=>void jobRunner.execute('usage_rollups'),8000);rollupFirstRun.unref();
+  const rollupPoll=setInterval(()=>void jobRunner.execute('usage_rollups'),USAGE_ROLLUP_INTERVAL_MS);rollupPoll.unref();
 });
 
 

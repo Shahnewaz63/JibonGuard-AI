@@ -108,7 +108,7 @@ The automation settings page includes a simulator for temperature, rain ETA, and
 
 The feature-suite work is in progress. The current branch adds an idempotent additive migration, safe-off environment switches, organization settings, an authenticated system-health view, reusable AI/job helpers, and unit tests for core rules. It does **not** yet provide an operational nowcast training/evaluation pipeline, automatic prediction loop or evidence dashboard; the constrained break-plan optimizer and approval/SMS lifecycle; inbound triage, health-consent and check-in workflow; scheduled daily/weekly report generation; . Do not enable these switches for production until those workflows, validation, and human reviews are complete. No nowcast evaluation score is claimed.
 
-Use `docs/AUDIT.md` for the source audit, `docs/DECISIONS.md` for implementation choices, and `docs/TRIAGE_SAFETY.md` for first-aid review notes. `.env.example` lists the proposed feature switches; blank/false defaults keep optional AI and incomplete scheduled workflows off.
+Use `docs/AUDIT.md` for the feature-suite source audit, `docs/ADMIN_AUDIT.md` for the admin/billing audit, `docs/DECISIONS.md` for implementation choices, `docs/METERING.md` for metered provider events and rates, and `docs/TRIAGE_SAFETY.md` for first-aid review notes. `.env.example` lists the proposed feature switches; blank/false defaults keep optional AI and incomplete scheduled workflows off.
 
 ## Production deployment
 
