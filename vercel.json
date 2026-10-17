@@ -4,6 +4,9 @@
   "functions": {
     "api/[...route].js": {
       "maxDuration": 60
+    },
+    "api/auth/[action].js": {
+      "maxDuration": 60
     }
   },
   "rewrites": [
