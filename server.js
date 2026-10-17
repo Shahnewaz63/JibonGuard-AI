@@ -19,7 +19,7 @@ import { FEATURE_KEYS } from './server/billing/features.js';
 import { createMeteringService, estimateGeminiTokens } from './server/billing/metering.js';
 import { calculateSmsSegments } from './server/billing/smsSegments.js';
 import { rebuildUsageRollups } from './server/billing/rollups.js';
-import { checkFeatureAccess, checkResourceLimit, checkUsageDispatch } from './server/billing/entitlements.js';
+import { checkFeatureAccess, checkResourceLimit, checkUsageDispatch, getOrganizationEntitlements } from './server/billing/entitlements.js';
 import { canTransitionSubscription } from './server/billing/subscriptionState.js';
 import { processBillingLifecycle } from './server/billing/lifecycle.js';
 
@@ -785,6 +785,20 @@ app.get('/api/alerts/automated',requireUser,(req,res)=>{
   const delayed=[...ALERT_WEATHER_STATUS.entries()].some(([key,value])=>key.startsWith(`${req.user.organization_id}:`)&&value.delayed);
   res.set('Cache-Control','no-store').json({items,counts:{sent:counts.sent||0,skipped:counts.skipped||0,scheduled:counts.scheduled||0},weatherDelayed:delayed});
 });
+app.get('/api/dashboard/summary',requireUser,(req,res)=>{
+  const org=req.user.organization_id,counts=db.prepare(`SELECT
+    (SELECT COUNT(*) FROM workers WHERE organization_id=?) AS workers,
+    (SELECT COUNT(*) FROM workers WHERE organization_id=? AND consent_at IS NOT NULL) AS consented_workers,
+    (SELECT COUNT(*) FROM sites WHERE organization_id=?) AS sites,
+    (SELECT COUNT(*) FROM break_logs WHERE organization_id=?) AS breaks`).get(org,org,org,org);
+  const workers=db.prepare('SELECT id,name,site,consent_at FROM workers WHERE organization_id=? ORDER BY name COLLATE NOCASE LIMIT 6').all(org);
+  const breaks=db.prepare('SELECT id,title,site,break_date,break_time,source FROM break_logs WHERE organization_id=? ORDER BY break_date DESC,break_time DESC,created_at DESC LIMIT 5').all(org);
+  const today=new Date();today.setHours(0,0,0,0);const cutoff=Math.floor(today.getTime()/1000);
+  const alertCounts=db.prepare("SELECT SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) AS skipped,SUM(CASE WHEN status='scheduled' THEN 1 ELSE 0 END) AS scheduled FROM automated_alerts WHERE organization_id=? AND created_at>=?").get(org,cutoff);
+  const delayed=[...ALERT_WEATHER_STATUS.entries()].some(([key,value])=>key.startsWith(`${org}:`)&&value.delayed);
+  const config=alertSettingsFor(org);
+  res.set('Cache-Control','no-store').json({user:req.user,workers,breaks,counts:{workers:Number(counts.workers||0),consentedWorkers:Number(counts.consented_workers||0),sites:Number(counts.sites||0),breaks:Number(counts.breaks||0)},automationSettings:config,automationAvailable:ALERT_CONFIG.enabled,aiAvailable:Boolean(ALERT_CONFIG.aiEnabled&&GEMINI_API_KEY),automationInfo:{items:[],counts:{sent:alertCounts.sent||0,skipped:alertCounts.skipped||0,scheduled:alertCounts.scheduled||0},weatherDelayed:delayed}});
+});
 app.post('/api/alerts/simulate',csrfAndOrigin,requireUser,requirePlanFeature('simulator'),async(req,res)=>{
   const siteId=String(req.body.site_id||''),temperatureC=Number(req.body.temperature_c),rainEtaRaw=req.body.rain_eta_minutes,timeOfDay=String(req.body.time_of_day||'12:00');
   if(!/^([01]\d|2[0-3]):[0-5]\d$/.test(timeOfDay)||!Number.isFinite(temperatureC)||temperatureC<0||temperatureC>60||!(rainEtaRaw===''||rainEtaRaw==null||(Number.isFinite(Number(rainEtaRaw))&&Number(rainEtaRaw)>=0&&Number(rainEtaRaw)<=360)))return sendError(res,400,'Choose a valid temperature, rain ETA, and time of day.');
@@ -802,6 +816,11 @@ app.get('/api/sms', requireUser, async (req, res) => {
     CASE q.status WHEN 'scheduled' THEN 'queued' WHEN 'sending' THEN 'sending' ELSE q.status END AS status,
     '' AS device_name,datetime(q.scheduled_at,'unixepoch')||'Z' AS message_at
     FROM scheduled_break_sms q WHERE q.organization_id=? ORDER BY q.scheduled_at DESC LIMIT 250`).all(req.user.organization_id);
+  const localMessages=()=>[...db.prepare('SELECT id,direction,sender,recipient,message,status,device_name,message_at FROM sms_messages WHERE organization_id=? ORDER BY message_at DESC LIMIT 250').all(req.user.organization_id),...queuedMessages()].sort((a,b)=>Date.parse(b.message_at)-Date.parse(a.message_at)).slice(0,250);
+  if(req.query.sync==='0'){
+    const messages=localMessages(),receivedMatched=messages.filter(item=>item.direction==='received').length;
+    return res.set('Cache-Control','no-store').json({messages,configured:Boolean(apiKey),synced:0,receivedFromTextbee:receivedMatched,receivedMatched});
+  }
   if (!apiKey) return res.set('Cache-Control','no-store').json({messages:queuedMessages(),configured:false,synced:0,message:'TextBee is not configured.'});
   const base = (process.env.TEXTBEE_BASE_URL || 'https://api.textbee.dev/api/v1').replace(/\/$/,'');
   if (!base.startsWith('https://')) return sendError(res, 503, 'TextBee must use an HTTPS API URL.');
@@ -842,7 +861,7 @@ app.get('/api/sms', requireUser, async (req, res) => {
     const newReceived=incoming.filter(row=>row.direction==='received'&&!existingIds.has(row.id));
     for(const row of newReceived){const emergency=Boolean(emergencySmsCode(row.message));metering.recordUsage({organizationId:req.user.organization_id,eventType:'sms_inbound',provider:'textbee',feature:emergency?'emergency_code':'inbound',quantity:1,unit:'message',status:row.status,category:emergency?'safety':'routine',metadata:{segments:calculateSmsSegments(row.message).segments},refType:'provider_message',refId:row.id,idempotencyKey:`sms-in:${req.user.organization_id}:${row.id}`});}
     const synced=incoming.length,receivedMatched=incoming.filter(row=>row.direction==='received').length;
-    const messages=[...db.prepare('SELECT id,direction,sender,recipient,message,status,device_name,message_at FROM sms_messages WHERE organization_id=? ORDER BY message_at DESC LIMIT 250').all(req.user.organization_id),...queuedMessages()].sort((a,b)=>Date.parse(b.message_at)-Date.parse(a.message_at)).slice(0,250);
+    const messages=localMessages();
     res.set('Cache-Control','no-store').json({messages,configured:true,synced,receivedFromTextbee:receivedMessages.length,receivedMatched});
   } catch { return sendError(res,502,'Could not reach TextBee. Try syncing again shortly.'); }
 });
@@ -902,10 +921,19 @@ app.post('/api/auth/login', csrfAndOrigin, async (req, res) => {
   const user = db.prepare('SELECT * FROM users WHERE email=?').get(email);
   if (!user) { await hashPassword(password || 'invalid-password'); return sendError(res, 401, 'Email or password is incorrect.'); }
   if (!(await checkPassword(password, user.password_hash, user.password_salt))) return sendError(res, 401, 'Email or password is incorrect.');
-  const purpose=user.email_verified_at?'login':'signup',challenge=issueAuthOtp(user.id,purpose,req.body.remember===true,req.body.next||'/dashboard.html');
-  try { await emailAuthOtp(user,challenge,purpose); }
-  catch (error) { db.prepare('DELETE FROM auth_otp_challenges WHERE id=?').run(challenge.challengeId); console.error('Login OTP delivery failed:', JSON.stringify({ code: error.code, command: error.command, responseCode: error.responseCode })); return sendError(res,502,'We could not send a one-time code. Check the server SMTP log for the delivery reason, then try again.'); }
-  res.json({otp_required:true,purpose,challenge_id:challenge.challengeId,email:user.email,resend_after:OTP_RESEND_COOLDOWN_SECONDS,message:purpose==='signup'?'This account still needs email verification. We sent a verification code.':'We emailed a 6-digit sign-in code.'});
+  const nextPath=safeNext(req.body.next||'/dashboard.html');
+  if(!user.email_verified_at){
+    const challenge=issueAuthOtp(user.id,'signup',req.body.remember===true,nextPath);
+    try { await emailAuthOtp(user,challenge,'signup'); }
+    catch (error) { db.prepare('DELETE FROM auth_otp_challenges WHERE id=?').run(challenge.challengeId); console.error('Signup verification OTP delivery failed:', JSON.stringify({ code: error.code, command: error.command, responseCode: error.responseCode })); return sendError(res,502,'We could not send a verification code. Check the server SMTP log for the delivery reason, then try again.'); }
+    return res.json({otp_required:true,purpose:'signup',challenge_id:challenge.challengeId,email:user.email,resend_after:OTP_RESEND_COOLDOWN_SECONDS,message:'This account still needs email verification. We sent a verification code.'});
+  }
+  db.prepare("DELETE FROM auth_otp_challenges WHERE user_id=? AND purpose='login'").run(user.id);
+  const remember=req.body.remember===true,lifetime=remember?REMEMBER_LIFETIME:SESSION_LIFETIME,opaque=token(32),cookie=parseCookies(req)[SESSION_COOKIE],stamp=now();
+  if(cookie)db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(cookie));
+  db.prepare('INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)').run(hashToken(opaque),user.id,stamp,stamp+lifetime);
+  const csrf=token(32);res.cookie(SESSION_COOKIE,opaque,cookieOptions(true,lifetime));res.cookie(CSRF_COOKIE,csrf,cookieOptions(false,REMEMBER_LIFETIME));
+  res.json({message:'Signed in.',csrf_token:csrf,next:nextPath});
 });
 app.post('/api/auth/verify-otp', csrfAndOrigin, (req,res)=>{
   if(!rateAllowed(req,'verify-otp',10))return sendError(res,429,'Too many code attempts. Please try again later.');
@@ -913,6 +941,7 @@ app.post('/api/auth/verify-otp', csrfAndOrigin, (req,res)=>{
   if(!/^[A-Za-z0-9_-]{24,64}$/.test(id)||!/^\d{6}$/.test(code))return sendError(res,400,'Enter the 6-digit code from your email.');
   const challenge=db.prepare('SELECT c.*,u.email_verified_at FROM auth_otp_challenges c JOIN users u ON u.id=c.user_id WHERE c.id=?').get(id);
   if(!challenge||challenge.expires_at<now())return sendError(res,400,'That code expired. Request a new one and try again.');
+  if(challenge.purpose==='login')return sendError(res,410,'Sign-in codes are disabled. Please sign in with your password.');
   if(challenge.attempts>=5)return sendError(res,429,'Too many incorrect codes. Request a new code.');
   if(hashToken(`${id}:${code}`)!==challenge.otp_hash){const attempts=challenge.attempts+1;db.prepare('UPDATE auth_otp_challenges SET attempts=? WHERE id=?').run(attempts,id);return sendError(res,attempts>=5?429:400,attempts>=5?'Too many incorrect codes. Request a new code.':'The code is incorrect. Check the email and try again.');}
   db.prepare('DELETE FROM auth_otp_challenges WHERE id=?').run(id);
@@ -929,6 +958,7 @@ app.post('/api/auth/resend-otp',csrfAndOrigin,async(req,res)=>{
   const id=String(req.body.challenge_id||''),email=String(req.body.email||'').trim().toLowerCase();
   const prior=db.prepare('SELECT c.*,u.email,u.full_name,u.email_verified_at FROM auth_otp_challenges c JOIN users u ON u.id=c.user_id WHERE c.id=? AND u.email=? COLLATE NOCASE AND c.created_at>=?').get(id,email,now()-86400);
   if(!prior)return sendError(res,400,'This code request can no longer be renewed. Start sign-in again.');
+  if(prior.purpose==='login')return sendError(res,410,'Sign-in codes are disabled. Please sign in with your password.');
   if(prior.purpose==='signup'&&prior.email_verified_at)return sendError(res,400,'Email is already verified. Return to sign in.');
   const resendAfter=Math.max(0,OTP_RESEND_COOLDOWN_SECONDS-(now()-prior.created_at));
   if(resendAfter>0)return res.status(429).json({error:`Please wait ${resendAfter} seconds before requesting another code.`,resend_after:resendAfter});
@@ -1777,6 +1807,7 @@ app.use((error, req, res, next) => {
   const status = error.type === 'entity.too.large' ? 413 : 500;
   sendError(res, status, status === 413 ? 'The submitted data is too large.' : 'The request could not be completed right now. Please try again later.');
 });
+if (!process.env.VERCEL) {
 app.listen(PORT, HOST, () => {
   console.log(`JibonGuard Node server listening at http://${HOST}:${PORT} (${IS_PRODUCTION ? 'production' : 'development'})`);
   const firstPoll=setTimeout(()=>void pollEmergencySms(),2000);firstPoll.unref();
@@ -1790,7 +1821,6 @@ app.listen(PORT, HOST, () => {
   const billingFirstRun=setTimeout(()=>void jobRunner.execute('billing_lifecycle'),12000);billingFirstRun.unref();
   const billingPoll=setInterval(()=>void jobRunner.execute('billing_lifecycle'),BILLING_LIFECYCLE_INTERVAL_MS);billingPoll.unref();
 });
+}
 
-
-
-
+export default app;
