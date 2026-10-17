@@ -1230,8 +1230,10 @@ app.post('/api/workers', csrfAndOrigin, requireUser, async (req, res) => {
   catch (error) { sendError(res, error.status || (error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 409 : 400), error.message || 'Could not save worker.'); }
 });
 app.post('/api/workers/import', csrfAndOrigin, requireUser, requirePlanFeature('csv_import'), async (req, res) => {
-  const rows = req.body.workers;
-  if (!Array.isArray(rows) || !rows.length || rows.length > 500) return sendError(res, 400, 'Choose a CSV with between 1 and 500 worker rows.');
+  const submittedRows = req.body.workers;
+  if (!Array.isArray(submittedRows) || submittedRows.length > 500) return sendError(res, 400, 'Choose a CSV with between 1 and 500 worker rows.');
+  const rows=submittedRows.filter(row=>row&&typeof row==='object'&&Object.values(row).some(value=>String(value??'').trim()!==''));
+  if (!rows.length) return sendError(res, 400, 'Choose a CSV with between 1 and 500 worker rows.');
   try {
     const normalized = rows.map(row => workerValues(row, req.user.organization_id));
     if (normalized.some(row => !row)) return sendError(res, 400, 'The CSV contains invalid worker data. Check name, phone, site, job type, workload, and shift times (use HH:mm or Excel times such as 7:00:00 AM); no rows were imported.');
