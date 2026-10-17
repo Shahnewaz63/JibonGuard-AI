@@ -1439,11 +1439,13 @@ async function sendTextBeeBreakSms(recipients, record, usageContext={}) {
     storm:`ঝড়ের সতর্কতা: বাইরে কাজ বন্ধ করে নির্ধারিত নিরাপদ আশ্রয়ে যান। গাছ, বৈদ্যুতিক খুঁটি ও ধাতব কাঠামো থেকে দূরে থাকুন। কর্মস্থল: ${record.site}`,
     earthquake:`ভূমিকম্প: নিচু হন, মজবুত কিছুর নিচে আশ্রয় নিন এবং ধরে থাকুন। জানালা ও ভারী জিনিস থেকে দূরে থাকুন। কম্পন থামলে সাইটের নির্দেশনা মানুন। কর্মস্থল: ${record.site}`
   };
+  if(record.alert_type==='custom')alertCopy.custom=String(record.ai_rationale||'').replace(/\{site\}/g,record.site);
   const plannedAt=Number(record.scheduled_at)||Math.floor(new Date(`${record.break_date}T${record.break_time}:00`).getTime()/1000);
-  const remaining=plannedAt-now(), timing=remaining>0?`Break starts in ${Math.max(1,Math.ceil(remaining/60))} minutes, at ${record.break_time}.`:`Break time: ${record.break_date} at ${record.break_time}.`;
+  const remaining=plannedAt-now(), timing=record.alert_type==='custom'?(record.status==='scheduled'?`Alert scheduled for ${record.break_date} at ${record.break_time} (window: ${record.duration_minutes} min).`:`Alert issued for ${record.site}.`):remaining>0?`Break starts in ${Math.max(1,Math.ceil(remaining/60))} minutes, at ${record.break_time}.`:`Break time: ${record.break_date} at ${record.break_time}.`;
   const messages=recipients.map(recipient=>{
     const name=recipient.name||'কর্মী';
-    const message=alertCopy[record.alert_type]
+    const customText=String(record.ai_rationale||'').replace(/\{worker\}/g,name).replace(/\{site\}/g,record.site);
+    const message=record.alert_type==='custom'?`${name}, ${record.title}: ${customText} - JibonGuard`:alertCopy[record.alert_type]
       ? `${name}, ${alertCopy[record.alert_type]}। - JibonGuard`
       : `${name}, বিরতির সময় হয়েছে। ${record.site} কর্মস্থলে ${record.duration_minutes} মিনিট পানি পান করুন ও ছায়ায় বিশ্রাম নিন। সময়: ${record.break_date} ${record.break_time}। - JibonGuard`;
     return {recipients:[recipient.phone],message:`${message} ${timing}`,...(subscription?{simSubscriptionId:Number(subscription)}:{})};
@@ -1478,7 +1480,7 @@ async function dispatchScheduledBreakSms() {
       const claim=db.prepare("UPDATE scheduled_break_sms SET status='sending' WHERE break_id=? AND organization_id=? AND status='scheduled'").run(item.break_id,item.organization_id);
       if(!claim.changes)continue;
       const rows=db.prepare("SELECT id,worker_id,workload,recipient FROM scheduled_break_sms WHERE break_id=? AND organization_id=? AND status='sending'").all(item.break_id,item.organization_id);
-      const record=db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,alert_type,status,workload_levels FROM break_logs WHERE id=? AND organization_id=?').get(item.break_id,item.organization_id);
+      const record=db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,alert_type,status,workload_levels,ai_rationale FROM break_logs WHERE id=? AND organization_id=?').get(item.break_id,item.organization_id);
       if(!record){db.prepare("UPDATE scheduled_break_sms SET status='failed',error='Safety log was removed.' WHERE break_id=? AND organization_id=? AND status='sending'").run(item.break_id,item.organization_id);continue;}
       let workloadLevels=[];try{workloadLevels=JSON.parse(record.workload_levels||'[]');}catch{}
       const firstWorker=rows.map(row=>row.worker_id&&db.prepare('SELECT site_id FROM workers WHERE id=? AND organization_id=?').get(row.worker_id,item.organization_id)).find(Boolean),timezone=firstWorker?await timezoneForSite(firstWorker.site_id,item.organization_id):'Asia/Dhaka';
@@ -1701,9 +1703,9 @@ function consentedRecipients(org, siteId) {
   return rows.map(row=>({...row,phone:normalizePhone(row.phone)})).filter(row=>row.phone);
 }
 app.post('/api/breaks',csrfAndOrigin,requireUser,async(req,res)=>{
-  const d=req.body, alertType=String(d.alert_type||'break').trim(), title=BREAK_ALERTS[alertType]||String(d.title||'').trim(), siteId=String(d.site_id||'').trim(), date=String(d.break_date||'').trim(), time=String(d.break_time||'').trim(), status=String(d.status||'logged').trim(), duration=Number(d.duration_minutes),workloadLevels=normalizeWorkloadLevels(d.workload_levels);
+  const d=req.body, alertType=String(d.alert_type||'break').trim(), title=alertType==='custom'?String(d.title||'').trim():BREAK_ALERTS[alertType]||String(d.title||'').trim(), customMessage=alertType==='custom'?String(d.custom_message||'').trim().slice(0,420):'', siteId=String(d.site_id||'').trim(), date=String(d.break_date||'').trim(), time=String(d.break_time||'').trim(), status=String(d.status||'logged').trim(), duration=Number(d.duration_minutes),workloadLevels=normalizeWorkloadLevels(d.workload_levels);
   if(!workloadLevels)return sendError(res,400,'Choose at least one valid workload level for the safety message.');
-  if (!['break','rain','storm','earthquake'].includes(alertType)||!title||title.length>120||!/^\d{4}-\d{2}-\d{2}$/.test(date)||!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)||!Number.isInteger(duration)||duration<1||duration>240||!['logged','scheduled'].includes(status)) return sendError(res,400,'Enter a break name, site, valid date and time, and duration from 1 to 240 minutes.');
+  if (!['break','rain','storm','earthquake','custom'].includes(alertType)||!title||title.length>120||(alertType==='custom'&&(!customMessage||customMessage.length>420))||!/^\d{4}-\d{2}-\d{2}$/.test(date)||!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)||!Number.isInteger(duration)||duration<1||duration>240||!['logged','scheduled'].includes(status)) return sendError(res,400,'Enter a break name, site, valid date and time, and duration from 1 to 240 minutes.');
   const [year,month,day]=date.split('-').map(Number),validDate=new Date(Date.UTC(year,month-1,day));
   if(validDate.getUTCFullYear()!==year||validDate.getUTCMonth()!==month-1||validDate.getUTCDate()!==day)return sendError(res,400,'Enter a valid break date.');
   const site=db.prepare('SELECT id,name,latitude,longitude FROM sites WHERE id=? AND organization_id=?').get(siteId,req.user.organization_id);
@@ -1716,7 +1718,7 @@ app.post('/api/breaks',csrfAndOrigin,requireUser,async(req,res)=>{
   const parsedSchedule=Number(d.scheduled_at), scheduledAt=Number.isFinite(parsedSchedule)&&parsedSchedule>0?Math.floor(parsedSchedule):Math.floor(new Date(`${date}T${time}:00`).getTime()/1000);
   if(!Number.isFinite(scheduledAt)||scheduledAt<=now())return sendError(res,400,'Choose a date and time later than the current time.');
   db.prepare(`INSERT INTO break_logs(id,organization_id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at,workload_levels)
-    VALUES(?,?,?,?,?,?,?,?,?,'manual',?,'',?,?)`).run(id,req.user.organization_id,title,site.name,date,time,duration,workerCount,status,alertType,stamp,JSON.stringify(workloadLevels));
+    VALUES(?,?,?,?,?,?,?,?,?,'manual',?,?,?,?)`).run(id,req.user.organization_id,title,site.name,date,time,duration,workerCount,status,alertType,customMessage,stamp,JSON.stringify(workloadLevels));
   const record=db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at FROM break_logs WHERE id=?').get(id);
   if(status==='scheduled'){
     const count=queueBreakSms(req.user.organization_id,id,recipients,{...record,scheduled_at:scheduledAt},scheduledAt);
@@ -1733,9 +1735,9 @@ app.put('/api/breaks',csrfAndOrigin,requireUser,async(req,res)=>{
   const existing=db.prepare('SELECT id,source,status FROM break_logs WHERE id=? AND organization_id=?').get(id,req.user.organization_id);
   if(!existing)return sendError(res,404,'Break log not found.');
   if(existing.source!=='manual')return sendError(res,403,'AI-created safety logs are read-only.');
-  const d=req.body,alertType=String(d.alert_type||'break').trim(),title=BREAK_ALERTS[alertType]||String(d.title||'').trim(),siteId=String(d.site_id||'').trim(),date=String(d.break_date||'').trim(),time=String(d.break_time||'').trim(),status=String(d.status||'logged').trim(),duration=Number(d.duration_minutes),workloadLevels=normalizeWorkloadLevels(d.workload_levels);
+  const d=req.body,alertType=String(d.alert_type||'break').trim(),title=alertType==='custom'?String(d.title||'').trim():BREAK_ALERTS[alertType]||String(d.title||'').trim(),customMessage=alertType==='custom'?String(d.custom_message||'').trim().slice(0,420):'',siteId=String(d.site_id||'').trim(),date=String(d.break_date||'').trim(),time=String(d.break_time||'').trim(),status=String(d.status||'logged').trim(),duration=Number(d.duration_minutes),workloadLevels=normalizeWorkloadLevels(d.workload_levels);
   if(!workloadLevels)return sendError(res,400,'Choose at least one valid workload level for the safety message.');
-  if(!['break','rain','storm','earthquake'].includes(alertType)||!title||title.length>120||!/^(\d{4})-(\d{2})-(\d{2})$/.test(date)||!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)||!Number.isInteger(duration)||duration<1||duration>240||!['logged','scheduled'].includes(status))return sendError(res,400,'Enter a valid action, worksite, date, time, and duration from 1 to 240 minutes.');
+  if(!['break','rain','storm','earthquake','custom'].includes(alertType)||!title||title.length>120||(alertType==='custom'&&(!customMessage||customMessage.length>420))||!/^(\d{4})-(\d{2})-(\d{2})$/.test(date)||!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)||!Number.isInteger(duration)||duration<1||duration>240||!['logged','scheduled'].includes(status))return sendError(res,400,'Enter a valid action, worksite, date, time, and duration from 1 to 240 minutes.');
   const [year,month,day]=date.split('-').map(Number),validDate=new Date(Date.UTC(year,month-1,day));
   if(validDate.getUTCFullYear()!==year||validDate.getUTCMonth()!==month-1||validDate.getUTCDate()!==day)return sendError(res,400,'Enter a valid break date.');
   const site=db.prepare('SELECT id,name,latitude,longitude FROM sites WHERE id=? AND organization_id=?').get(siteId,req.user.organization_id);
@@ -1743,7 +1745,7 @@ app.put('/api/breaks',csrfAndOrigin,requireUser,async(req,res)=>{
   const parsedSchedule=Number(d.scheduled_at),scheduledAt=Number.isFinite(parsedSchedule)&&parsedSchedule>0?Math.floor(parsedSchedule):Math.floor(new Date(`${date}T${time}:00`).getTime()/1000);
   if(!Number.isFinite(scheduledAt)||scheduledAt<=now())return sendError(res,400,'Choose a date and time later than the current time.');
   const workerCount=db.prepare('SELECT COUNT(*) AS count FROM workers WHERE organization_id=?').get(req.user.organization_id).count;
-  db.prepare('UPDATE break_logs SET title=?,site=?,break_date=?,break_time=?,duration_minutes=?,worker_count=?,status=?,alert_type=?,workload_levels=? WHERE id=? AND organization_id=? AND source=\'manual\'').run(title,site.name,date,time,duration,workerCount,status,alertType,JSON.stringify(workloadLevels),id,req.user.organization_id);
+  db.prepare('UPDATE break_logs SET title=?,site=?,break_date=?,break_time=?,duration_minutes=?,worker_count=?,status=?,alert_type=?,ai_rationale=?,workload_levels=? WHERE id=? AND organization_id=? AND source=\'manual\'').run(title,site.name,date,time,duration,workerCount,status,alertType,customMessage,JSON.stringify(workloadLevels),id,req.user.organization_id);
   const record=db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,workload_levels,created_at FROM break_logs WHERE id=? AND organization_id=?').get(id,req.user.organization_id);
   if(existing.status==='scheduled'||status==='scheduled'){
     db.prepare("DELETE FROM scheduled_break_sms WHERE break_id=? AND organization_id=? AND status='scheduled'").run(id,req.user.organization_id);
