@@ -137,6 +137,11 @@ const migrations = [
     name: 'admin_totp_requirement',
     sql: `ALTER TABLE admin_users ADD COLUMN totp_required INTEGER NOT NULL DEFAULT 1;`,
   },
+  {
+    version: 8,
+    name: 'disable_admin_two_factor_signin',
+    sql: `UPDATE admin_users SET totp_required=0,totp_enabled=0,totp_secret_encrypted=NULL; DELETE FROM admin_recovery_codes;`,
+  },
 ];
 
 export function runMigrations(db, { databasePath, development = true, clock = () => Math.floor(Date.now() / 1000) } = {}) {

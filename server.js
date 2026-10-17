@@ -13,7 +13,6 @@ import { dispatchAlertGroups } from './server/alerts/gateway.js';
 import { runMigrations } from './server/db/migrations.js';
 import { applyPlanCatalogMigration } from './server/billing/planCatalog.js';
 import { createJobRunner } from './server/jobs/runner.js';
-import { decryptTotpSecret, encryptTotpSecret, newTotpSecret, verifyTotp } from './server/billing/totp.js';
 import { writeAdminAudit } from './server/billing/audit.js';
 import { hasPermission } from './server/billing/permissions.js';
 import { FEATURE_KEYS } from './server/billing/features.js';
@@ -239,15 +238,13 @@ const adminCsrfAndOrigin = (req,res,next) => {
   if(!cookies[ADMIN_CSRF_COOKIE]||!header||cookies[ADMIN_CSRF_COOKIE]!==header)return sendError(res,403,'Admin security token expired. Reload the page and try again.');
   next();
 };
-const loadAdmin = (req,res,next,{allowPendingTotp=false}={}) => {
+const loadAdmin = (req,res,next) => {
   if(!adminIpAllowed(req))return sendError(res,403,'Admin access is not allowed from this network.');
   req.admin=adminSessionUser(req);
   if(!req.admin)return sendError(res,401,'Admin sign-in is required.');
-  if(req.admin.totp_required&&!req.admin.totp_enabled&&!allowPendingTotp)return res.status(403).json({error:'Complete admin two-factor setup to continue.',requiresTotpSetup:true});
   next();
 };
 const requireAdmin=(req,res,next)=>loadAdmin(req,res,next);
-const requireAdminSetup=(req,res,next)=>loadAdmin(req,res,next,{allowPendingTotp:true});
 const adminPermission=permission=>(req,res,next)=>{
   if(!req.admin)return sendError(res,401,'Admin sign-in is required.');
   if(!hasPermission(req.admin.role,permission))return sendError(res,403,'This admin role cannot perform that action.');
@@ -307,91 +304,38 @@ app.post('/api/admin/auth/signup',adminCsrfAndOrigin,async(req,res)=>{
 app.post('/api/admin/auth/login',adminCsrfAndOrigin,async(req,res)=>{
   if(!adminIpAllowed(req))return sendError(res,403,'Admin access is not allowed from this network.');
   if(!rateAllowed(req,'admin-login',8,900))return sendError(res,429,'Too many admin sign-in attempts. Try again later.');
-  const email=String(req.body.email||'').trim().toLowerCase(),password=req.body.password,code=String(req.body.code||'');
+  const email=String(req.body.email||'').trim().toLowerCase(),password=req.body.password;
   if(email.length>254||!/^\S+@\S+\.\S+$/.test(email)||typeof password!=='string'||password.length>128)return sendError(res,400,'Enter a valid email and password.');
   const address=req.ip||req.socket.remoteAddress||'unknown',stamp=now();
   const failures=db.prepare('SELECT COUNT(*) AS n FROM admin_login_attempts WHERE email=? AND ip=? AND success=0 AND created_at>?').get(email,address,stamp-900).n;
   if(failures>=5)return sendError(res,429,'Admin sign-in is temporarily locked. Try again later.');
   const admin=db.prepare('SELECT * FROM admin_users WHERE email=? COLLATE NOCASE AND disabled_at IS NULL').get(email);
-  let valid=Boolean(admin&&await checkPassword(password,admin.password_hash,admin.password_salt));
-  let usedRecovery=false;
-  if(valid&&admin.totp_enabled){
-    try{valid=verifyTotp(decryptTotpSecret(admin.totp_secret_encrypted,process.env.ADMIN_ENCRYPTION_KEY||''),code);}
-    catch{valid=false;}
-    if(!valid&&code.length>=16){
-      const consumed=db.prepare('UPDATE admin_recovery_codes SET used_at=? WHERE admin_id=? AND code_hash=? AND used_at IS NULL').run(stamp,admin.id,hashToken(code));
-      valid=consumed.changes===1;usedRecovery=valid;
-    }
-  }
+  const valid=Boolean(admin&&await checkPassword(password,admin.password_hash,admin.password_salt));
   db.prepare('INSERT INTO admin_login_attempts(id,email,ip,success,created_at) VALUES(?,?,?,?,?)').run(token(16),email,address,valid?1:0,stamp);
-  if(!valid)return sendError(res,401,'Email, password, or two-factor code was not accepted.');
-  const opaque=token(32),lifetime=admin.totp_enabled||!admin.totp_required?ADMIN_SESSION_LIFETIME:600;
+  if(!valid)return sendError(res,401,'Email or password was not accepted.');
+  const opaque=token(32),lifetime=ADMIN_SESSION_LIFETIME;
   db.prepare('INSERT INTO admin_sessions(token_hash,admin_id,created_at,expires_at,ip,user_agent,reauth_at) VALUES(?,?,?,?,?,?,?)').run(hashToken(opaque),admin.id,stamp,stamp+lifetime,address,String(req.get('user-agent')||'').slice(0,300),null);
-  writeAdminAudit(db,{adminId:admin.id,role:admin.role,action:'admin.login',targetType:'admin_user',targetId:admin.id,ip:address,userAgent:req.get('user-agent')||'',after:{success:true,recoveryCode:usedRecovery},now:stamp});
+  writeAdminAudit(db,{adminId:admin.id,role:admin.role,action:'admin.login',targetType:'admin_user',targetId:admin.id,ip:address,userAgent:req.get('user-agent')||'',after:{success:true},now:stamp});
   res.cookie(ADMIN_SESSION_COOKIE,opaque,cookieOptions(true,lifetime));
-  res.set('Cache-Control','no-store').json({authenticated:true,requiresTotpSetup:Boolean(admin.totp_required&&!admin.totp_enabled),admin:{id:admin.id,email:admin.email,role:admin.role}});
+  res.set('Cache-Control','no-store').json({authenticated:true,admin:{id:admin.id,email:admin.email,role:admin.role}});
 });
 app.get('/api/admin/auth/me',(req,res)=>{
   if(!adminIpAllowed(req))return sendError(res,403,'Admin access is not allowed from this network.');
   const admin=adminSessionUser(req);
   if(!admin)return sendError(res,401,'Admin sign-in is required.');
-  res.set('Cache-Control','no-store').json({authenticated:true,requiresTotpSetup:Boolean(admin.totp_required&&!admin.totp_enabled),admin:{id:admin.id,email:admin.email,role:admin.role}});
+  res.set('Cache-Control','no-store').json({authenticated:true,admin:{id:admin.id,email:admin.email,role:admin.role}});
 });
-app.get('/api/admin/auth/totp/setup',requireAdminSetup,(req,res)=>{
-  if(req.admin.totp_enabled)return sendError(res,409,'Two-factor authentication is already enabled.');
-  const row=db.prepare('SELECT totp_secret_encrypted FROM admin_users WHERE id=?').get(req.admin.id);
-  let secret;
-  try{secret=row?.totp_secret_encrypted?decryptTotpSecret(row.totp_secret_encrypted,process.env.ADMIN_ENCRYPTION_KEY||''):newTotpSecret();}
-  catch{return sendError(res,503,'Set a strong ADMIN_ENCRYPTION_KEY before enrolling admin two-factor authentication.');}
-  if(!row?.totp_secret_encrypted){
-    try{db.prepare('UPDATE admin_users SET totp_secret_encrypted=?,updated_at=? WHERE id=?').run(encryptTotpSecret(secret,process.env.ADMIN_ENCRYPTION_KEY||''),now(),req.admin.id);}
-    catch{return sendError(res,503,'Could not protect the admin two-factor secret.');}
-    writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'admin.totp_setup_started',targetType:'admin_user',targetId:req.admin.id,ip:req.ip||'',userAgent:req.get('user-agent')||'',now:now()});
-  }
-  const uri=`otpauth://totp/${encodeURIComponent(`JibonGuard:${req.admin.email}`)}?secret=${secret}&issuer=JibonGuard&algorithm=SHA1&digits=6&period=30`;
-  res.set('Cache-Control','no-store').json({secret,otpauth_uri:uri,issuer:'JibonGuard',account:req.admin.email});
-});
-app.post('/api/admin/auth/totp/setup',adminCsrfAndOrigin,requireAdminSetup,(req,res)=>{
-  if(req.admin.totp_enabled)return sendError(res,409,'Two-factor authentication is already enabled.');
-  const row=db.prepare('SELECT totp_secret_encrypted FROM admin_users WHERE id=?').get(req.admin.id);
-  let secret;
-  try{secret=decryptTotpSecret(row?.totp_secret_encrypted,process.env.ADMIN_ENCRYPTION_KEY||'');}
-  catch{return sendError(res,400,'Start two-factor setup again.');}
-  if(!verifyTotp(secret,String(req.body.code||'')))return sendError(res,422,'The two-factor code is not valid yet.');
-  const stamp=now(),codes=Array.from({length:10},()=>randomBytes(10).toString('hex'));
-  const enable=db.prepare('UPDATE admin_users SET totp_enabled=1,updated_at=? WHERE id=? AND totp_enabled=0').run(stamp,req.admin.id);
-  if(!enable.changes)return sendError(res,409,'Two-factor authentication changed in another session.');
-  const insert=db.prepare('INSERT INTO admin_recovery_codes(id,admin_id,code_hash,created_at) VALUES(?,?,?,?)');
-  for(const recovery of codes)insert.run(token(16),req.admin.id,hashToken(recovery),stamp);
-  const currentSession=hashToken(parseCookies(req)[ADMIN_SESSION_COOKIE]);
-  db.prepare('DELETE FROM admin_sessions WHERE admin_id=? AND token_hash<>?').run(req.admin.id,currentSession);
-  db.prepare('UPDATE admin_sessions SET expires_at=?,reauth_at=? WHERE token_hash=?').run(stamp+ADMIN_SESSION_LIFETIME,stamp,currentSession);
-  writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'admin.totp_enabled',targetType:'admin_user',targetId:req.admin.id,ip:req.ip||'',userAgent:req.get('user-agent')||'',after:{recoveryCodesCreated:codes.length},now:stamp});
-  res.set('Cache-Control','no-store').json({enabled:true,recovery_codes:codes});
-});
-app.post('/api/admin/auth/logout',adminCsrfAndOrigin,requireAdminSetup,(req,res)=>{
+app.post('/api/admin/auth/logout',adminCsrfAndOrigin,requireAdmin,(req,res)=>{
   db.prepare('DELETE FROM admin_sessions WHERE token_hash=?').run(hashToken(parseCookies(req)[ADMIN_SESSION_COOKIE]));
   writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'admin.logout',targetType:'admin_user',targetId:req.admin.id,ip:req.ip||'',userAgent:req.get('user-agent')||'',now:now()});
   res.clearCookie(ADMIN_SESSION_COOKIE,cookieOptions(true,0));res.json({ok:true});
-});
-app.post('/api/admin/auth/reauth',adminCsrfAndOrigin,requireAdmin,async(req,res)=>{
-  const password=req.body.password,code=String(req.body.code||'');
-  if(typeof password!=='string'||password.length>128)return sendError(res,400,'Enter your admin password.');
-  const row=db.prepare('SELECT password_hash,password_salt,totp_secret_encrypted FROM admin_users WHERE id=? AND disabled_at IS NULL').get(req.admin.id);
-  let valid=false;
-  try{valid=Boolean(row&&verifyTotp(decryptTotpSecret(row.totp_secret_encrypted,process.env.ADMIN_ENCRYPTION_KEY||''),code)&&await checkPassword(password,row.password_hash,row.password_salt));}catch{valid=false;}
-  if(!valid)return sendError(res,401,'Password or two-factor code did not match.');
-  db.prepare('UPDATE admin_sessions SET reauth_at=? WHERE token_hash=?').run(now(),hashToken(parseCookies(req)[ADMIN_SESSION_COOKIE]));
-  writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'admin.reauthenticated',targetType:'admin_user',targetId:req.admin.id,ip:req.ip||'',userAgent:req.get('user-agent')||'',now:now()});
-  res.json({ok:true});
 });
 app.post('/api/admin/auth/change-password',adminCsrfAndOrigin,requireAdmin,async(req,res)=>{
   const {current_password:currentPassword,new_password:newPassword,confirm_password:confirmPassword}=req.body||{};
   if(typeof currentPassword!=='string'||typeof newPassword!=='string'||newPassword.length<PASSWORD_MIN||newPassword.length>128)return sendError(res,400,`Enter your current password and a new password between ${PASSWORD_MIN} and 128 characters.`);
   if(newPassword!==confirmPassword)return sendError(res,400,'The new password and confirmation do not match.');
-  const row=db.prepare('SELECT password_hash,password_salt,totp_enabled,totp_secret_encrypted FROM admin_users WHERE id=? AND disabled_at IS NULL').get(req.admin.id);
+  const row=db.prepare('SELECT password_hash,password_salt FROM admin_users WHERE id=? AND disabled_at IS NULL').get(req.admin.id);
   if(!row||!(await checkPassword(currentPassword,row.password_hash,row.password_salt)))return sendError(res,401,'Current password did not match.');
-  if(row.totp_enabled){let valid=false;try{valid=verifyTotp(decryptTotpSecret(row.totp_secret_encrypted,process.env.ADMIN_ENCRYPTION_KEY||''),String(req.body.code||''));}catch{}if(!valid)return sendError(res,401,'Enter a valid authenticator code.');}
   if(await checkPassword(newPassword,row.password_hash,row.password_salt))return sendError(res,400,'Choose a password different from your current one.');
   const {passwordHash,passwordSalt}=await hashPassword(newPassword),stamp=now(),sessionHash=hashToken(parseCookies(req)[ADMIN_SESSION_COOKIE]);
   db.prepare('UPDATE admin_users SET password_hash=?,password_salt=?,updated_at=? WHERE id=?').run(passwordHash,passwordSalt,stamp,req.admin.id);
@@ -403,7 +347,8 @@ app.post('/api/admin/auth/change-password',adminCsrfAndOrigin,requireAdmin,async
 app.get('/api/admin/overview',requireAdmin,adminPermission('dashboard_read'),(req,res)=>{
   const stamp=now(),day=new Date(stamp*1000);day.setUTCHours(0,0,0,0);const start=Math.floor(day.getTime()/1000);
   const counts=table=>Number(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n||0);
-  const mrr=db.prepare("SELECT billing_cycle,price_minor FROM subscriptions WHERE status IN ('active','trialing')").all().reduce((sum,row)=>sum+(row.billing_cycle==='yearly'?Math.round(row.price_minor/12):row.price_minor),0);
+  const currentPlanPrices=db.prepare("SELECT s.billing_cycle,COALESCE((SELECT pp.amount_minor FROM plan_prices pp WHERE pp.plan_id=s.plan_id AND pp.billing_cycle=s.billing_cycle ORDER BY pp.effective_from DESC,pp.version DESC LIMIT 1),s.price_minor) AS current_price_minor FROM subscriptions s WHERE s.status IN ('active','trialing')").all();
+  const mrr=currentPlanPrices.reduce((sum,row)=>sum+(row.billing_cycle==='yearly'?Math.round(row.current_price_minor/12):row.current_price_minor),0);
   const todayUsage=db.prepare('SELECT event_type,SUM(quantity) AS quantity,SUM(cost_minor) AS cost_minor FROM usage_events WHERE created_at>=? GROUP BY event_type').all(start);
   const usage=Object.fromEntries(todayUsage.map(row=>[row.event_type,{quantity:Number(row.quantity||0),cost_minor:Number(row.cost_minor||0)}]));
   const monthStart=Math.floor(Date.UTC(new Date(stamp*1000).getUTCFullYear(),new Date(stamp*1000).getUTCMonth(),1)/1000),finance=hasPermission(req.admin.role,'billing_read')?(()=>{const revenue=Number(db.prepare("SELECT COALESCE(SUM(amount_minor),0) AS n FROM payments WHERE status='succeeded' AND currency='BDT' AND verified_at>=? AND verified_at<?").get(monthStart,stamp).n||0),cost=Number(db.prepare("SELECT COALESCE(SUM(cost_minor),0) AS n FROM usage_events WHERE currency='BDT' AND created_at>=? AND created_at<?").get(monthStart,stamp).n||0),expense=Number(db.prepare("SELECT COALESCE(SUM(amount_minor),0) AS n FROM expenses WHERE currency='BDT' AND expense_date>=date(?,'unixepoch') AND expense_date<=date(?,'unixepoch')").get(monthStart,stamp).n||0);return {revenue_minor:revenue,provider_cost_minor:cost,expenses_minor:expense,profit_minor:revenue-cost-expense};})():null;
@@ -700,9 +645,9 @@ app.get('/api/admin/analytics',requireAdmin,adminPermission('billing_read'),(req
   const collected=Number(db.prepare("SELECT COALESCE(SUM(amount_minor),0) AS n FROM payments WHERE status='succeeded' AND verified_at>=? AND verified_at<?").get(from,end).n||0),refunds=Number(db.prepare('SELECT COALESCE(SUM(amount_minor),0) AS n FROM refunds WHERE created_at>=? AND created_at<?').get(from,end).n||0);
   const usageCost=Number(db.prepare('SELECT COALESCE(SUM(cost_minor),0) AS n FROM usage_events WHERE created_at>=? AND created_at<?').get(from,end).n||0),expenseCost=Number(db.prepare("SELECT COALESCE(SUM(amount_minor),0) AS n FROM expenses WHERE expense_date>=date(?,'unixepoch') AND expense_date<=date(?,'unixepoch')").get(from,end-1).n||0);
   const mrrRows=db.prepare("SELECT billing_cycle,price_minor FROM subscriptions WHERE status IN ('active','trialing')").all(),mrr=mrrRows.reduce((sum,row)=>sum+(row.billing_cycle==='yearly'?Math.round(row.price_minor/12):row.price_minor),0);
-  const byPlan=db.prepare("SELECT p.id,p.name,(SELECT COUNT(*) FROM subscriptions s WHERE s.plan_id=p.id) AS subscriptions,(SELECT COALESCE(SUM(CASE WHEN s.billing_cycle='yearly' THEN s.price_minor/12 ELSE s.price_minor END),0) FROM subscriptions s WHERE s.plan_id=p.id AND s.status IN ('active','trialing')) AS mrr_minor,(SELECT COALESCE(SUM(u.cost_minor),0) FROM usage_events u JOIN subscriptions s ON s.organization_id=u.organization_id AND s.plan_id=p.id AND s.id=(SELECT s2.id FROM subscriptions s2 WHERE s2.organization_id=u.organization_id ORDER BY s2.created_at DESC LIMIT 1) WHERE u.created_at>=? AND u.created_at<?) AS usage_cost_minor FROM plans p ORDER BY mrr_minor DESC").all(from,end);
+  const byPlan=db.prepare("SELECT p.id,p.name,(SELECT COUNT(*) FROM subscriptions s WHERE s.plan_id=p.id) AS subscriptions,(SELECT COALESCE(SUM(CASE WHEN s.billing_cycle='yearly' THEN COALESCE((SELECT pp.amount_minor FROM plan_prices pp WHERE pp.plan_id=s.plan_id AND pp.billing_cycle=s.billing_cycle ORDER BY pp.effective_from DESC,pp.version DESC LIMIT 1),s.price_minor)/12 ELSE COALESCE((SELECT pp.amount_minor FROM plan_prices pp WHERE pp.plan_id=s.plan_id AND pp.billing_cycle=s.billing_cycle ORDER BY pp.effective_from DESC,pp.version DESC LIMIT 1),s.price_minor) END),0) FROM subscriptions s WHERE s.plan_id=p.id AND s.status IN ('active','trialing')) AS mrr_minor,(SELECT COALESCE(SUM(u.cost_minor),0) FROM usage_events u JOIN subscriptions s ON s.organization_id=u.organization_id AND s.plan_id=p.id AND s.id=(SELECT s2.id FROM subscriptions s2 WHERE s2.organization_id=u.organization_id ORDER BY s2.created_at DESC LIMIT 1) WHERE u.created_at>=? AND u.created_at<?) AS usage_cost_minor FROM plans p ORDER BY mrr_minor DESC").all(from,end);
   const counts=Object.fromEntries(['active','trialing','past_due','suspended'].map(status=>[status,Number(db.prepare('SELECT COUNT(*) AS n FROM subscriptions WHERE status=?').get(status).n||0)]));
-  res.set('Cache-Control','no-store').json({period:{from,to:end},mrr_minor:mrr,invoiced_minor:Number(invoices.invoiced||0),collected_minor:collected,refunds_minor:refunds,outstanding_minor:Number(invoices.outstanding||0),provider_cost_minor:usageCost,expenses_minor:expenseCost,profit_minor:collected-refunds-usageCost-expenseCost,counts,by_plan:byPlan});
+  res.set('Cache-Control','no-store').json({period:{from,to:end},mrr_minor:mrr,current_plan_revenue_minor:mrr,invoiced_minor:Number(invoices.invoiced||0),collected_minor:collected,refunds_minor:refunds,outstanding_minor:Number(invoices.outstanding||0),provider_cost_minor:usageCost,expenses_minor:expenseCost,profit_minor:collected-refunds-usageCost-expenseCost,counts,by_plan:byPlan});
 });
 app.get('/api/admin/expenses',requireAdmin,adminPermission('billing_read'),(_req,res)=>res.json({items:db.prepare('SELECT * FROM expenses ORDER BY expense_date DESC,created_at DESC LIMIT 500').all(),totals:db.prepare('SELECT currency,SUM(amount_minor) AS amount_minor,COUNT(*) AS count FROM expenses GROUP BY currency ORDER BY currency').all()}));
 app.post('/api/admin/expenses',adminCsrfAndOrigin,requireAdmin,adminPermission('expenses_write'),(req,res)=>{
