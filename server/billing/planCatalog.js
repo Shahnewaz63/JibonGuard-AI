@@ -1,4 +1,4 @@
-const PLAN_CATALOG_VERSION = 8;
+const PLAN_CATALOG_VERSION = 9;
 const PLAN_FEATURES = {
   basic: ['ai_chat','ai_alert_automation','simulator','csv_import','data_export'],
   pro: ['ai_chat','ai_alert_automation','simulator','voice_alerts','csv_import','data_export'],
@@ -17,10 +17,18 @@ export function applyPlanCatalogMigration(db, { now = () => Math.floor(Date.now(
 
   db.exec('BEGIN');
   try {
-    // Keep the hidden compatibility plan for existing organizations, freeing the
-    // public "legacy" slug for the high-capacity enterprise offer.
-    db.prepare("UPDATE plans SET name='Grandfathered Legacy',slug='grandfathered-legacy',description='Hidden compatibility plan for organizations created before the public plans.',status='hidden',sort_order=0,sample_values=0,updated_at=? WHERE id='legacy-default'").run(now());
+    // Move every existing organization onto the public Basic plan, then remove
+    // the obsolete compatibility plan and its non-cascading price rows.
     const stamp = now();
+    const basicCatalog=PLANS.find(plan=>plan.id==='sample-basic');
+    const basicPrice=db.prepare("SELECT amount_minor,currency FROM plan_prices WHERE plan_id='sample-basic' AND billing_cycle='monthly' ORDER BY effective_from DESC,version DESC LIMIT 1").get();
+    const price=basicPrice&&basicPrice.amount_minor>0?basicPrice:{amount_minor:basicCatalog.monthly,currency:'BDT'};
+    db.prepare("UPDATE subscriptions SET plan_id='sample-basic',billing_cycle='monthly',price_minor=?,currency=?,current_period_start=?,current_period_end=?,trial_end=NULL,updated_at=?").run(price.amount_minor,price.currency,stamp,stamp+30*86400,stamp);
+    // Older admin expense forms accepted whole taka but persisted the value in
+    // the paisa column unchanged, making every historic BDT expense 100x small.
+    db.prepare("UPDATE expenses SET amount_minor=amount_minor*100,updated_at=? WHERE currency='BDT' AND amount_minor<=90071992547409").run(stamp);
+    db.prepare("DELETE FROM plan_prices WHERE plan_id='legacy-default'").run();
+    db.prepare("DELETE FROM plans WHERE id='legacy-default'").run();
     for (const plan of PLANS) {
       db.prepare('UPDATE plans SET name=?,slug=?,description=?,status=?,sort_order=?,trial_days=0,badge_text=?,sample_values=0,updated_at=? WHERE id=?')
         .run(plan.name,plan.slug,plan.description,plan.status,plan.sort,plan.badge,stamp,plan.id);

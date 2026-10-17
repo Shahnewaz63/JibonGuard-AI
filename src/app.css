@@ -539,6 +539,10 @@ html[data-theme=dark] .chat-user { background: #347b4b; color: #fff; }
 .billing-summary span,.billing-meter span { color: var(--muted); font-size: 12px; }
 .billing-summary strong { text-transform: capitalize; }
 .billing-meters { display: grid; grid-template-columns: repeat(auto-fit,minmax(210px,1fr)); gap: 16px; margin: 14px 0 22px; }
+.report-breakdown,.report-sites { display: grid; }
+.report-breakdown>div,.report-sites>div { display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:39px;border-top:1px solid var(--line);font-size:10px;color:var(--muted); }
+.report-breakdown strong,.report-sites strong { color:var(--ink);font-size:12px; }
+.report-sites>div:first-child,.report-breakdown>div:first-child { border-top:0; }
 .billing-meter > div:first-child { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 7px; }
 .meter-track { height: 7px; overflow: hidden; border-radius: 8px; background: var(--surface-soft); }
 .meter-track i { display: block; height: 100%; border-radius: inherit; background: var(--green-strong); }
