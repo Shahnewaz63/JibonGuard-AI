@@ -353,7 +353,8 @@ app.get('/api/admin/overview',requireAdmin,adminPermission('dashboard_read'),(re
   const todayUsage=db.prepare('SELECT event_type,SUM(quantity) AS quantity,SUM(cost_minor) AS cost_minor FROM usage_events WHERE created_at>=? GROUP BY event_type').all(start);
   const usage=Object.fromEntries(todayUsage.map(row=>[row.event_type,{quantity:Number(row.quantity||0),cost_minor:Number(row.cost_minor||0)}]));
   const monthStart=Math.floor(Date.UTC(new Date(stamp*1000).getUTCFullYear(),new Date(stamp*1000).getUTCMonth(),1)/1000),finance=hasPermission(req.admin.role,'billing_read')?(()=>{const cash=Number(db.prepare("SELECT COALESCE(SUM(amount_minor),0) AS n FROM payments WHERE status='succeeded' AND currency='BDT' AND verified_at>=? AND verified_at<?").get(monthStart,stamp).n||0),refunds=Number(db.prepare("SELECT COALESCE(SUM(amount_minor),0) AS n FROM refunds WHERE currency='BDT' AND created_at>=? AND created_at<?").get(monthStart,stamp).n||0),cost=Number(db.prepare("SELECT COALESCE(SUM(cost_minor),0) AS n FROM usage_events WHERE currency='BDT' AND created_at>=? AND created_at<?").get(monthStart,stamp).n||0),expense=Number(db.prepare("SELECT COALESCE(SUM(amount_minor),0) AS n FROM expenses WHERE currency='BDT' AND expense_date>=date(?,'unixepoch') AND expense_date<=date(?,'unixepoch')").get(monthStart,stamp).n||0);return {revenue_minor:mrr,cash_collected_minor:cash,refunds_minor:refunds,provider_cost_minor:cost,expenses_minor:expense,profit_minor:mrr-refunds-cost-expense};})():null;
-  res.set('Cache-Control','no-store').json({organizations:counts('organizations'),workers:counts('workers'),sites:counts('sites'),alerts_today:Number(db.prepare('SELECT COUNT(*) AS n FROM automated_alerts WHERE created_at>=?').get(start).n||0),subscriptions_active:Number(db.prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE status='active'").get().n||0),subscriptions_trialing:Number(db.prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE status='trialing'").get().n||0),subscriptions_past_due:Number(db.prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE status='past_due'").get().n||0),mrr_minor:mrr,currency:'BDT',usage_today:usage,finance});
+  const activeOrganizations=Number(db.prepare("SELECT COUNT(*) AS n FROM organizations o WHERE NOT EXISTS (SELECT 1 FROM soft_delete_records sd WHERE sd.entity_type='organization' AND sd.entity_id=o.id)").get().n||0);
+  res.set('Cache-Control','no-store').json({organizations:activeOrganizations,workers:counts('workers'),sites:counts('sites'),alerts_today:Number(db.prepare('SELECT COUNT(*) AS n FROM automated_alerts WHERE created_at>=?').get(start).n||0),subscriptions_active:Number(db.prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE status='active'").get().n||0),subscriptions_trialing:Number(db.prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE status='trialing'").get().n||0),subscriptions_past_due:Number(db.prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE status='past_due'").get().n||0),mrr_minor:mrr,currency:'BDT',usage_today:usage,finance});
 });
 app.get('/api/admin/system/health',requireAdmin,adminPermission('dashboard_read'),(_req,res)=>{
   const jobs=db.prepare(`SELECT j.id,j.organization_id,j.job_key,j.status,j.started_at,j.finished_at,j.error_code,o.name AS organization_name FROM job_runs j LEFT JOIN organizations o ON o.id=j.organization_id ORDER BY j.started_at DESC LIMIT 100`).all();
@@ -362,8 +363,10 @@ app.get('/api/admin/system/health',requireAdmin,adminPermission('dashboard_read'
 });
 app.get('/api/admin/organizations',requireAdmin,adminPermission('organizations_read'),(req,res)=>{
   const limit=Math.min(100,Math.max(1,Number.parseInt(req.query.limit,10)||25)),offset=Math.max(0,Number.parseInt(req.query.offset,10)||0),search=String(req.query.q||'').trim().slice(0,100),like=`%${search.replace(/[\\%_]/g,'\\$&')}%`;
-  const where=search?"WHERE o.name LIKE ? ESCAPE '\\' OR o.phone LIKE ? ESCAPE '\\' OR o.id LIKE ? ESCAPE '\\'":'';
-  const args=search?[like,like,like]:[];
+  const filters=["NOT EXISTS (SELECT 1 FROM soft_delete_records sd WHERE sd.entity_type='organization' AND sd.entity_id=o.id)"];
+  const args=[];
+  if(search){filters.push("(o.name LIKE ? ESCAPE '\\' OR o.phone LIKE ? ESCAPE '\\' OR o.id LIKE ? ESCAPE '\\')");args.push(like,like,like);}
+  const where=`WHERE ${filters.join(' AND ')}`;
   const total=Number(db.prepare(`SELECT COUNT(*) AS n FROM organizations o ${where}`).get(...args).n||0);
   const rows=db.prepare(`SELECT o.id,o.name,o.organization_type,o.phone,o.address,o.created_at,
     (SELECT COUNT(*) FROM users u WHERE u.organization_id=o.id) AS users_count,
@@ -374,6 +377,28 @@ app.get('/api/admin/organizations',requireAdmin,adminPermission('organizations_r
     FROM organizations o ${where} ORDER BY o.created_at DESC LIMIT ? OFFSET ?`).all(...args,limit,offset);
   const items=rows.map(row=>({...row,phone:req.admin.role==='viewer'&&row.phone?`${row.phone.slice(0,3)}••••${row.phone.slice(-2)}`:row.phone}));
   res.set('Cache-Control','no-store').json({items,total,limit,offset});
+});
+app.delete('/api/admin/organizations/:id',adminCsrfAndOrigin,requireAdmin,adminPermission('organizations_hard_delete'),(req,res)=>{
+  const organization=db.prepare("SELECT * FROM organizations o WHERE o.id=? AND NOT EXISTS (SELECT 1 FROM soft_delete_records sd WHERE sd.entity_type='organization' AND sd.entity_id=o.id)").get(req.params.id);
+  if(!organization)return sendError(res,404,'Organization not found or already deleted.');
+  const reason=String(req.body?.reason||'').trim().slice(0,500),confirmation=String(req.body?.confirmation||'').trim();
+  if(!reason)return sendError(res,422,'Include a reason to delete this organization.');
+  if(confirmation!==organization.name)return sendError(res,422,'Type the organization name exactly to confirm deletion.');
+  const stamp=now();
+  try{
+    db.exec('BEGIN IMMEDIATE');
+    db.prepare('INSERT INTO soft_delete_records(id,entity_type,entity_id,organization_id,deleted_by,reason,deleted_at) VALUES(?,?,?,?,?,?,?)').run(token(18),'organization',organization.id,organization.id,req.admin.id,reason,stamp);
+    for(const subscription of db.prepare("SELECT id,status FROM subscriptions WHERE organization_id=? AND status IN ('trialing','active','past_due','suspended')").all(organization.id)){
+      db.prepare('INSERT INTO subscription_events(id,subscription_id,organization_id,event_type,from_status,to_status,details_json,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)').run(token(18),subscription.id,organization.id,'organization.deleted',subscription.status,'cancelled','{}',reason,stamp);
+    }
+    db.prepare("UPDATE subscriptions SET status='cancelled',cancel_at_period_end=0,updated_at=? WHERE organization_id=? AND status IN ('trialing','active','past_due','suspended')").run(stamp,organization.id);
+    for(const table of ['break_plans','break_acknowledgements','triage_events','safety_reports','automated_alerts','break_logs','sms_deleted_messages','sms_messages','alert_settings','org_ai_features','workers','sites','users','organization_billing_details','admin_notes','ai_calls','job_runs'])db.prepare(`DELETE FROM ${table} WHERE organization_id=?`).run(organization.id);
+    db.prepare("UPDATE invoices SET billing_details_json='{}' WHERE organization_id=?").run(organization.id);
+    db.prepare("UPDATE organizations SET name='Deleted organization',organization_type='deleted',phone='',address='',estimated_workers=0 WHERE id=?").run(organization.id);
+    writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'organization.deleted',targetType:'organization',targetId:organization.id,ip:req.ip||'',userAgent:req.get('user-agent')||'',before:{name:organization.name,phone:organization.phone},after:{name:'Deleted organization',financial_history_retained:true},reason,now:stamp});
+    db.exec('COMMIT');
+  }catch(error){try{db.exec('ROLLBACK');}catch{};if(error.code==='SQLITE_CONSTRAINT_FOREIGNKEY')return sendError(res,409,'The organization has linked records that could not be safely removed.');throw error;}
+  res.json({ok:true,message:'Organization access and operational data deleted. Anonymized billing history is retained for accounting.'});
 });
 app.get('/api/admin/plans',requireAdmin,adminPermission('plans_read'),(_req,res)=>{
   const plans=db.prepare(`SELECT p.*, (SELECT amount_minor FROM plan_prices pp WHERE pp.plan_id=p.id AND pp.billing_cycle='monthly' ORDER BY effective_from DESC LIMIT 1) AS monthly_price_minor,
@@ -477,7 +502,7 @@ app.get('/api/admin/usage',requireAdmin,adminPermission('usage_read'),(req,res)=
   const total=Number(db.prepare(`SELECT COUNT(*) AS n FROM usage_events u ${where}`).get(...args).n||0);
   const items=db.prepare(`SELECT u.id,u.organization_id,o.name AS organization_name,u.site_id,u.event_type,u.provider,u.feature,u.quantity,u.unit,u.status,u.category,u.tokens_input,u.tokens_output,u.tokens_total,u.latency_ms,u.estimated,u.unit_cost_minor,u.unit_price_minor,u.cost_minor,u.price_minor,u.currency,u.model,u.created_at
     FROM usage_events u JOIN organizations o ON o.id=u.organization_id ${where} ORDER BY u.created_at DESC LIMIT ? OFFSET ?`).all(...args,limit,offset);
-  const periodNow=now(),organizations=db.prepare(`SELECT o.id,o.name,s.plan_id,s.current_period_start,s.current_period_end,p.name AS plan_name,(SELECT COUNT(*) FROM workers w WHERE w.organization_id=o.id) AS workers,(SELECT COUNT(*) FROM sites si WHERE si.organization_id=o.id) AS sites FROM organizations o LEFT JOIN subscriptions s ON s.id=(SELECT s2.id FROM subscriptions s2 WHERE s2.organization_id=o.id ORDER BY s2.created_at DESC LIMIT 1) LEFT JOIN plans p ON p.id=s.plan_id ORDER BY o.name`).all();
+  const periodNow=now(),organizations=db.prepare(`SELECT o.id,o.name,s.plan_id,s.current_period_start,s.current_period_end,p.name AS plan_name,(SELECT COUNT(*) FROM workers w WHERE w.organization_id=o.id) AS workers,(SELECT COUNT(*) FROM sites si WHERE si.organization_id=o.id) AS sites FROM organizations o LEFT JOIN subscriptions s ON s.id=(SELECT s2.id FROM subscriptions s2 WHERE s2.organization_id=o.id ORDER BY s2.created_at DESC LIMIT 1) LEFT JOIN plans p ON p.id=s.plan_id WHERE NOT EXISTS (SELECT 1 FROM soft_delete_records sd WHERE sd.entity_type='organization' AND sd.entity_id=o.id) ORDER BY o.name`).all();
   const organizationUsage=organizations.map(org=>{const from=org.current_period_start||Math.floor(Date.UTC(new Date(periodNow*1000).getUTCFullYear(),new Date(periodNow*1000).getUTCMonth(),1)/1000),to=org.current_period_end?Math.min(periodNow,org.current_period_end):periodNow,usage=Object.fromEntries(db.prepare('SELECT event_type,SUM(quantity) AS quantity,SUM(cost_minor) AS cost_minor FROM usage_events WHERE organization_id=? AND created_at>=? AND created_at<? GROUP BY event_type').all(org.id,from,to).map(row=>[row.event_type,{quantity:Number(row.quantity||0),cost_minor:Number(row.cost_minor||0)}])),limits=org.plan_id?Object.fromEntries(db.prepare('SELECT limit_key,value,unlimited FROM plan_limits WHERE plan_id=?').all(org.plan_id).map(row=>[row.limit_key,row.unlimited?null:Number(row.value)])):{};return {id:org.id,name:org.name,plan_name:org.plan_name||'Basic',workers:Number(org.workers),sites:Number(org.sites),usage,limits};});
   res.set('Cache-Control','no-store').json({items,total,limit,offset,organization_usage:organizationUsage});
 });
@@ -1395,7 +1420,9 @@ app.post('/api/ai/chat', csrfAndOrigin, requireUser, async (req,res) => {
   const instruction="You are JibonGuard's in-app assistant. Help organization administrators understand the dashboard, site weather, worker consent, break logs, and practical heat and weather safety. Be concise and clear. Do not claim to see private organization records or live weather unless supplied in the conversation. Never give a medical diagnosis or claim an emergency is safe; direct urgent situations to local emergency services and official instructions. Do not ask for passwords, API keys, or personal worker details.";
   try { res.json({ reply:await geminiGenerate(contents,instruction,false,{organizationId:req.user.organization_id,feature:'chat'}) }); } catch(error) { sendError(res,503,error.message); }
 });
-app.post('/api/ai/speech', csrfAndOrigin, requireUser, requirePlanFeature('voice_alerts'), async (req,res) => {
+// Gemini voice is temporarily available to every signed-in account as a demo.
+// Keep authentication, rate limiting, token quotas, and usage metering enabled.
+app.post('/api/ai/speech', csrfAndOrigin, requireUser, async (req,res) => {
   if (!rateAllowed(req,'gemini-speech',30,3600)) return sendError(res,429,'Speech limit reached. Try again in a little while.');
   const text=typeof req.body.text==='string'?req.body.text.trim():'';
   const voice=String(req.body.voice||'Kore');
@@ -1415,7 +1442,7 @@ app.post('/api/ai/speech', csrfAndOrigin, requireUser, requirePlanFeature('voice
   if(!audioPart)return sendError(res,503,'Gemini returned no speech audio. Check TTS model access and try again.');
   res.set('Cache-Control','no-store').json({audio:audioPart.inlineData.data,mime_type:audioPart.inlineData.mimeType||'audio/wav'});
 });
-app.post('/api/ai/live-token', csrfAndOrigin, requireUser, requirePlanFeature('voice_alerts'), async (req,res) => {
+app.post('/api/ai/live-token', csrfAndOrigin, requireUser, async (req,res) => {
   if (!rateAllowed(req,'gemini-live-token',10,3600)) return sendError(res,429,'Live voice is temporarily limited. Try again in a little while.');
   if (!GEMINI_API_KEY) return sendError(res,503,'Gemini is not configured. Set GEMINI_API_KEY in the server .env file.');
   let response;
