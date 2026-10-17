@@ -92,3 +92,54 @@ html[data-admin-theme=light],html[data-admin-theme=light] body,html[data-admin-t
   .admin-table-wrap td{font-size:12px}
   .admin-table-wrap td small{font-size:11px}
 }
+
+/* Final admin legibility, control sizing, and alignment pass. */
+.admin-app,.admin-auth-wrap{font-size:15px;line-height:1.5}
+.admin-app small,.admin-auth-wrap small{font-size:12px!important;line-height:1.45}
+.admin-sidebar nav button,.admin-sidebar-bottom button{min-height:44px;padding:10px 12px;font-size:14px}
+.admin-sidebar-label,.admin-eyebrow{font-size:12px;letter-spacing:.1em}
+.admin-brand b{font-size:12px}
+.admin-user{font-size:14px;line-height:1.4}
+.admin-user b{font-size:13px}
+.admin-topbar{align-items:center;gap:18px}
+.admin-topbar-actions{gap:12px}
+.admin-topbar h1,.admin-auth-card h1{line-height:1.18}
+.admin-stat span,.admin-search,.admin-plan-form>label,.admin-auth-card form>label{font-size:14px;line-height:1.4}
+.admin-stat{min-height:112px;box-sizing:border-box}
+.admin-panel{border-radius:14px}
+.admin-panel-heading{align-items:center;flex-wrap:wrap}
+.admin-panel-heading p,.admin-auth-card>p,.admin-empty,.admin-loading{font-size:14px;line-height:1.55}
+.admin-table-wrap{border-radius:9px}
+.admin-table-wrap th{font-size:12px;line-height:1.4;white-space:nowrap}
+.admin-table-wrap td{font-size:14px;line-height:1.5}
+.admin-table-wrap td small{font-size:12px!important}
+.admin-pill{font-size:12px}
+.admin-app input,.admin-app textarea,.admin-app select,.admin-auth-card input{box-sizing:border-box;min-height:44px;font-size:15px;line-height:1.4}
+.admin-app textarea{min-height:100px;padding:11px 12px}
+.admin-check{font-size:13px;line-height:1.45}
+.admin-primary,.admin-app .admin-back,.admin-app .admin-text-button,.admin-auth-wrap .admin-back,.admin-auth-wrap .admin-text-button{min-height:44px;font-size:14px;line-height:1.25}
+.admin-alert,.admin-notice,.admin-secret,.admin-setup-card details{font-size:14px;line-height:1.5}
+.admin-uri{font-size:12px!important}
+.admin-plan-form{align-items:start}
+.admin-plan-form>.admin-primary{align-self:end}
+.admin-rate-actions{align-items:stretch}
+.admin-rate-actions>.admin-primary{min-height:44px}
+.admin-app button:focus-visible,.admin-auth-wrap button:focus-visible,.admin-app a:focus-visible,.admin-auth-wrap a:focus-visible{outline-width:3px;outline-offset:3px}
+@media(max-width:950px){
+  .admin-app{grid-template-columns:220px minmax(0,1fr)}
+}
+@media(max-width:650px){
+  .admin-sidebar nav button{min-height:44px;padding:10px 12px;font-size:14px}
+  .admin-topbar{align-items:flex-start}
+  .admin-topbar-actions{align-items:flex-end;gap:8px}
+  .admin-user{max-width:65vw;font-size:13px}
+  .admin-stat-grid{gap:10px}
+  .admin-stat{min-height:100px;padding:13px}
+  .admin-stat span{font-size:13px}
+  .admin-stat strong{font-size:20px}
+  .admin-panel-heading{align-items:stretch}
+  .admin-panel-heading>.admin-primary,.admin-panel-heading>.admin-search{width:100%}
+  .admin-table-wrap th{font-size:11px}
+  .admin-table-wrap td{font-size:13px}
+  .admin-plan-form>.admin-primary{align-self:stretch}
+}

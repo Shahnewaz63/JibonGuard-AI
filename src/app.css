@@ -742,3 +742,106 @@ body{font-size:16px}
   .brand-mark{width:38px;height:38px}
   .site-account-trigger{font-size:12px}
 }
+
+/* Final legibility and alignment pass across home, account, and dashboard views. */
+body{font-size:16px;line-height:1.5}
+body small{font-size:12px!important;line-height:1.45}
+.eyebrow,.kicker{font-size:12px;letter-spacing:.1em}
+.hero-proof strong{font-size:14px}
+.hero-proof small,.float-card small,.float-card em{font-size:12px!important}
+.float-card strong{font-size:14px}
+.art-caption,.trust-row>span{font-size:12px}
+.trust-row>div{font-size:13px}
+.proof-icon{width:38px;height:38px}
+.risk-top,.risk-tags,.risk-label{font-size:12px}
+.risk-tags span{font-size:12px!important;padding:6px 9px}
+.site-top nav a,.quiet-link,.subtle-link,.site-account-trigger{font-size:14px}
+.theme-button{min-height:40px;padding-inline:13px}
+.mobile-menu,.editor-close{width:40px;height:40px;min-width:40px;min-height:40px;border-radius:9px}
+.chat-speak-button{min-height:40px;padding-inline:12px;font-size:13px!important}
+.button{box-sizing:border-box;min-height:44px;border-radius:9px;font-size:14px;line-height:1.2}
+.button.small{min-height:40px}
+button:not(.mobile-menu):not(.editor-close):not(.chat-attach-button):not(.chat-mic-button):not(.chat-live-button):not(.chat-speak-button){line-height:1.25}
+.field,.field label,.form-stack label,.table-tools label{font-size:14px}
+.field input,.field select,.field textarea,.form-stack input,.form-stack select,.form-stack textarea,.table-tools input,.table-tools select{box-sizing:border-box;min-height:44px;font-size:15px;line-height:1.4}
+.field textarea,.form-stack textarea{padding:11px 12px}
+.form-hint,.form-stack .field small,.field>small,.disclaimer{font-size:12px!important;line-height:1.5}
+.panel,.metric,.account-card,.site-card,.risk-card{border-radius:14px}
+.panel-head{align-items:center;gap:14px}
+.panel-head>div:first-child{min-width:0}
+.panel-head p,.empty-state p,.empty-inline,.table-scroll td{font-size:14px;line-height:1.5}
+.table-scroll th{font-size:12px;line-height:1.35}
+.table-scroll td small{font-size:12px!important}
+.table-scroll .badge,.badge,.plan-badge,.tiny-action{font-size:12px}
+.tiny-action{min-height:38px;padding:6px 10px}
+.simple-list small,.break-item small,.break-item p,.site-heading small,.site-weather span,.site-weather small,.site-card-footer,.bulk-selection label{font-size:12px!important;line-height:1.45}
+.metric>span,.metric>small{font-size:12px!important}
+.nav-caption,.sidebar-label,.side-nav .nav-section-label{font-size:11px!important;letter-spacing:.08em}
+.side-nav button{min-height:42px;font-size:14px}
+.org-card strong,.profile strong{font-size:14px}
+.org-card small,.support-card small,.support-card a,.profile small{font-size:12px!important}
+.dash-title{align-items:center;gap:16px;margin-bottom:20px}
+.dash-title h1{font-size:clamp(26px,3vw,34px);line-height:1.15}
+.dash-title-actions{justify-content:flex-end;gap:9px}
+.dash-title-actions .button{min-height:44px;padding-inline:14px;font-size:14px}
+.worker-list-actions{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.worker-list-actions>.button,.worker-list-actions>.upload-button,.site-list-actions>.button{min-height:44px;padding-inline:14px;font-size:14px}
+.billing-panel form.form-two>.button{grid-column:1/-1;justify-self:end;min-width:180px}
+.editor-actions{align-items:center;gap:10px}
+.editor-actions .button{min-width:120px;min-height:44px}
+.billing-summary>div>span,.billing-meter>div>span,.report-breakdown>div,.report-sites>div{font-size:13px}
+.chat-attachment-row>small,.chat-selected-file,.chat-voice-control,.chat-language-control,.chat-live-status,.chat-speak-button,.chat-file-tag{font-size:12px!important}
+.chat-attach-button,.chat-mic-button,.chat-live-button{width:42px;min-width:42px;min-height:42px}
+.chat-voice-control select,.chat-language-control select{min-height:40px;font-size:13px}
+.pricing-card{border-radius:16px;padding:28px}
+.pricing-card>p:not(.plan-price),.pricing-card ul,.pricing-footer{font-size:14px;line-height:1.65}
+.pricing-card h2{font-size:22px}
+.pricing-card .button{min-height:46px}
+.site-account-popover a{font-size:13px}
+.site-account-popover small{font-size:12px!important}
+.dash-footer span,.dash-footer a{font-size:12px!important}
+.button:focus-visible,.theme-button:focus-visible,.tiny-action:focus-visible,.site-account-trigger:focus-visible{outline:3px solid color-mix(in srgb,var(--green) 55%,transparent);outline-offset:2px}
+@media(max-width:760px){
+  .site-top{min-height:64px;height:auto;flex-wrap:wrap;gap:8px 12px;padding:9px 16px}
+  .site-top nav{order:3;width:100%;justify-content:center;gap:clamp(16px,5vw,30px);margin:0;padding-top:6px;border-top:1px solid var(--line)}
+  .top-actions{margin-left:auto}
+  .site-top nav a{font-size:13px}
+  .trust-row>span{font-size:12px}
+  .trust-row>div{font-size:13px}
+  .dash-title{align-items:flex-start;gap:12px}
+  .dash-title-actions{justify-content:flex-start}
+  .dash-title-actions .button{flex:1 1 auto;min-height:44px;padding-inline:11px;font-size:13px}
+  .panel-head{align-items:flex-start}
+  .panel-head>.button,.panel-head>a.button{flex:none}
+  .metric>span,.metric>small{font-size:12px!important}
+  .overview-worker>span:nth-of-type(2){font-size:12px!important}
+  .overview-worker>.badge{font-size:11px!important}
+  .bulk-selection{align-items:flex-start;flex-wrap:wrap}
+  .worker-list-actions>.button,.worker-list-actions>.upload-button,.site-list-actions>.button{min-height:44px;font-size:13px}
+  .billing-panel form.form-two>.button{justify-self:stretch;width:100%}
+  .chat-window{width:min(440px,calc(100vw - 24px))}
+}
+@media(max-width:520px){
+  .wrap{width:calc(100% - 32px)}
+  .site-top{padding:8px 12px;gap:7px}
+  .site-top nav{gap:10px}
+  .site-top nav a{font-size:12px}
+  .site-top .theme-button{font-size:12px;min-height:40px;padding-inline:9px}
+  .top-actions{gap:6px}
+  .site-account-trigger{min-height:40px;padding-inline:9px;font-size:13px}
+  .panel{padding:15px}
+  .dash-content{padding:18px 12px}
+  .dash-title-actions .button{min-width:calc(50% - 5px);font-size:13px}
+  .editor-actions{display:grid;grid-template-columns:1fr 1fr}
+  .editor-actions .button{width:100%;min-width:0}
+  .pricing-page{padding-inline:16px}
+  .pricing-card{padding:22px}
+}
+@media(max-width:380px){
+  .site-top nav a{font-size:11px}
+  .brand{gap:8px}
+  .brand-copy strong{font-size:17px}
+  .brand-mark{width:34px;height:34px}
+  .theme-button{gap:4px;padding-inline:7px}
+  .dash-title-actions .button{min-width:100%;}
+}
