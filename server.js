@@ -11,6 +11,7 @@ import { decideAlerts } from './server/alerts/index.js';
 import { renderAlertTemplate } from './server/alerts/templates.js';
 import { dispatchAlertGroups } from './server/alerts/gateway.js';
 import { runMigrations } from './server/db/migrations.js';
+import { applyPlanCatalogMigration } from './server/billing/planCatalog.js';
 import { createJobRunner } from './server/jobs/runner.js';
 import { decryptTotpSecret, encryptTotpSecret, newTotpSecret, verifyTotp } from './server/billing/totp.js';
 import { writeAdminAudit } from './server/billing/audit.js';
@@ -109,6 +110,7 @@ for(const row of db.prepare('SELECT id,workload_levels FROM break_logs').all()){
   try{const levels=JSON.parse(row.workload_levels||'[]');if(Array.isArray(levels)&&levels.includes(retiredWorkload)){const normalized=[...new Set(levels.map(level=>level===retiredWorkload?'Heavy':level).filter(level=>['Light','Standard','Heavy'].includes(level)))];db.prepare('UPDATE break_logs SET workload_levels=? WHERE id=?').run(JSON.stringify(normalized),row.id);}}catch{}
 }
 if (!USING_POSTGRES) runMigrations(db, { databasePath: DB_PATH, development: !IS_PRODUCTION });
+applyPlanCatalogMigration(db);
 const jobRunner = createJobRunner({ db });
 const metering = createMeteringService(db, { logger: console, defaultCurrency: 'BDT' });
 const USAGE_ROLLUP_INTERVAL_MS=Math.max(60000,Number(process.env.BILLING_ROLLUP_INTERVAL_MS||86400000));
@@ -868,7 +870,7 @@ app.get('/api/sms', requireUser, async (req, res) => {
     res.set('Cache-Control','no-store').json({messages,configured:true,synced,receivedFromTextbee:receivedMessages.length,receivedMatched});
   } catch { return sendError(res,502,'Could not reach TextBee. Try syncing again shortly.'); }
 });
-app.get('/api/privacy/export', requireUser, requirePlanFeature('data_export'), (req, res) => {
+app.get('/api/privacy/export', requireUser, (req, res) => {
   const organization = db.prepare('SELECT name,organization_type,phone,address,estimated_workers,created_at FROM organizations WHERE id=?').get(req.user.organization_id);
   const privacy = db.prepare('SELECT privacy_notice_version,privacy_consent_at,created_at FROM users WHERE id=?').get(req.user.id);
   const workers = db.prepare('SELECT id,name,phone,site,site_id,job_type,workload,risk_level,shift_start,shift_end,age_group,has_personal_risk_factor,outdoor_minutes,last_break,consent_at,consent_method,created_at,updated_at FROM workers WHERE organization_id=? ORDER BY name COLLATE NOCASE').all(req.user.organization_id);
@@ -877,6 +879,33 @@ app.get('/api/privacy/export', requireUser, requirePlanFeature('data_export'), (
   const sms_messages = db.prepare('SELECT id,direction,sender,recipient,message,status,device_name,message_at FROM sms_messages WHERE organization_id=? ORDER BY message_at DESC').all(req.user.organization_id);
   const worker_consent_events = db.prepare('SELECT worker_id,action,method,note,changed_by,changed_at FROM worker_consent_events WHERE organization_id=? ORDER BY changed_at DESC,rowid DESC').all(req.user.organization_id);
   res.set('Content-Disposition', 'attachment; filename=jibonguard-account-data.json').json({ account: req.user, organization, workers, sites, worker_consent_events, break_logs, sms_messages, privacy, exported_at: new Date().toISOString() });
+});
+
+app.put('/api/account/organization', csrfAndOrigin, requireUser, (req, res) => {
+  const name = typeof req.body.organization_name === 'string' ? req.body.organization_name.trim() : '';
+  if (!name || name.length > 160) return sendError(res, 400, 'Enter a company name between 1 and 160 characters.');
+  const result = db.prepare('UPDATE organizations SET name=? WHERE id=?').run(name, req.user.organization_id);
+  if (!result.changes) return sendError(res, 404, 'Organization not found.');
+  res.set('Cache-Control', 'no-store').json({ organization_name: name });
+});
+
+app.post('/api/account/change-password', csrfAndOrigin, requireUser, async (req, res) => {
+  if (!rateAllowed(req, 'change-password', 5, 900)) return sendError(res, 429, 'Too many password-change attempts. Try again later.');
+  const { current_password: currentPassword, new_password: newPassword, confirm_password: confirmPassword } = req.body;
+  if (typeof currentPassword !== 'string' || currentPassword.length > 128 || typeof newPassword !== 'string' || newPassword.length < PASSWORD_MIN || newPassword.length > 128) {
+    return sendError(res, 400, `Enter your current password and choose a new password between ${PASSWORD_MIN} and 128 characters.`);
+  }
+  if (newPassword !== confirmPassword) return sendError(res, 400, 'The new password and confirmation do not match.');
+  const row = db.prepare('SELECT password_hash,password_salt FROM users WHERE id=?').get(req.user.id);
+  if (!row || !(await checkPassword(currentPassword, row.password_hash, row.password_salt))) return sendError(res, 401, 'Current password did not match.');
+  if (await checkPassword(newPassword, row.password_hash, row.password_salt)) return sendError(res, 400, 'Choose a new password that is different from your current password.');
+  const { passwordHash, passwordSalt } = await hashPassword(newPassword);
+  db.prepare('UPDATE users SET password_hash=?,password_salt=? WHERE id=?').run(passwordHash, passwordSalt, req.user.id);
+  const currentSessionHash = hashToken(parseCookies(req)[SESSION_COOKIE]);
+  db.prepare('DELETE FROM sessions WHERE user_id=? AND token_hash<>?').run(req.user.id, currentSessionHash);
+  db.prepare('DELETE FROM action_tokens WHERE user_id=?').run(req.user.id);
+  db.prepare("DELETE FROM auth_otp_challenges WHERE user_id=? AND purpose='login'").run(req.user.id);
+  res.set('Cache-Control', 'no-store').json({ message: 'Password changed. Other signed-in sessions have been signed out.' });
 });
 
 app.post('/api/auth/signup', csrfAndOrigin, async (req, res) => {
@@ -892,10 +921,11 @@ app.post('/api/auth/signup', csrfAndOrigin, async (req, res) => {
   if (typeof password !== 'string' || password.length < PASSWORD_MIN || password.length > 128) return sendError(res, 400, `Use a password between ${PASSWORD_MIN} and 128 characters.`);
   if (d.privacy_consent !== true) return sendError(res, 400, 'Please review and accept the privacy notice and terms.');
   const selectedSlug=String(d.plan_slug||'').trim(),billingCycle=String(d.billing_cycle||'monthly');
+  if(selectedSlug==='legacy')return sendError(res,422,'Legacy uses custom enterprise pricing. Contact sales to set up this plan.');
   if(!['monthly','yearly'].includes(billingCycle))return sendError(res,422,'Choose a valid billing cycle.');
   let selectedPlan;
   if(selectedSlug){selectedPlan=db.prepare("SELECT * FROM plans WHERE slug=? AND status='active' AND sample_values=0").get(selectedSlug);if(!selectedPlan)return sendError(res,422,'That plan is not currently available.');}
-  else{const defaultPlanId=String(billingSetting('default_plan_id','legacy-default'));selectedPlan=db.prepare('SELECT * FROM plans WHERE id=?').get(defaultPlanId)||db.prepare("SELECT * FROM plans WHERE id='legacy-default'").get();}
+  else{const defaultPlanId=String(billingSetting('default_plan_id','sample-basic'));selectedPlan=db.prepare('SELECT * FROM plans WHERE id=?').get(defaultPlanId)||db.prepare("SELECT * FROM plans WHERE id='sample-basic'").get();}
   const selectedPrice=db.prepare('SELECT amount_minor,currency FROM plan_prices WHERE plan_id=? AND billing_cycle=? ORDER BY effective_from DESC,version DESC LIMIT 1').get(selectedPlan.id,billingCycle);
   if(!selectedPrice)return sendError(res,422,'That plan does not have a price for the selected billing cycle.');
   const ids = token(18), organizationId = token(18), stamp = now(), { passwordHash, passwordSalt } = await hashPassword(password);
@@ -1195,19 +1225,6 @@ app.delete('/api/workers', csrfAndOrigin, requireUser, (req, res) => {
   if (!result.changes) return sendError(res, 404, 'Worker not found.');
   res.json({ message: 'Worker removed.' });
 });
-app.post('/api/workers/consent', csrfAndOrigin, requireUser, (req, res) => {
-  const workerId = String(req.body.worker_id || '').trim(), action = String(req.body.action || '').trim();
-  let method = String(req.body.method || '').trim(); const note = String(req.body.note || '').trim();
-  if (!['consented','withdrawn'].includes(action) || note.length > 500) return sendError(res, 400, 'Choose a valid consent action and keep notes under 500 characters.');
-  if (action === 'consented' && (!['written','verbal'].includes(method) || req.body.worker_agreed !== true)) return sendError(res, 400, 'Record consent only after the worker has received the notice and explicitly agreed.');
-  if (action === 'withdrawn') method = '';
-  const stamp = now(), org = req.user.organization_id, worker = db.prepare('SELECT id FROM workers WHERE id=? AND organization_id=?').get(workerId, org);
-  if (!worker) return sendError(res, 404, 'Worker not found.');
-  db.prepare('UPDATE workers SET consent_at=?,consent_method=?,updated_at=? WHERE id=? AND organization_id=?').run(action === 'consented' ? stamp : null, method, stamp, workerId, org);
-  db.prepare('INSERT INTO worker_consent_events(id,organization_id,worker_id,action,method,note,changed_by,changed_at) VALUES(?,?,?,?,?,?,?,?)').run(token(12), org, workerId, action, method, note, req.user.id, stamp);
-  res.json({ worker: { ...db.prepare('SELECT id,name,consent_at,consent_method,updated_at FROM workers WHERE id=?').get(workerId), consent_status: action }, message: 'Consent status updated and logged.' });
-});
-
 app.post('/api/sites', csrfAndOrigin, requireUser, (req, res) => {
   const values = siteValues(req.body);
   if (!values) return sendError(res, 400, 'Enter a worksite name (up to 120 characters), keep the address under 500 characters, and provide both valid coordinates if setting a map location.');

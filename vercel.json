@@ -2,51 +2,21 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/[...route].js": {
-      "maxDuration": 60
-    },
-    "api/auth/[action].js": {
-      "maxDuration": 60
-    },
-    "api/dashboard/summary.js": {
+    "api/index.js": {
       "maxDuration": 60
     }
   },
   "rewrites": [
     {
-      "source": "/dashboard.html",
-      "destination": "/index.html"
+      "source": "/api",
+      "destination": "/api/index?__jg_path="
     },
     {
-      "source": "/account.html",
-      "destination": "/index.html"
+      "source": "/api/:path*",
+      "destination": "/api/index?__jg_path=:path*"
     },
     {
-      "source": "/privacy.html",
-      "destination": "/index.html"
-    },
-    {
-      "source": "/signup.html",
-      "destination": "/index.html"
-    },
-    {
-      "source": "/verify.html",
-      "destination": "/index.html"
-    },
-    {
-      "source": "/resend-verification.html",
-      "destination": "/index.html"
-    },
-    {
-      "source": "/login.html",
-      "destination": "/index.html"
-    },
-    {
-      "source": "/login",
-      "destination": "/index.html"
-    },
-    {
-      "source": "/admin",
+      "source": "/(.*)",
       "destination": "/index.html"
     }
   ]
