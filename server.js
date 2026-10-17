@@ -1,5 +1,6 @@
 import express from 'express';
 import { DatabaseSync } from 'node:sqlite';
+import { PostgresSyncDatabase } from './server/db/postgresSync.js';
 import { createHash, createHmac, randomBytes, randomInt, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { readFileSync, existsSync } from 'node:fs';
@@ -47,6 +48,9 @@ const PLAN_LIMIT_KEYS = new Set(['workers','sites','users','sms_segments_month',
 const ADMIN_SESSION_LIFETIME = Math.min(8 * 60 * 60, Math.max(600, Number(process.env.ADMIN_SESSION_LIFETIME_SECONDS || 3600)));
 const PASSWORD_MIN = 12;
 const DB_PATH = process.env.JIBONGUARD_DB || path.join(__dirname, 'jibonguard.sqlite3');
+const USING_POSTGRES = Boolean(process.env.DATABASE_URL);
+const now = () => Math.floor(Date.now() / 1000);
+const token = (bytes = 24) => randomBytes(bytes).toString('base64url');
 if (IS_PRODUCTION && SESSION_SECRET.length < 32) throw new Error('Set SESSION_SECRET to a random value of at least 32 characters.');
 if (IS_PRODUCTION && (!PUBLIC_ORIGIN.startsWith('https://') || !new URL(PUBLIC_ORIGIN).host || new URL(PUBLIC_ORIGIN).pathname !== '/')) throw new Error('Set PUBLIC_ORIGIN to the exact production HTTPS origin.');
 if (IS_PRODUCTION && (!process.env.SMTP_HOST || !(process.env.SMTP_FROM || process.env.SMTP_USER))) throw new Error('Set SMTP_HOST and SMTP_FROM (or SMTP_USER) in production.');
@@ -58,7 +62,8 @@ const BREAK_ALERTS = { break: 'Water and shade break', rain: 'Rain safety alert'
 const BANGLA_DIGITS = '\u09e6\u09e7\u09e8\u09e9\u09ea\u09eb\u09ec\u09ed\u09ee\u09ef';
 const toAsciiDigits = value => String(value || '').replace(/[\u09e6-\u09ef]/g, digit => String(BANGLA_DIGITS.indexOf(digit)));
 const scrypt = promisify(scryptCb);
-const db = new DatabaseSync(DB_PATH);
+const db = USING_POSTGRES ? new PostgresSyncDatabase(process.env.DATABASE_URL) : new DatabaseSync(DB_PATH);
+if (!USING_POSTGRES) {
 db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000;');
 
 db.exec(`
@@ -96,13 +101,14 @@ for (const [table, column, declaration] of [
   const columns = db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name);
   if (!columns.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`);
 }
+}
 const retiredWorkload=['Very','Heavy'].join(' ');
 db.prepare("UPDATE workers SET workload='Heavy' WHERE workload=?").run(retiredWorkload);
 db.prepare("UPDATE scheduled_break_sms SET workload='Heavy' WHERE workload=?").run(retiredWorkload);
 for(const row of db.prepare('SELECT id,workload_levels FROM break_logs').all()){
   try{const levels=JSON.parse(row.workload_levels||'[]');if(Array.isArray(levels)&&levels.includes(retiredWorkload)){const normalized=[...new Set(levels.map(level=>level===retiredWorkload?'Heavy':level).filter(level=>['Light','Standard','Heavy'].includes(level)))];db.prepare('UPDATE break_logs SET workload_levels=? WHERE id=?').run(JSON.stringify(normalized),row.id);}}catch{}
 }
-runMigrations(db, { databasePath: DB_PATH, development: !IS_PRODUCTION });
+if (!USING_POSTGRES) runMigrations(db, { databasePath: DB_PATH, development: !IS_PRODUCTION });
 const jobRunner = createJobRunner({ db });
 const metering = createMeteringService(db, { logger: console, defaultCurrency: 'BDT' });
 const USAGE_ROLLUP_INTERVAL_MS=Math.max(60000,Number(process.env.BILLING_ROLLUP_INTERVAL_MS||86400000));
@@ -126,8 +132,6 @@ const RATE_LIMITS = new Map();
 const ALERT_WEATHER_CACHE = new Map();
 const ALERT_WEATHER_STATUS = new Map();
 const SITE_TIMEZONES = new Map();
-const now = () => Math.floor(Date.now() / 1000);
-const token = (bytes = 24) => randomBytes(bytes).toString('base64url');
 const hashToken = value => SESSION_SECRET ? createHmac('sha256', SESSION_SECRET).update(value).digest('hex') : createHash('sha256').update(value).digest('hex');
 function issueAuthOtp(userId,purpose,remember=false,nextPath='/dashboard.html') {
   const id=token(24),code=String(randomInt(0,1_000_000)).padStart(6,'0'),stamp=now();
@@ -155,12 +159,16 @@ const appOrigin = req => {
   return PUBLIC_ORIGIN;
 };
 const sendError = (res, status, error) => res.status(status).json({ error });
+let nextAuthCleanupAt = 0;
 const sessionUser = req => {
   const opaque = parseCookies(req)[SESSION_COOKIE];
   if (!opaque) return null;
   const stamp = now();
-  db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(stamp);
-  db.prepare('DELETE FROM action_tokens WHERE expires_at < ?').run(stamp);
+  if (stamp >= nextAuthCleanupAt) {
+    nextAuthCleanupAt = stamp + 300;
+    db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(stamp);
+    db.prepare('DELETE FROM action_tokens WHERE expires_at < ?').run(stamp);
+  }
   return db.prepare(`SELECT u.id,u.organization_id,u.full_name,u.email,u.phone,u.role,o.name AS organization_name,o.organization_type
     FROM sessions s JOIN users u ON u.id=s.user_id JOIN organizations o ON o.id=u.organization_id
     WHERE s.token_hash=? AND s.expires_at>=?`).get(hashToken(opaque), stamp) || null;
@@ -380,6 +388,11 @@ app.get('/api/admin/overview',requireAdmin,adminPermission('dashboard_read'),(re
   const usage=Object.fromEntries(todayUsage.map(row=>[row.event_type,{quantity:Number(row.quantity||0),cost_minor:Number(row.cost_minor||0)}]));
   res.set('Cache-Control','no-store').json({organizations:counts('organizations'),workers:counts('workers'),sites:counts('sites'),alerts_today:Number(db.prepare('SELECT COUNT(*) AS n FROM automated_alerts WHERE created_at>=?').get(start).n||0),subscriptions_active:Number(db.prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE status='active'").get().n||0),subscriptions_trialing:Number(db.prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE status='trialing'").get().n||0),subscriptions_past_due:Number(db.prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE status='past_due'").get().n||0),mrr_minor:mrr,currency:'BDT',usage_today:usage});
 });
+app.get('/api/admin/system/health',requireAdmin,adminPermission('dashboard_read'),(_req,res)=>{
+  const jobs=db.prepare(`SELECT j.id,j.organization_id,j.job_key,j.status,j.started_at,j.finished_at,j.error_code,o.name AS organization_name FROM job_runs j LEFT JOIN organizations o ON o.id=j.organization_id ORDER BY j.started_at DESC LIMIT 100`).all();
+  const aiCalls=db.prepare(`SELECT a.id,a.organization_id,a.feature,a.prompt_version,a.ok,a.fallback,a.latency_ms,a.created_at,o.name AS organization_name FROM ai_calls a LEFT JOIN organizations o ON o.id=a.organization_id ORDER BY a.created_at DESC LIMIT 100`).all();
+  res.set('Cache-Control','no-store').json({jobs,ai_calls:aiCalls});
+});
 app.get('/api/admin/organizations',requireAdmin,adminPermission('organizations_read'),(req,res)=>{
   const limit=Math.min(100,Math.max(1,Number.parseInt(req.query.limit,10)||25)),offset=Math.max(0,Number.parseInt(req.query.offset,10)||0),search=String(req.query.q||'').trim().slice(0,100),like=`%${search.replace(/[\\%_]/g,'\\$&')}%`;
   const where=search?"WHERE o.name LIKE ? ESCAPE '\\' OR o.phone LIKE ? ESCAPE '\\' OR o.id LIKE ? ESCAPE '\\'":'';
@@ -550,7 +563,7 @@ app.get('/api/billing',requireUser,(req,res)=>{
   const details=db.prepare('SELECT legal_name,address,tax_id FROM organization_billing_details WHERE organization_id=?').get(org)||{legal_name:'',address:'',tax_id:''};
   const instructions=JSON.parse(db.prepare("SELECT value_json FROM billing_settings WHERE setting_key='payment_instructions'").get()?.value_json||'"Manual payment instructions are not configured."');
   const resources={workers:Number(db.prepare('SELECT COUNT(*) AS n FROM workers WHERE organization_id=?').get(org).n),sites:Number(db.prepare('SELECT COUNT(*) AS n FROM sites WHERE organization_id=?').get(org).n)},usage=subscription?db.prepare('SELECT event_type,SUM(quantity) AS quantity,SUM(cost_minor) AS cost_minor,SUM(price_minor) AS price_minor FROM usage_events WHERE organization_id=? AND created_at>=? AND created_at<? GROUP BY event_type').all(org,subscription.current_period_start,Math.min(now(),subscription.current_period_end)):[];
-  const entitlements=getOrganizationEntitlements(db,org);
+  const entitlements=getOrganizationEntitlements(db,org,subscription&&['trialing','active','past_due','suspended'].includes(subscription.status)?subscription:null);
   res.set('Cache-Control','no-store').json({subscription:subscription||null,invoices,payments,billing_details:details,payment_instructions:instructions,resources,limits:entitlements.limits,features:entitlements.features,usage});
 });
 app.put('/api/billing/details',csrfAndOrigin,requireUser,(req,res)=>{
@@ -737,12 +750,6 @@ app.put('/api/features', csrfAndOrigin, requireUser, (req, res) => {
   db.prepare('INSERT INTO org_ai_features(organization_id,settings_json,updated_at) VALUES(?,?,?) ON CONFLICT(organization_id) DO UPDATE SET settings_json=excluded.settings_json,updated_at=excluded.updated_at').run(req.user.organization_id, JSON.stringify(requested), now());
   res.json({ features: effective, masters: FEATURE_MASTERS });
 });
-app.get('/api/system/health', requireUser, (req, res) => {
-  const org = req.user.organization_id;
-  const jobs = db.prepare('SELECT id,organization_id,job_key,status,started_at,finished_at,error_code FROM job_runs WHERE organization_id=? OR organization_id IS NULL ORDER BY started_at DESC LIMIT 30').all(org);
-  const aiCalls = db.prepare('SELECT id,feature,prompt_version,ok,fallback,latency_ms,created_at FROM ai_calls WHERE organization_id=? ORDER BY created_at DESC LIMIT 20').all(org);
-  res.set('Cache-Control', 'no-store').json({ features: orgFeatures(org), jobs, ai_calls: aiCalls });
-});
 app.get('/api/auth/me', requireUser, (req, res) => res.set('Cache-Control', 'no-store').json({ authenticated: true, user: req.user }));
 app.get('/api/workers', requireUser, (req, res) => {
   const workers = db.prepare(`SELECT w.*,COALESCE((SELECT action FROM worker_consent_events e WHERE e.worker_id=w.id ORDER BY e.changed_at DESC,e.rowid DESC LIMIT 1),'pending') AS consent_status FROM workers w WHERE organization_id=? ORDER BY name COLLATE NOCASE`).all(req.user.organization_id);
@@ -753,7 +760,7 @@ app.get('/api/breaks', requireUser, (req, res) => {
   const date = String(req.query.date || '');
   if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) return sendError(res, 400, 'Enter a valid date.');
   const records = db.prepare(`SELECT b.id,b.title,b.site,b.break_date,b.break_time,b.duration_minutes,b.worker_count,b.status,b.source,b.alert_type,b.ai_rationale,b.workload_levels,b.created_at,
-    (SELECT CASE WHEN SUM(q.status='scheduled')>0 THEN 'queued' WHEN SUM(q.status='sending')>0 THEN 'sending' WHEN SUM(q.status='failed')>0 THEN 'failed' WHEN SUM(q.status='sent')>0 THEN 'sent' ELSE 'none' END FROM scheduled_break_sms q WHERE q.break_id=b.id) AS sms_status
+    (SELECT CASE WHEN SUM(CASE WHEN q.status='scheduled' THEN 1 ELSE 0 END)>0 THEN 'queued' WHEN SUM(CASE WHEN q.status='sending' THEN 1 ELSE 0 END)>0 THEN 'sending' WHEN SUM(CASE WHEN q.status='failed' THEN 1 ELSE 0 END)>0 THEN 'failed' WHEN SUM(CASE WHEN q.status='sent' THEN 1 ELSE 0 END)>0 THEN 'sent' ELSE 'none' END FROM scheduled_break_sms q WHERE q.break_id=b.id) AS sms_status
     FROM break_logs b WHERE b.organization_id=? ORDER BY b.break_date DESC,b.break_time DESC,b.created_at DESC`).all(req.user.organization_id);
   res.json({ breaks: records, total: records.length, date_total: date ? records.filter(row => row.break_date === date && row.status === 'logged').length : 0 });
 });
@@ -799,7 +806,6 @@ app.get('/api/sms', requireUser, async (req, res) => {
   const base = (process.env.TEXTBEE_BASE_URL || 'https://api.textbee.dev/api/v1').replace(/\/$/,'');
   if (!base.startsWith('https://')) return sendError(res, 503, 'TextBee must use an HTTPS API URL.');
   try {
-    await pollEmergencySms();
     const headers={'x-api-key':apiKey,Accept:'application/json','User-Agent':'JibonGuard/1.0 (SMS history sync)'};
     const [sentResponse,receivedResponse]=await Promise.all(['sent','received'].map(direction=>fetch(`${base}/gateway/messages?direction=${direction}&order=desc&limit=100`,{signal:AbortSignal.timeout(15000),headers})));
     const failedResponse=[sentResponse,receivedResponse].find(response=>!response.ok);
@@ -813,21 +819,29 @@ app.get('/api/sms', requireUser, async (req, res) => {
     };
     const numbers = new Set(workers.flatMap(row=>phoneKeys(row.phone)));
     const hiddenMessageIds=new Set(db.prepare('SELECT id FROM sms_deleted_messages WHERE organization_id=?').all(req.user.organization_id).map(row=>row.id));
-    const upsert = db.prepare(`INSERT INTO sms_messages(id,organization_id,direction,sender,recipient,message,status,device_name,message_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(organization_id,id) DO UPDATE SET status=excluded.status,message=excluded.message,message_at=excluded.message_at`);
-    let synced=0,receivedMatched=0;
     const sentMessages=(Array.isArray(sentResult.data)?sentResult.data:[]).map(item=>({...item,direction:'sent'}));
     const receivedMessages=(Array.isArray(receivedResult.data)?receivedResult.data:[]).map(item=>({...item,direction:'received'}));
+    const incomingById=new Map();
     for (const item of [...sentMessages,...receivedMessages]) {
       const sender=String(item.sender||''), recipient=String(item.recipient||'');
       const direction=item.direction;
       const matched=phoneKeys(direction==='received'?sender:recipient).some(phone=>numbers.has(phone));
       if (!matched || !item._id || !['sent','received'].includes(direction) || hiddenMessageIds.has(String(item._id))) continue;
       const stamp = direction==='received'?(item.receivedAt||item.createdAt):(item.sentAt||item.requestedAt||item.createdAt);
-      const providerId=String(item._id),already=db.prepare('SELECT 1 FROM sms_messages WHERE organization_id=? AND id=?').get(req.user.organization_id,providerId);
-      upsert.run(String(item._id),req.user.organization_id,direction,sender,recipient,String(item.message||''),String(item.status||'unknown'),String(item.device?.name||''),stamp||new Date().toISOString(),now()); synced++;
-      if(direction==='received'&&!already){const content=String(item.message||''),emergency=Boolean(emergencySmsCode(content));metering.recordUsage({organizationId:req.user.organization_id,eventType:'sms_inbound',provider:'textbee',feature:emergency?'emergency_code':'inbound',quantity:1,unit:'message',status:String(item.status||'received'),category:emergency?'emergency':'routine',metadata:{segments:calculateSmsSegments(content).segments},refType:'provider_message',refId:providerId,idempotencyKey:`sms-in:${req.user.organization_id}:${providerId}`});}
-      if(direction==='received')receivedMatched++;
+      incomingById.set(String(item._id),{id:String(item._id),organization_id:req.user.organization_id,direction,sender,recipient,message:String(item.message||''),status:String(item.status||'unknown'),device_name:String(item.device?.name||''),message_at:stamp||new Date().toISOString(),created_at:now()});
+
     }
+    const incoming=[...incomingById.values()],existingIds=new Set();
+    for(let offset=0;offset<incoming.length;offset+=200){const batch=incoming.slice(offset,offset+200),marks=batch.map(()=>'?').join(',');for(const row of db.prepare(`SELECT id FROM sms_messages WHERE organization_id=? AND id IN (${marks})`).all(req.user.organization_id,...batch.map(row=>row.id)))existingIds.add(row.id);}
+    const upsertBatch=batch=>{
+      const tuple='('+Array(10).fill('?').join(',')+')';
+      const sql=`INSERT INTO sms_messages(id,organization_id,direction,sender,recipient,message,status,device_name,message_at,created_at) VALUES ${batch.map(()=>tuple).join(',')} ON CONFLICT(organization_id,id) DO UPDATE SET status=excluded.status,message=excluded.message,message_at=excluded.message_at`;
+      db.prepare(sql).run(...batch.flatMap(row=>[row.id,row.organization_id,row.direction,row.sender,row.recipient,row.message,row.status,row.device_name,row.message_at,row.created_at]));
+    };
+    for(let offset=0;offset<incoming.length;offset+=80)upsertBatch(incoming.slice(offset,offset+80));
+    const newReceived=incoming.filter(row=>row.direction==='received'&&!existingIds.has(row.id));
+    for(const row of newReceived){const emergency=Boolean(emergencySmsCode(row.message));metering.recordUsage({organizationId:req.user.organization_id,eventType:'sms_inbound',provider:'textbee',feature:emergency?'emergency_code':'inbound',quantity:1,unit:'message',status:row.status,category:emergency?'safety':'routine',metadata:{segments:calculateSmsSegments(row.message).segments},refType:'provider_message',refId:row.id,idempotencyKey:`sms-in:${req.user.organization_id}:${row.id}`});}
+    const synced=incoming.length,receivedMatched=incoming.filter(row=>row.direction==='received').length;
     const messages=[...db.prepare('SELECT id,direction,sender,recipient,message,status,device_name,message_at FROM sms_messages WHERE organization_id=? ORDER BY message_at DESC LIMIT 250').all(req.user.organization_id),...queuedMessages()].sort((a,b)=>Date.parse(b.message_at)-Date.parse(a.message_at)).slice(0,250);
     res.set('Cache-Control','no-store').json({messages,configured:true,synced,receivedFromTextbee:receivedMessages.length,receivedMatched});
   } catch { return sendError(res,502,'Could not reach TextBee. Try syncing again shortly.'); }
@@ -1194,7 +1208,7 @@ app.delete('/api/sites', csrfAndOrigin, requireUser, (req, res) => {
   } catch(error) { try{db.exec('ROLLBACK');}catch{} sendError(res,500,'Could not delete the site and its workers.'); }
 });
 app.post('/api/records/bulk-delete',csrfAndOrigin,requireUser,(req,res)=>{
-  const records=req.body.records,allowed=new Set(['workers','sites','breaks','sms','alerts','jobs','ai_calls']);
+  const records=req.body.records,allowed=new Set(['workers','sites','breaks','sms','alerts']);
   if(!Array.isArray(records)||!records.length||records.length>500||records.some(item=>!item||!allowed.has(item.type)||typeof item.id!=='string'||!item.id))return sendError(res,400,'Select between 1 and 500 valid records to delete.');
   const org=req.user.organization_id,stamp=now(),unique=[...new Map(records.map(item=>[`${item.type}:${item.id}`,item])).values()],counts={};
   try{
@@ -1211,8 +1225,6 @@ app.post('/api/records/bulk-delete',csrfAndOrigin,requireUser,(req,res)=>{
         else {db.prepare('INSERT INTO sms_deleted_messages(organization_id,id,deleted_at) VALUES(?,?,?) ON CONFLICT(organization_id,id) DO UPDATE SET deleted_at=excluded.deleted_at').run(org,item.id,stamp);changed=db.prepare('DELETE FROM sms_messages WHERE id=? AND organization_id=?').run(item.id,org).changes;}
       }
       else if(item.type==='alerts')changed=db.prepare('DELETE FROM automated_alerts WHERE id=? AND organization_id=?').run(item.id,org).changes;
-      else if(item.type==='jobs')changed=db.prepare('DELETE FROM job_runs WHERE id=? AND organization_id=?').run(item.id,org).changes;
-      else if(item.type==='ai_calls')changed=db.prepare('DELETE FROM ai_calls WHERE id=? AND organization_id=?').run(item.id,org).changes;
       counts[item.type]=(counts[item.type]||0)+changed;
     }
     db.exec('COMMIT');res.json({deleted:Object.values(counts).reduce((sum,count)=>sum+count,0),counts});

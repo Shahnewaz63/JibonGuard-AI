@@ -1,6 +1,6 @@
 # JibonGuard AI
 
-JibonGuard is a React frontend with a Node.js/Express API and SQLite account store. The server continues to use `jibonguard.sqlite3`, including its existing organizations, users, workers, sites, consent records, and break history.
+JibonGuard is a React frontend with a Node.js/Express API. It uses PostgreSQL when `DATABASE_URL` is configured; SQLite at `jibonguard.sqlite3` remains available when it is not.
 
 ## Run locally on Windows
 
@@ -56,13 +56,13 @@ JibonGuard is an organization-admin workspace. The current user journey and the 
 
 ### What happens behind the screens
 
-The React app calls the Express API on the same origin. In development, Vite serves the app on port 5173 and proxies API requests to Express on port 8000; in production, Express serves the built frontend and API on port 8000. The API checks the signed-in session for organization-scoped routes, applies CSRF and origin checks to state-changing requests, and stores application records in `jibonguard.sqlite3`. Database startup applies additive, versioned migrations. Weather, geocoding, Gemini, SMTP, and TextBee are server-side integrations and depend on their respective configuration and availability. `/api/health` is a basic service check; dashboard system health is a separate authenticated view.
+The React app calls the Express API on the same origin. In development, Vite serves the app on port 5173 and proxies API requests to Express on port 8000; in production, Express serves the built frontend and API on port 8000. The API checks the signed-in session for organization-scoped routes and applies CSRF and origin checks to state-changing requests. Set `DATABASE_URL` to use PostgreSQL; otherwise the server uses `jibonguard.sqlite3`. Weather, geocoding, Gemini, SMTP, and TextBee are server-side integrations and depend on their respective configuration and availability. `/api/health` is a basic service check; system health is available in the authenticated admin panel.
 
 The webapp includes UI and database foundations for more feature-suite work, but those foundations are not completed end-user workflows. Automated nowcast prediction/training/evaluation, optimized break-plan approval and acknowledgement, inbound symptom triage and health check-ins, and scheduled daily/weekly report generation are **not currently operational**. The feature switches, migration tables, health page, and pure rule/helper modules should not be described as those live workflows. Risk guidance is illustrative, not medical advice or emergency monitoring; follow official local warnings and workplace procedures. Alert records are for safety follow-up and must not be used to penalize workers for taking breaks.
 
 ## Configuration
 
-The Node server reads `.env` from this folder. Keep `.env` and `jibonguard.sqlite3` private; do not commit or publish them.
+The Node server reads `.env` from this folder. Keep `.env` and `jibonguard.sqlite3` private; do not commit or publish them. The one-time SQLite import uses `node scripts/migrateSqliteToPostgres.js`; the script refuses to write unless the target public schema is empty and verifies copied rows before committing. Keep the SQLite file as a rollback copy until the PostgreSQL deployment has been reviewed.
 
 Open-Meteo's public Forecast API is used by default for non-commercial development. For a commercial deployment, subscribe to Open-Meteo and set `OPEN_METEO_API_KEY`.
 

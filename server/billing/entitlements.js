@@ -2,8 +2,8 @@ import { FEATURE_KEYS } from './features.js';
 
 const USAGE_LIMITS=Object.freeze({sms_outbound:'sms_segments_month',ai_call:'ai_tokens_month',voice_seconds:'voice_minutes_month',weather_api_call:'weather_checks_month'});
 
-export function getOrganizationEntitlements(db,organizationId){
-  const subscription=db.prepare("SELECT * FROM subscriptions WHERE organization_id=? AND status IN ('trialing','active','past_due','suspended') ORDER BY created_at DESC LIMIT 1").get(organizationId);
+export function getOrganizationEntitlements(db,organizationId,knownSubscription=null){
+  const subscription=knownSubscription||db.prepare("SELECT * FROM subscriptions WHERE organization_id=? AND status IN ('trialing','active','past_due','suspended') ORDER BY created_at DESC LIMIT 1").get(organizationId);
   const features=Object.fromEntries(FEATURE_KEYS.map(key=>[key,false])),limits={};
   if(!subscription)return {subscription:null,features,limits};
   for(const row of db.prepare('SELECT feature_key,enabled FROM plan_features WHERE plan_id=?').all(subscription.plan_id))if(Object.hasOwn(features,row.feature_key))features[row.feature_key]=Boolean(row.enabled);
