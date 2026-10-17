@@ -760,6 +760,18 @@ app.get('/api/auth/csrf', (req, res) => {
   if (csrf.set) res.cookie(CSRF_COOKIE, csrf.value, cookieOptions(false, REMEMBER_LIFETIME));
   res.set('Cache-Control', 'no-store').json({ csrf_token: csrf.value });
 });
+app.post('/api/demo-requests', csrfAndOrigin, async (req, res) => {
+  if (!rateAllowed(req, 'demo-request', 5, 3600)) return sendError(res, 429, 'Too many demo requests. Please try again later.');
+  const name=String(req.body?.name||'').trim(),email=String(req.body?.email||'').trim();
+  if(!name||name.length>120||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||email.length>254)return sendError(res,400,'Enter your name and a valid work email address.');
+  try {
+    await sendEmail('admin.curiobd@gmail.com','JibonGuard demo request',`A demo was requested from the homepage.\n\nName: ${name}\nWork email: ${email}`);
+    return res.json({ok:true,message:'Thanks. Your demo request has been sent.'});
+  } catch(error) {
+    console.error('Demo request email failed:',error.name);
+    return sendError(res,503,'The demo request could not be sent right now. Please email admin.curiobd@gmail.com directly.');
+  }
+});
 app.get('/api/health', (_req, res) => res.set('Cache-Control', 'no-store').json({ ok: true, service: 'jibonguard-api' }));
 const FEATURE_MASTERS = Object.freeze({ nowcast: process.env.NOWCAST_ENABLED === 'true', breakPlanner: process.env.SMART_BREAK_SCHEDULER_ENABLED === 'true', triage: process.env.TRIAGE_ENABLED === 'true', aiTriage: process.env.AI_TRIAGE_ENABLED === 'true', reports: process.env.AI_SAFETY_REPORTS_ENABLED === 'true' });
 const featureDefaults = Object.freeze({ nowcast: false, breakPlanner: false, triage: false, aiTriage: false, reports: false });

@@ -913,6 +913,13 @@ button:not(.mobile-menu):not(.editor-close):not(.chat-attach-button):not(.chat-m
 .auth-form-wrap>.back-link{display:block;width:max-content;margin:0 0 38px;color:var(--ink);font-size:13px;line-height:1.5}
 .account-page>.account-back-link{display:inline-flex;align-items:center;min-height:42px;margin:0 0 20px;padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--green-strong);font-size:15px;font-weight:700;line-height:1.4}
 .account-page>.account-back-link:hover{border-color:var(--green);background:var(--soft)}
+.feature-points{display:grid;gap:9px;margin:16px 0 20px;padding:0;list-style:none;color:var(--ink);font-size:14px;line-height:1.5}
+.feature-points li{position:relative;padding-left:25px}
+.feature-points li:before{content:'✓';position:absolute;left:0;top:0;display:grid;place-items:center;width:18px;height:18px;border-radius:50%;background:var(--soft);color:var(--green-strong);font-size:12px;font-weight:800}
+.demo-message{margin:4px 0 8px;color:var(--green-strong);font-size:13px;line-height:1.5}
+.demo-message.error{color:#a33d2b}
+.contact-card .demo-message{overflow-wrap:anywhere}
+.sample-controls-label{display:block;margin:18px 0 4px;padding-top:14px;border-top:1px solid var(--line)}
 .auth-form-wrap>.kicker{display:block;margin:0 0 8px}
 .auth-foot,.remember-row,.notice,.dev-link,.consent-check{font-size:13px;line-height:1.55}
 .nav-caption,.side-nav em{font-size:12px!important}

@@ -28,7 +28,7 @@ function CycleToggle({cycle,setCycle}){
 function PlanCards({plans,cycle,error,loading}){
   if(loading)return <p className="pricing-state">Loading current plans…</p>;
   if(error)return <p className="pricing-state error">{error}</p>;
-  if(!plans.length)return <section className="pricing-empty"><h2>Plans are being prepared</h2><p>Contact our team for current plan availability.</p><a className="button primary" href="mailto:hello@jibonguard.org">Contact us</a></section>;
+  if(!plans.length)return <section className="pricing-empty"><h2>Plans are being prepared</h2><p>Contact our team for current plan availability.</p><a className="button primary" href="mailto:admin.curiobd@gmail.com">Contact us</a></section>;
   return <section className="pricing-grid">{plans.map(plan=>{
     const price=plan.prices.find(item=>item.billing_cycle===cycle),isEnterprise=plan.slug==='legacy';
     const listedLimits=['workers','sites','sms_segments_month','ai_tokens_month'].filter(key=>plan.limits?.[key]).map(key=>[key,plan.limits[key]]);
@@ -38,7 +38,7 @@ function PlanCards({plans,cycle,error,loading}){
       <h2>{plan.name}</h2><p>{plan.description}</p>
       <p className="plan-price">{isEnterprise?'Custom pricing':price?money(price.amount_minor,price.currency):'Contact us'}<small>{!isEnterprise&&price?` / ${cycle==='monthly'?'month':'year'}`:''}</small></p>
       <ul>{listedLimits.map(([key,limit])=>{const value=formatLimit(key,limit);return value===null?null:<li key={key}>{LIMIT_LABELS[key]}: {value}</li>;})}{highlights.map(key=><li key={key}>{FEATURE_LABELS[key]||key.replaceAll('_',' ')}</li>)}</ul>
-      {isEnterprise?<a className="button primary" href="mailto:hello@jibonguard.org?subject=JibonGuard%20Legacy%20enterprise%20plan">Contact sales</a>:<a className="button primary" href={`/signup.html?plan=${encodeURIComponent(plan.slug)}&cycle=${cycle}`}>Choose {plan.name}</a>}
+      {isEnterprise?<a className="button primary" href="mailto:admin.curiobd@gmail.com?subject=JibonGuard%20Legacy%20enterprise%20plan">Contact sales</a>:<a className="button primary" href={`/signup.html?plan=${encodeURIComponent(plan.slug)}&cycle=${cycle}`}>Choose {plan.name}</a>}
     </article>;
   })}</section>;
 }
