@@ -274,6 +274,22 @@ app.use((req, res, next) => {
   if (IS_PRODUCTION) res.set('Strict-Transport-Security', 'max-age=31536000');
   next();
 });
+app.post('/api/textbee/webhook',express.raw({type:'application/json',limit:'256kb'}),async(req,res)=>{
+  const secret=String(process.env.TEXTBEE_WEBHOOK_SECRET||'');
+  if(secret.length<20)return sendError(res,503,'TextBee webhook is not configured. Set TEXTBEE_WEBHOOK_SECRET.');
+  const raw=Buffer.isBuffer(req.body)?req.body:null,signature=String(req.get('x-signature')||'').trim().toLowerCase();
+  if(!raw||!/^[a-f0-9]{64}$/.test(signature))return sendError(res,401,'Invalid TextBee webhook signature.');
+  const expected=createHmac('sha256',secret).update(raw).digest(),provided=Buffer.from(signature,'hex');
+  if(provided.length!==expected.length||!timingSafeEqual(provided,expected))return sendError(res,401,'Invalid TextBee webhook signature.');
+  let payload;try{payload=JSON.parse(raw.toString('utf8'));}catch{return sendError(res,400,'Invalid TextBee webhook payload.');}
+  if(payload.webhookEvent!=='MESSAGE_RECEIVED')return res.status(200).json({ok:true,ignored:true});
+  const smsId=String(payload.smsId||'').trim(),sender=String(payload.sender||'').trim(),message=String(payload.message||'');
+  if(!smsId||!normalizePhone(sender))return sendError(res,400,'TextBee webhook is missing a valid SMS ID or sender number.');
+  try{
+    await syncEmergencySms({incomingMessages:[{_id:smsId,sender,message,direction:'received',status:'received',receivedAt:payload.receivedAt||new Date().toISOString(),device:{_id:payload.deviceId||'',name:''}}]});
+    return res.status(200).json({ok:true});
+  }catch(error){console.error(`TextBee webhook processing failed (${error.name})`);return sendError(res,503,'SMS could not be processed; TextBee may retry this delivery.');}
+});
 app.use(express.json({ limit: '15mb' }));
 app.use((req, res, next) => { if (!req.path.startsWith('/api/')) console.log(`${req.method} ${req.path}`); next(); });
 
@@ -810,11 +826,23 @@ app.post('/api/alerts/simulate',csrfAndOrigin,requireUser,requirePlanFeature('si
 });
 app.get('/api/sms', requireUser, async (req, res) => {
   const apiKey = (process.env.TEXTBEE_API_KEY || process.env.TEXTBEE_DEV_API || '').trim();
+  // TextBee history is shared by the server's gateway credentials. Only expose
+  // messages linked to a phone number owned by this organization, including
+  // messages cached by an older sync that did not enforce this boundary.
+  const organizationPhones=()=>{
+    const owners=new Map();
+    for(const worker of db.prepare('SELECT organization_id,phone FROM workers').all()){
+      const phone=normalizePhone(worker.phone);if(!phone)continue;
+      if(!owners.has(phone))owners.set(phone,new Set());owners.get(phone).add(worker.organization_id);
+    }
+    return new Set([...owners].filter(([,orgs])=>orgs.size===1&&orgs.has(req.user.organization_id)).map(([phone])=>phone));
+  };
+  const belongsToOrganization=(item,phones)=>smsPhoneKeys(item.direction==='received'?item.sender:item.recipient).some(phone=>phones.has(phone));
   const queuedMessages=()=>db.prepare(`SELECT 'break-queue-'||q.id AS id,'sent' AS direction,'' AS sender,q.recipient,q.message,
     CASE q.status WHEN 'scheduled' THEN 'queued' WHEN 'sending' THEN 'sending' ELSE q.status END AS status,
     '' AS device_name,datetime(q.scheduled_at,'unixepoch')||'Z' AS message_at
     FROM scheduled_break_sms q WHERE q.organization_id=? ORDER BY q.scheduled_at DESC LIMIT 250`).all(req.user.organization_id);
-  const localMessages=()=>[...db.prepare('SELECT id,direction,sender,recipient,message,status,device_name,message_at FROM sms_messages WHERE organization_id=? ORDER BY message_at DESC LIMIT 250').all(req.user.organization_id),...queuedMessages()].sort((a,b)=>Date.parse(b.message_at)-Date.parse(a.message_at)).slice(0,250);
+  const localMessages=()=>{const phones=organizationPhones(),stored=db.prepare('SELECT id,direction,sender,recipient,message,status,device_name,message_at FROM sms_messages WHERE organization_id=? ORDER BY message_at DESC LIMIT 500').all(req.user.organization_id).filter(item=>belongsToOrganization(item,phones)&&(item.direction!=='sent'||item.id.startsWith('app-')));return [...stored,...queuedMessages()].sort((a,b)=>Date.parse(b.message_at)-Date.parse(a.message_at)).slice(0,250);};
   if(req.query.sync==='0'){
     const messages=localMessages(),receivedMatched=messages.filter(item=>item.direction==='received').length;
     return res.set('Cache-Control','no-store').json({messages,configured:Boolean(apiKey),synced:0,receivedFromTextbee:receivedMatched,receivedMatched});
@@ -822,23 +850,20 @@ app.get('/api/sms', requireUser, async (req, res) => {
   if (!apiKey) return res.set('Cache-Control','no-store').json({messages:queuedMessages(),configured:false,synced:0,message:'TextBee is not configured.'});
   const base = (process.env.TEXTBEE_BASE_URL || 'https://api.textbee.dev/api/v1').replace(/\/$/,'');
   if (!base.startsWith('https://')) return sendError(res, 503, 'TextBee must use an HTTPS API URL.');
+  const numbers=organizationPhones();
+  if(!numbers.size){const messages=localMessages();return res.set('Cache-Control','no-store').json({messages,configured:true,synced:0,receivedFromTextbee:0,receivedMatched:0});}
   try {
     const headers={'x-api-key':apiKey,Accept:'application/json','User-Agent':'JibonGuard/1.0 (SMS history sync)'};
-    const [sentResponse,receivedResponse]=await Promise.all(['sent','received'].map(direction=>fetch(`${base}/gateway/messages?direction=${direction}&order=desc&limit=100`,{signal:AbortSignal.timeout(15000),headers})));
-    const failedResponse=[sentResponse,receivedResponse].find(response=>!response.ok);
-    if (failedResponse) return sendError(res, failedResponse.status===401?401:502, failedResponse.status===401?'TextBee rejected the API key. Check TEXTBEE_API_KEY.':`TextBee message history request failed (HTTP ${failedResponse.status}).`);
-    const [sentResult,receivedResult]=await Promise.all([sentResponse.json(),receivedResponse.json()]);
-    const workers = db.prepare('SELECT organization_id,phone FROM workers').all(),phoneOwners=new Map();
-    for(const worker of workers){const phone=normalizePhone(worker.phone);if(!phone)continue;if(!phoneOwners.has(phone))phoneOwners.set(phone,new Set());phoneOwners.get(phone).add(worker.organization_id);}
-    const numbers = new Set(workers.filter(worker=>worker.organization_id===req.user.organization_id).map(worker=>normalizePhone(worker.phone)).filter(phone=>phone&&phoneOwners.get(phone)?.size===1));
+    const receivedResponse=await fetch(`${base}/gateway/messages?direction=received&order=desc&limit=100`,{signal:AbortSignal.timeout(8000),headers});
+    if (!receivedResponse.ok) return sendError(res, receivedResponse.status===401?401:502, receivedResponse.status===401?'TextBee rejected the API key. Check TEXTBEE_API_KEY.':`TextBee message history request failed (HTTP ${receivedResponse.status}).`);
+    const receivedResult=await receivedResponse.json();
     const hiddenMessageIds=new Set(db.prepare('SELECT id FROM sms_deleted_messages WHERE organization_id=?').all(req.user.organization_id).map(row=>row.id));
-    const sentMessages=(Array.isArray(sentResult.data)?sentResult.data:[]).map(item=>({...item,direction:'sent'}));
     const receivedMessages=(Array.isArray(receivedResult.data)?receivedResult.data:[]).map(item=>({...item,direction:'received'}));
     const incomingById=new Map();
-    for (const item of [...sentMessages,...receivedMessages]) {
+    for (const item of receivedMessages) {
       const sender=String(item.sender||''), recipient=String(item.recipient||'');
       const direction=item.direction;
-      const matched=smsPhoneKeys(direction==='received'?sender:recipient).some(phone=>numbers.has(phone));
+      const matched=smsPhoneKeys(sender).some(phone=>numbers.has(phone));
       if (!matched || !item._id || !['sent','received'].includes(direction) || hiddenMessageIds.has(String(item._id))) continue;
       const stamp = direction==='received'?(item.receivedAt||item.createdAt):(item.sentAt||item.requestedAt||item.createdAt);
       incomingById.set(String(item._id),{id:String(item._id),organization_id:req.user.organization_id,direction,sender,recipient,message:String(item.message||''),status:String(item.status||'unknown'),device_name:String(item.device?.name||''),message_at:stamp||new Date().toISOString(),created_at:now()});
@@ -854,7 +879,8 @@ app.get('/api/sms', requireUser, async (req, res) => {
     for(let offset=0;offset<incoming.length;offset+=80)upsertBatch(incoming.slice(offset,offset+80));
     const newReceived=incoming.filter(row=>row.direction==='received'&&!existingIds.has(row.id));
     for(const row of newReceived){const emergency=Boolean(emergencySmsCode(row.message));metering.recordUsage({organizationId:req.user.organization_id,eventType:'sms_inbound',provider:'textbee',feature:emergency?'emergency_code':'inbound',quantity:1,unit:'message',status:row.status,category:emergency?'safety':'routine',metadata:{segments:calculateSmsSegments(row.message).segments},refType:'provider_message',refId:row.id,idempotencyKey:`sms-in:${req.user.organization_id}:${row.id}`});}
-    const synced=incoming.length,receivedMatched=incoming.filter(row=>row.direction==='received').length,receivedForOrg=receivedMessages.filter(item=>smsPhoneKeys(item.sender).some(phone=>numbers.has(phone))).length;
+    try{const seeded=db.prepare("SELECT value FROM sms_sync_state WHERE key='emergency_seeded'").get();await syncEmergencySms({seed:!seeded,incomingMessages:receivedMessages});}catch(error){console.error(`SMS receive processing failed (${error.name})`);}
+    const synced=incoming.length,receivedMatched=incoming.length,receivedForOrg=receivedMessages.filter(item=>smsPhoneKeys(item.sender).some(phone=>numbers.has(phone))).length;
     const messages=localMessages();
     res.set('Cache-Control','no-store').json({messages,configured:true,synced,receivedFromTextbee:receivedForOrg,receivedMatched});
   } catch { return sendError(res,502,'Could not reach TextBee. Try syncing again shortly.'); }
@@ -1449,6 +1475,22 @@ app.post('/api/ai/live-token', csrfAndOrigin, requireUser, async (req,res) => {
   res.set('Cache-Control','no-store').json({token:result.name,model:'models/gemini-3.8-live'});
 });
 
+function saveOrganizationSms(organizationId,entries,status='queued'){
+  if(!organizationId||!entries.length)return;
+  const owners=new Map();
+  for(const worker of db.prepare('SELECT organization_id,phone FROM workers').all()){
+    const phone=normalizePhone(worker.phone);if(!phone)continue;
+    if(!owners.has(phone))owners.set(phone,new Set());owners.get(phone).add(worker.organization_id);
+  }
+  const insert=db.prepare("INSERT INTO sms_messages(id,organization_id,direction,sender,recipient,message,status,device_name,message_at,created_at) VALUES(?,?,'sent','',?,?,?,'',?,?)");
+  const stamp=new Date().toISOString(),created=now(),unique=new Map();
+  for(const entry of entries){
+    const phone=normalizePhone(entry.phone);if(!phone||owners.get(phone)?.size!==1||!owners.get(phone)?.has(organizationId))continue;
+    const key=`${phone}\0${entry.message||''}`;if(unique.has(key))continue;unique.set(key,true);
+    insert.run(`app-${token(16)}`,organizationId,phone,String(entry.message||''),status,stamp,created);
+  }
+}
+
 async function sendTextBeeBreakSms(recipients, record, usageContext={}) {
   if (!recipients.length) return { status:'no_recipients',recipient_count:0,message:'No workers with usable phone numbers are assigned to this site.' };
   const apiKey=(process.env.TEXTBEE_API_KEY||process.env.TEXTBEE_DEV_API||'').trim(), subscription=(process.env.TEXTBEE_SIM_SUBSCRIPTION_ID||process.env.SIM_SUBSCRIPTION_ID||'').trim(), base=(process.env.TEXTBEE_BASE_URL||'https://api.textbee.dev/api/v1').replace(/\/$/,'');
@@ -1482,6 +1524,7 @@ async function sendTextBeeBreakSms(recipients, record, usageContext={}) {
     if (!accepted) {meterSmsAttempt(meterEntries,usageContext,'failed',token(16));const failed=Number(result.data?.failureCount)||0; return {status:'failed',recipient_count:0,message:failed?`Break saved, but TextBee could not queue ${failed} SMS. Check device status and recipient numbers.`:'Break saved, but TextBee did not confirm the batch. Check that a default sending device is enabled and online.'}; }
     const acceptedCount=Number(result.data?.recipientCount||result.data?.successCount)||recipients.length;
     meterSmsAttempt(meterEntries,usageContext,'queued',token(16));
+    if(usageContext.feature!=='break_planner')saveOrganizationSms(usageContext.organizationId,meterEntries,'queued');
     return {status:'queued',recipient_count:acceptedCount,message:`TextBee accepted ${acceptedCount} personalized SMS message(s) into its queue.`};
   } catch { meterSmsAttempt(meterEntries,usageContext,'failed',token(16));return {status:'failed',recipient_count:0,message:'Break saved, but the TextBee request timed out or failed. Retry shortly.'}; }
 }
@@ -1623,6 +1666,7 @@ async function sendTextBeeMessages(entries,messageTemplate,usageContext={}) {
     const result=await response.json().catch(()=>({}));
     const accepted=response.ok&&(result.data?.success===true||Number(result.data?.successCount)>0||Number(result.data?.recipientCount)>0);
     meterSmsAttempt(entries,usageContext,accepted?'queued':'failed',attemptId);
+    if(accepted)saveOrganizationSms(usageContext.organizationId,entries,'queued');
     return {accepted,result,latencyMs:Date.now()-started};
   } catch { meterSmsAttempt(entries,usageContext,'failed',attemptId);return {accepted:false}; }
 }
@@ -1655,14 +1699,18 @@ async function sendWorkerWelcomeMessages(workers, organizationId) {
   return {status:accepted===entries.length&&entries.length?'queued':accepted?'partial':entries.length?'failed':'outside_shift',recipient_count:accepted,skipped_outside_shift:workers.length-entries.length};
 }
 async function sendWorkerWelcomeSms(worker, organizationId) { return sendWorkerWelcomeMessages([worker],organizationId); }
-async function syncEmergencySms({seed=false}={}) {
+async function syncEmergencySms({seed=false,incomingMessages=null}={}) {
   const apiKey=(process.env.TEXTBEE_API_KEY||process.env.TEXTBEE_DEV_API||'').trim();
-  if(!apiKey)return {configured:false,received:0};
-  const base=(process.env.TEXTBEE_BASE_URL||'https://api.textbee.dev/api/v1').replace(/\/$/,'');
-  if(!base.startsWith('https://'))return {configured:true,received:0};
-  const response=await fetch(`${base}/gateway/messages?direction=received&order=desc&limit=100`,{signal:AbortSignal.timeout(15000),headers:{'x-api-key':apiKey,Accept:'application/json','User-Agent':'JibonGuard/1.0 (emergency SMS monitor)'}});
-  if(!response.ok)throw new Error(`TextBee returned HTTP ${response.status}`);
-  const result=await response.json(),incoming=Array.isArray(result.data)?result.data:[];
+  let incoming;
+  if(Array.isArray(incomingMessages))incoming=incomingMessages;
+  else{
+    if(!apiKey)return {configured:false,received:0};
+    const base=(process.env.TEXTBEE_BASE_URL||'https://api.textbee.dev/api/v1').replace(/\/$/,'');
+    if(!base.startsWith('https://'))return {configured:true,received:0};
+    const response=await fetch(`${base}/gateway/messages?direction=received&order=desc&limit=100`,{signal:AbortSignal.timeout(8000),headers:{'x-api-key':apiKey,Accept:'application/json','User-Agent':'JibonGuard/1.0 (emergency SMS monitor)'}});
+    if(!response.ok)throw new Error(`TextBee returned HTTP ${response.status}`);
+    const result=await response.json();incoming=Array.isArray(result.data)?result.data:[];
+  }
   const workers=db.prepare('SELECT id,organization_id,name,phone,site,site_id FROM workers').all();
   const byPhone=new Map();
   for(const worker of workers)for(const key of smsPhoneKeys(worker.phone)){if(!byPhone.has(key))byPhone.set(key,[]);byPhone.get(key).push(worker);}
