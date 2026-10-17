@@ -911,6 +911,8 @@ button:not(.mobile-menu):not(.editor-close):not(.chat-attach-button):not(.chat-m
 
 /* Keep authentication navigation distinct and small supporting text readable. */
 .auth-form-wrap>.back-link{display:block;width:max-content;margin:0 0 38px;color:var(--ink);font-size:13px;line-height:1.5}
+.account-page>.account-back-link{display:inline-flex;align-items:center;min-height:42px;margin:0 0 20px;padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--green-strong);font-size:15px;font-weight:700;line-height:1.4}
+.account-page>.account-back-link:hover{border-color:var(--green);background:var(--soft)}
 .auth-form-wrap>.kicker{display:block;margin:0 0 8px}
 .auth-foot,.remember-row,.notice,.dev-link,.consent-check{font-size:13px;line-height:1.55}
 .nav-caption,.side-nav em{font-size:12px!important}
