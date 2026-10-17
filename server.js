@@ -178,15 +178,26 @@ const csrfToken = req => {
   if (existing && /^[A-Za-z0-9_-]{32,64}$/.test(existing)) return { value: existing, set: false };
   return { value: token(32), set: true };
 };
-const csrfAndOrigin = (req, res, next) => {
+const validRequestOrigin = req => {
   const origin = req.get('origin');
-  const host = req.get('host') || '';
-  let validOrigin = origin === PUBLIC_ORIGIN;
-  if (!validOrigin && !IS_PRODUCTION && origin) {
-    try { const parsed = new URL(origin); validOrigin = ['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname) && /^https?:$/.test(parsed.protocol); } catch { validOrigin = false; }
-  }
+  if (!origin) return false;
+  try {
+    const parsed = new URL(origin);
+    const requestHosts = [req.get('x-forwarded-host'), req.get('host')]
+      .flatMap(value => String(value || '').split(','))
+      .map(value => value.trim().toLowerCase())
+      .filter(Boolean);
+    const matchesRequestHost = requestHosts.includes(parsed.host.toLowerCase());
+    const matchesConfiguredOrigin = parsed.origin === PUBLIC_ORIGIN;
+    const forwardedProtocol = String(req.get('x-forwarded-proto') || '').split(',')[0].trim().toLowerCase();
+    if (!matchesRequestHost && !matchesConfiguredOrigin) return false;
+    if (IS_PRODUCTION) return parsed.protocol === 'https:' && (!forwardedProtocol || forwardedProtocol === 'https');
+    return /^https?:$/.test(parsed.protocol);
+  } catch { return false; }
+};
+const csrfAndOrigin = (req, res, next) => {
   const cookies = parseCookies(req), header = req.get('x-csrf-token') || '';
-  if (!validOrigin) return sendError(res, 403, 'Request origin could not be verified. Reload the page and try again.');
+  if (!validRequestOrigin(req)) return sendError(res, 403, 'Request origin could not be verified. Reload the page and try again.');
   if (!cookies[CSRF_COOKIE] || !header || cookies[CSRF_COOKIE] !== header) return sendError(res, 403, 'Your security token expired. Reload the page and try again.');
   next();
 };
@@ -219,14 +230,6 @@ const adminSessionUser = req => {
 const adminIpAllowed = req => {
   const configured = String(process.env.ADMIN_IP_ALLOWLIST || '').split(',').map(value => value.trim()).filter(Boolean);
   return !configured.length || configured.includes(req.ip || req.socket.remoteAddress || '');
-};
-const validRequestOrigin = req => {
-  const origin = req.get('origin');
-  if (origin === PUBLIC_ORIGIN) return true;
-  if (!IS_PRODUCTION && origin) {
-    try { const parsed = new URL(origin); return ['127.0.0.1','localhost','::1'].includes(parsed.hostname) && /^https?:$/.test(parsed.protocol); } catch { return false; }
-  }
-  return false;
 };
 const adminCsrfAndOrigin = (req,res,next) => {
   const cookies=parseCookies(req),header=req.get('x-csrf-token')||'';
