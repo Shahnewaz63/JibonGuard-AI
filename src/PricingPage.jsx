@@ -1,4 +1,4 @@
-import React,{useEffect,useMemo,useState} from 'react';
+import React,{useEffect,useState} from 'react';
 
 function money(minor,currency){
   const formatter=new Intl.NumberFormat(undefined,{style:'currency',currency});
@@ -18,26 +18,26 @@ const formatLimit=(key,limit)=>{
 function usePricingPlans(){
   const [plans,setPlans]=useState([]),[cycle,setCycle]=useState('monthly'),[error,setError]=useState(''),[loading,setLoading]=useState(true);
   useEffect(()=>{let live=true;fetch('/api/pricing').then(async response=>{const data=await response.json();if(!response.ok)throw new Error(data.error||'Plans could not be loaded.');if(live)setPlans(data.plans||[]);}).catch(reason=>{if(live)setError(reason.message);}).finally(()=>{if(live)setLoading(false);});return()=>{live=false;};},[]);
-  const features=useMemo(()=>[...new Set(plans.flatMap(plan=>Object.keys(plan.features||{}).filter(key=>plan.features[key])))],[plans]);
-  return {plans,cycle,setCycle,error,loading,features};
+  return {plans,cycle,setCycle,error,loading};
 }
 
 function CycleToggle({cycle,setCycle}){
   return <div className="cycle-toggle" role="group" aria-label="Billing cycle"><button type="button" className={cycle==='monthly'?'selected':''} onClick={()=>setCycle('monthly')}>Monthly</button><button type="button" className={cycle==='yearly'?'selected':''} onClick={()=>setCycle('yearly')}>Yearly <small>2 months free</small></button></div>;
 }
 
-function PlanCards({plans,cycle,features,error,loading}){
+function PlanCards({plans,cycle,error,loading}){
   if(loading)return <p className="pricing-state">Loading current plans…</p>;
   if(error)return <p className="pricing-state error">{error}</p>;
   if(!plans.length)return <section className="pricing-empty"><h2>Plans are being prepared</h2><p>Contact our team for current plan availability.</p><a className="button primary" href="mailto:hello@jibonguard.org">Contact us</a></section>;
   return <section className="pricing-grid">{plans.map(plan=>{
     const price=plan.prices.find(item=>item.billing_cycle===cycle),isEnterprise=plan.slug==='legacy';
-    const listedLimits=Object.entries(plan.limits||{}).filter(([key])=>LIMIT_LABELS[key]);
+    const listedLimits=['workers','sites','sms_segments_month','ai_tokens_month'].filter(key=>plan.limits?.[key]).map(key=>[key,plan.limits[key]]);
+    const highlights=['voice_alerts','ai_chat','ai_alert_automation','simulator','csv_import','data_export'].filter(key=>plan.features?.[key]).slice(0,3);
     return <article className="pricing-card" key={plan.id}>
       {plan.badge_text&&<span className="plan-badge">{plan.badge_text}</span>}
       <h2>{plan.name}</h2><p>{plan.description}</p>
       <p className="plan-price">{isEnterprise?'Custom pricing':price?money(price.amount_minor,price.currency):'Contact us'}<small>{!isEnterprise&&price?` / ${cycle==='monthly'?'month':'year'}`:''}</small></p>
-      <ul>{listedLimits.map(([key,limit])=>{const value=formatLimit(key,limit);return value===null?null:<li key={key}>{LIMIT_LABELS[key]}: {value}</li>;})}{features.filter(key=>plan.features?.[key]).map(key=><li key={key}>{FEATURE_LABELS[key]||key.replaceAll('_',' ')}</li>)}</ul>
+      <ul>{listedLimits.map(([key,limit])=>{const value=formatLimit(key,limit);return value===null?null:<li key={key}>{LIMIT_LABELS[key]}: {value}</li>;})}{highlights.map(key=><li key={key}>{FEATURE_LABELS[key]||key.replaceAll('_',' ')}</li>)}</ul>
       {isEnterprise?<a className="button primary" href="mailto:hello@jibonguard.org?subject=JibonGuard%20Legacy%20enterprise%20plan">Contact sales</a>:<a className="button primary" href={`/signup.html?plan=${encodeURIComponent(plan.slug)}&cycle=${cycle}`}>Choose {plan.name}</a>}
     </article>;
   })}</section>;

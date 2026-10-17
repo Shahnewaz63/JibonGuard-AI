@@ -679,7 +679,8 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .brand-dashboard .brand-copy strong{font-size:17px}
 .brand-dashboard .brand-copy small{display:none}
 .sidebar>.brand-dashboard{padding:0 5px 21px}
-.dash-top>.brand-dashboard{margin-left:7px}
+.dash-top>.brand-dashboard{display:none;margin-left:7px}
+.dashboard-app.menu-open .dash-top>.brand-dashboard{visibility:hidden}
 .auth-intro{padding-left:clamp(48px,8vw,142px);padding-right:clamp(34px,6vw,96px)}
 .auth-intro>*{position:relative;z-index:1}
 .auth-intro ul li{display:flex;align-items:center;gap:10px;color:var(--ink);font-size:14px;font-weight:600;line-height:1.5}
@@ -695,4 +696,49 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
   .auth-intro ul li{font-size:13px}
   .brand-dashboard .brand-mark{width:30px;height:30px}
   .brand-dashboard .brand-copy strong{font-size:15px}
+  .dash-top>.brand-dashboard{display:flex}
+}
+.pricing-grid{align-items:stretch}
+.pricing-card{display:flex;min-width:0;flex-direction:column}
+.pricing-card h2{min-height:1.4em;margin:28px 0 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:clamp(19px,2vw,23px)}
+.pricing-card>p:not(.plan-price){display:-webkit-box;min-height:3.2em;overflow:hidden;-webkit-box-orient:vertical;-webkit-line-clamp:2;line-height:1.6}
+.pricing-card .plan-price{white-space:nowrap}
+.pricing-card ul{flex:1;min-height:0;line-height:1.75}
+.pricing-card .button{width:100%;min-height:44px;margin-top:18px;flex:none;white-space:nowrap}
+.auth-intro>.brand,.site-footer .brand{display:none}
+
+/* Larger, clearer branding and baseline text sizing. */
+.brand{gap:13px}
+.brand-mark{width:48px;height:48px;border-radius:14px}
+.brand-copy strong{font-size:22px;letter-spacing:-.025em}
+.brand-copy em{font-size:10px}
+.brand-dashboard{gap:9px}
+.brand-dashboard .brand-mark{width:38px;height:38px}
+.brand-dashboard .brand-copy strong{font-size:18px}
+.brand-copy small{display:none}
+body{font-size:16px}
+.eyebrow,.kicker{font-size:11px}
+.site-top nav a,.quiet-link,.subtle-link{font-size:14px}
+.button,.theme-button{font-size:14px}
+.field label,.form-stack label,.table-tools label{font-size:13px}
+.field input,.field select,.form-stack input,.form-stack select,.form-stack textarea,.table-tools input,.table-tools select{font-size:15px}
+.side-nav button{font-size:14px}
+.org-card strong,.profile strong{font-size:13px}
+.org-card small,.support-card small,.support-card a,.profile small{font-size:12px}
+.panel-head p,.empty-state p,.empty-inline,.table-scroll td{font-size:13px}
+.table-scroll th{font-size:11px}
+.table-scroll td small{font-size:12px}
+.site-heading,.site-card-footer,.site-weather,.break-item,.simple-list,.report-breakdown{font-size:13px}
+@media(max-width:760px){
+  .brand-mark{width:40px;height:40px}
+  .brand-copy strong{font-size:20px}
+  .brand-dashboard .brand-mark{width:36px;height:36px}
+  .brand-dashboard .brand-copy strong{font-size:17px}
+  .auth-intro .kicker{font-size:10px}
+  .dash-title-actions .button{font-size:13px}
+}
+@media(max-width:430px){
+  .brand-copy strong{font-size:19px}
+  .brand-mark{width:38px;height:38px}
+  .site-account-trigger{font-size:12px}
 }

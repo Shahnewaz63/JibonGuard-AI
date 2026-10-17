@@ -32,7 +32,7 @@ const currentClock = () => { const date=new Date();return `${String(date.getHour
 const currentTime = () => { const date=new Date(Date.now()+15*60000);date.setSeconds(0,0);return `${String(date.getHours()).padStart(2,'0')}:${String(date.getMinutes()).padStart(2,'0')}`; };
 
 function Brand({ light = false, compact = false, href = '/' }) {
-  return <a className={cx('brand', light && 'brand-light', compact && 'brand-dashboard')} href={href} aria-label="JibonGuard AI home"><img className="brand-mark" src={brandMark} alt=""/><span className="brand-copy"><strong>Jibon<span>Guard</span><em>AI</em></strong><small>HEAT SAFETY, MADE PERSONAL</small></span></a>;
+  return <a className={cx('brand', light && 'brand-light', compact && 'brand-dashboard')} href={href} aria-label="JibonGuard AI home"><img className="brand-mark" src={brandMark} alt=""/><span className="brand-copy"><strong>Jibon<span>Guard</span><em>AI</em></strong></span></a>;
 }
 function ThemeButton() {
   const [dark, setDark] = useState(() => document.documentElement.dataset.theme === 'dark');

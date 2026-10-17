@@ -53,6 +53,11 @@
 .admin-app{width:100%;max-width:100vw;overflow-x:clip}
 html:has(.admin-app),body:has(.admin-app),#root:has(.admin-app){overflow-x:hidden}
 @media(max-width:650px){.admin-plan-form>.admin-primary{justify-self:stretch;width:100%;min-width:0}}
+.admin-topbar-actions{display:flex;align-items:center;justify-content:flex-end;gap:16px;min-width:0}
+.admin-theme-toggle{min-height:40px;padding-inline:12px;font-size:12px}
+.admin-user{min-width:0;max-width:min(34vw,320px)}
+.admin-user span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media(max-width:650px){.admin-topbar{align-items:flex-start}.admin-topbar-actions{align-items:flex-end;flex-direction:column;gap:8px}.admin-theme-toggle{min-height:40px}.admin-user{max-width:55vw}}
 html[data-admin-theme=dark],html[data-admin-theme=dark] body,html[data-admin-theme=dark] #root{min-height:100%;background:#101815!important;color:#eef5f1;color-scheme:dark}
 html[data-admin-theme=light],html[data-admin-theme=light] body,html[data-admin-theme=light] #root{min-height:100%;background:#f4f7f6!important;color:#172c27;color-scheme:light}
 .admin-app{min-height:100vh;min-height:100dvh;align-items:stretch;background:var(--admin-bg)!important;color:var(--admin-text)}
@@ -65,3 +70,25 @@ html[data-admin-theme=light],html[data-admin-theme=light] body,html[data-admin-t
 .admin-app .admin-table-wrap tbody tr:hover td{background:var(--admin-soft)}
 .admin-app .admin-table-wrap td small{color:var(--admin-muted)}
 .admin-app input:focus,.admin-app textarea:focus,.admin-app select:focus{border-color:var(--admin-brand);outline:2px solid color-mix(in srgb,var(--admin-brand) 20%,transparent)}
+
+/* Keep admin navigation, data, and controls legible at a glance. */
+.admin-sidebar nav button,.admin-sidebar-bottom button{font-size:14px}
+.admin-sidebar-label,.admin-eyebrow{font-size:11px}
+.admin-user{font-size:13px}
+.admin-user b{font-size:12px}
+.admin-stat span,.admin-search,.admin-plan-form>label,.admin-auth-card form>label{font-size:13px}
+.admin-table-wrap th{font-size:11px}
+.admin-table-wrap td{font-size:13px}
+.admin-table-wrap td small{font-size:12px}
+.admin-pill{font-size:11px}
+.admin-primary{font-size:14px}
+.admin-check,.admin-alert,.admin-notice,.admin-secret{font-size:13px}
+.admin-auth-card small,.admin-uri{font-size:12px}
+@media(max-width:650px){
+  .admin-sidebar nav button{font-size:13px}
+  .admin-user{font-size:12px}
+  .admin-stat span,.admin-search,.admin-plan-form>label,.admin-auth-card form>label{font-size:12px}
+  .admin-table-wrap th{font-size:10px}
+  .admin-table-wrap td{font-size:12px}
+  .admin-table-wrap td small{font-size:11px}
+}
