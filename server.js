@@ -1011,12 +1011,10 @@ app.post('/api/auth/login', csrfAndOrigin, async (req, res) => {
     catch (error) { db.prepare('DELETE FROM auth_otp_challenges WHERE id=?').run(challenge.challengeId); console.error('Signup verification OTP delivery failed:', JSON.stringify({ code: error.code, command: error.command, responseCode: error.responseCode })); return sendError(res,502,'We could not send a verification code. Check the server SMTP log for the delivery reason, then try again.'); }
     return res.json({otp_required:true,purpose:'signup',challenge_id:challenge.challengeId,email:user.email,resend_after:OTP_RESEND_COOLDOWN_SECONDS,message:'This account still needs email verification. We sent a verification code.'});
   }
-  db.prepare("DELETE FROM auth_otp_challenges WHERE user_id=? AND purpose='login'").run(user.id);
-  const remember=req.body.remember===true,lifetime=remember?REMEMBER_LIFETIME:SESSION_LIFETIME,opaque=token(32),cookie=parseCookies(req)[SESSION_COOKIE],stamp=now();
-  if(cookie)db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(cookie));
-  db.prepare('INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)').run(hashToken(opaque),user.id,stamp,stamp+lifetime);
-  const csrf=token(32);res.cookie(SESSION_COOKIE,opaque,cookieOptions(true,lifetime));res.cookie(CSRF_COOKIE,csrf,cookieOptions(false,REMEMBER_LIFETIME));
-  res.json({message:'Signed in.',csrf_token:csrf,next:nextPath});
+  const remember=req.body.remember===true,challenge=issueAuthOtp(user.id,'login',remember,nextPath);
+  try { await emailAuthOtp(user,challenge,'login'); }
+  catch (error) { db.prepare('DELETE FROM auth_otp_challenges WHERE id=?').run(challenge.challengeId); console.error('Sign-in OTP delivery failed:', JSON.stringify({ code:error.code,command:error.command,responseCode:error.responseCode })); return sendError(res,502,'We could not send a sign-in code. Check the server SMTP settings and try again.'); }
+  res.json({otp_required:true,purpose:'login',challenge_id:challenge.challengeId,email:user.email,resend_after:OTP_RESEND_COOLDOWN_SECONDS,message:'We sent a 6-digit sign-in code to your email. Enter it to continue.'});
 });
 app.post('/api/auth/verify-otp', csrfAndOrigin, (req,res)=>{
   if(!rateAllowed(req,'verify-otp',10))return sendError(res,429,'Too many code attempts. Please try again later.');
@@ -1024,7 +1022,6 @@ app.post('/api/auth/verify-otp', csrfAndOrigin, (req,res)=>{
   if(!/^[A-Za-z0-9_-]{24,64}$/.test(id)||!/^\d{6}$/.test(code))return sendError(res,400,'Enter the 6-digit code from your email.');
   const challenge=db.prepare('SELECT c.*,u.email_verified_at FROM auth_otp_challenges c JOIN users u ON u.id=c.user_id WHERE c.id=?').get(id);
   if(!challenge||challenge.expires_at<now())return sendError(res,400,'That code expired. Request a new one and try again.');
-  if(challenge.purpose==='login')return sendError(res,410,'Sign-in codes are disabled. Please sign in with your password.');
   if(challenge.attempts>=5)return sendError(res,429,'Too many incorrect codes. Request a new code.');
   if(hashToken(`${id}:${code}`)!==challenge.otp_hash){const attempts=challenge.attempts+1;db.prepare('UPDATE auth_otp_challenges SET attempts=? WHERE id=?').run(attempts,id);return sendError(res,attempts>=5?429:400,attempts>=5?'Too many incorrect codes. Request a new code.':'The code is incorrect. Check the email and try again.');}
   db.prepare('DELETE FROM auth_otp_challenges WHERE id=?').run(id);
@@ -1041,7 +1038,6 @@ app.post('/api/auth/resend-otp',csrfAndOrigin,async(req,res)=>{
   const id=String(req.body.challenge_id||''),email=String(req.body.email||'').trim().toLowerCase();
   const prior=db.prepare('SELECT c.*,u.email,u.full_name,u.email_verified_at FROM auth_otp_challenges c JOIN users u ON u.id=c.user_id WHERE c.id=? AND u.email=? COLLATE NOCASE AND c.created_at>=?').get(id,email,now()-86400);
   if(!prior)return sendError(res,400,'This code request can no longer be renewed. Start sign-in again.');
-  if(prior.purpose==='login')return sendError(res,410,'Sign-in codes are disabled. Please sign in with your password.');
   if(prior.purpose==='signup'&&prior.email_verified_at)return sendError(res,400,'Email is already verified. Return to sign in.');
   const resendAfter=Math.max(0,OTP_RESEND_COOLDOWN_SECONDS-(now()-prior.created_at));
   if(resendAfter>0)return res.status(429).json({error:`Please wait ${resendAfter} seconds before requesting another code.`,resend_after:resendAfter});
@@ -1476,39 +1472,25 @@ app.post('/api/ai/chat', csrfAndOrigin, requireUser, async (req,res) => {
   const instruction="You are JibonGuard's in-app assistant. Help organization administrators understand the dashboard, site weather, worker teams, break logs, and practical heat and weather safety. Be concise and clear. Do not claim to see private organization records or live weather unless supplied in the conversation. Never give a medical diagnosis or claim an emergency is safe; direct urgent situations to local emergency services and official instructions. Do not ask for passwords, API keys, or personal worker details.";
   try { res.json({ reply:await geminiGenerate(contents,instruction,false,{organizationId:req.user.organization_id,feature:'chat'}) }); } catch(error) { sendError(res,503,error.message); }
 });
-// Gemini voice is temporarily available to every signed-in account as a demo.
-// Keep authentication, rate limiting, token quotas, and usage metering enabled.
+// Stream generated speech so the browser can begin playback as audio arrives.
 app.post('/api/ai/speech', csrfAndOrigin, requireUser, async (req,res) => {
   if (!rateAllowed(req,'gemini-speech',30,3600)) return sendError(res,429,'Speech limit reached. Try again in a little while.');
   const text=typeof req.body.text==='string'?req.body.text.trim():'';
   const voice=String(req.body.voice||'Kore');
   if(!text||text.length>5000)return sendError(res,400,'Choose a reply with 1 to 5,000 characters to read aloud.');
   if(!['Kore','Puck','Charon','Aoede'].includes(voice))return sendError(res,400,'Choose one of the available assistant voices.');
-  let response;const started=Date.now(),estimatedInput=estimateGeminiTokens(text,'');
+  const started=Date.now(),estimatedInput=estimateGeminiTokens(text,'');
   const quota=checkUsageDispatch(db,{organizationId:req.user.organization_id,eventType:'ai_call',quantity:estimatedInput.inputTokens});if(!quota.allowed)return sendError(res,402,'Speech generation is paused because this organization reached its plan limit or needs to restore its subscription.');
-  if(!GEMINI_API_KEY)return sendError(res,503,'Gemini is not configured. Set GEMINI_API_KEY in the server .env file.');
-  try{
-    response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_TTS_MODEL)}:generateContent`,{method:'POST',signal:AbortSignal.timeout(60000),headers:{'x-goog-api-key':GEMINI_API_KEY,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({contents:[{role:'user',parts:[{text,speech_metadata:{style:'Clear, calm, conversational delivery.'}}]}],generationConfig:{responseModalities:['AUDIO'],speechConfig:{voiceConfig:{voice}}}})});
-  }catch{metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:estimatedInput.inputTokens,unit:'token',rateDivisor:1000000,tokensInput:estimatedInput.inputTokens,tokensOutput:0,estimated:true,status:'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});return sendError(res,503,"Could not connect to Gemini speech. Check the server's internet connection.");}
-  const result=await response.json().catch(()=>({}));
-  const usageMeta=result.usageMetadata||{},tokensInput=Number.isSafeInteger(usageMeta.promptTokenCount)?usageMeta.promptTokenCount:estimatedInput.inputTokens,tokensOutput=Number.isSafeInteger(usageMeta.candidatesTokenCount)?usageMeta.candidatesTokenCount:0,estimated=!Number.isSafeInteger(usageMeta.promptTokenCount)||!Number.isSafeInteger(usageMeta.candidatesTokenCount);
-  if(!response.ok){metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:tokensInput+tokensOutput,unit:'token',rateDivisor:1000000,tokensInput,tokensOutput,estimated,status:'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});const detail=String(result.error?.message||'').replace(/\s+/g,' ').slice(0,220);return sendError(res,503,`Gemini speech returned HTTP ${response.status}.${detail?` ${detail}`:' Check TTS model access and API quota.'}`);}
-  const audioPart=(result.candidates?.[0]?.content?.parts||[]).find(part=>part.inlineData?.data);
-  metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:tokensInput+tokensOutput,unit:'token',rateDivisor:1000000,tokensInput,tokensOutput,estimated,status:audioPart?'success':'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});
-  if(!audioPart)return sendError(res,503,'Gemini returned no speech audio. Check TTS model access and try again.');
-  res.set('Cache-Control','no-store').json({audio:audioPart.inlineData.data,mime_type:audioPart.inlineData.mimeType||'audio/wav'});
-});
-app.post('/api/ai/live-token', csrfAndOrigin, requireUser, async (req,res) => {
-  if (!rateAllowed(req,'gemini-live-token',10,3600)) return sendError(res,429,'Live voice is temporarily limited. Try again in a little while.');
-  if (!GEMINI_API_KEY) return sendError(res,503,'Gemini is not configured. Set GEMINI_API_KEY in the server .env file.');
+  if(!GEMINI_API_KEY)return sendError(res,503,'Speech service is not configured. Set GEMINI_API_KEY in the server .env file.');
   let response;
-  try {
-    const expiresAt=new Date(Date.now()+30*60*1000).toISOString();
-    response=await fetch('https://generativelanguage.googleapis.com/v1beta/auth_tokens',{method:'POST',signal:AbortSignal.timeout(15000),headers:{'x-goog-api-key':GEMINI_API_KEY,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({uses:1,expireTime:expiresAt,newSessionExpireTime:new Date(Date.now()+60*1000).toISOString()})});
-  } catch { return sendError(res,503,"Could not connect to Gemini Live. Check the server's internet connection."); }
-  const result=await response.json().catch(()=>({}));
-  if (!response.ok||typeof result.name!=='string') { const detail=String(result.error?.message||'').replace(/\s+/g,' ').slice(0,220); return sendError(res,503,`Gemini Live token request failed${response.status?` (HTTP ${response.status})`:''}.${detail?` ${detail}`:' Check Live API access, model availability and API quota.'}`); }
-  res.set('Cache-Control','no-store').json({token:result.name,model:'models/gemini-3.8-live'});
+  try{
+    response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_TTS_MODEL)}:streamGenerateContent?alt=sse`,{method:'POST',signal:AbortSignal.timeout(60000),headers:{'x-goog-api-key':GEMINI_API_KEY,'Content-Type':'application/json',Accept:'text/event-stream'},body:JSON.stringify({contents:[{role:'user',parts:[{text,speech_metadata:{style:'Clear, calm, conversational delivery.'}}]}],generationConfig:{responseModalities:['AUDIO'],speechConfig:{voiceConfig:{prebuiltVoiceConfig:{voiceName:voice}}}}})});
+  }catch{metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:estimatedInput.inputTokens,unit:'token',rateDivisor:1000000,tokensInput:estimatedInput.inputTokens,tokensOutput:0,estimated:true,status:'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});return sendError(res,503,'Could not connect to the speech service. Check the server connection.');}
+  if(!response.ok){const result=await response.json().catch(()=>({})),detail=String(result.error?.message||'').replace(/\s+/g,' ').slice(0,220);metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:estimatedInput.inputTokens,unit:'token',rateDivisor:1000000,tokensInput:estimatedInput.inputTokens,tokensOutput:0,estimated:true,status:'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});return sendError(res,503,`Speech service returned HTTP ${response.status}.${detail?' '+detail:' Check the TTS model and API quota.'}`);}
+  if(!response.body)return sendError(res,503,'Speech service returned no audio stream.');
+  const reader=response.body.getReader(),decoder=new TextDecoder();let pending='',headersSent=false,hasAudio=false,usageMeta={};
+  const writeEvent=eventText=>{const data=eventText.split(/\r?\n/).filter(line=>line.startsWith('data:')).map(line=>line.slice(5).trim()).join('\n');if(!data||data==='[DONE]')return;let result;try{result=JSON.parse(data);}catch{return;}usageMeta=result.usageMetadata||usageMeta;for(const part of result.candidates?.[0]?.content?.parts||[]){const encoded=part.inlineData?.data;if(!encoded)continue;const audio=Buffer.from(encoded,'base64');if(!audio.length)continue;if(!headersSent){headersSent=true;res.status(200).set({'Content-Type':'audio/L16; rate=24000; channels=1','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.flushHeaders?.();}hasAudio=true;res.write(audio);}};
+  try{while(true){const{done,value}=await reader.read();pending+=decoder.decode(value||new Uint8Array(),{stream:!done});let boundary;while((boundary=pending.search(/\r?\n\r?\n/))>=0){const event=pending.slice(0,boundary);const separator=pending.slice(boundary).match(/^\r?\n\r?\n/)[0];pending=pending.slice(boundary+separator.length);writeEvent(event);}if(done)break;}if(pending.trim())writeEvent(pending);const tokensInput=Number.isSafeInteger(usageMeta.promptTokenCount)?usageMeta.promptTokenCount:estimatedInput.inputTokens,tokensOutput=Number.isSafeInteger(usageMeta.candidatesTokenCount)?usageMeta.candidatesTokenCount:0,estimated=!Number.isSafeInteger(usageMeta.promptTokenCount)||!Number.isSafeInteger(usageMeta.candidatesTokenCount);metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:tokensInput+tokensOutput,unit:'token',rateDivisor:1000000,tokensInput,tokensOutput,estimated,status:hasAudio?'success':'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});if(!hasAudio)return sendError(res,503,'Speech service returned no audio. Check TTS model access and try again.');res.end();}catch(error){metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:estimatedInput.inputTokens,unit:'token',rateDivisor:1000000,tokensInput:estimatedInput.inputTokens,tokensOutput:0,estimated:true,status:'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});if(headersSent)res.destroy(error);else sendError(res,503,'Could not read the speech stream from the server.');}
 });
 
 function saveOrganizationSms(organizationId,entries,status='queued'){
