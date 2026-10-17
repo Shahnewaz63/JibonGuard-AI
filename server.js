@@ -1713,10 +1713,10 @@ function workerWelcomeText(worker) {
 async function sendWorkerWelcomeMessages(workers, organizationId) {
   if(!(process.env.TEXTBEE_API_KEY||process.env.TEXTBEE_DEV_API||'').trim())return {status:'not_configured',recipient_count:0};
   const entries=[];
-  for(const worker of workers){const timezone=worker.siteId?await timezoneForSite(worker.siteId,organizationId):'Asia/Dhaka';if(workerIsOnShift(worker,new Date(),timezone)){const phone=normalizePhone(worker.phone);if(phone)entries.push({phone,message:workerWelcomeText(worker),refId:worker.id});}}
+  for(const worker of workers){const phone=normalizePhone(worker.phone);if(phone)entries.push({phone,message:workerWelcomeText(worker),refId:worker.id});}
   let accepted=0;
   for(let start=0;start<entries.length;start+=50){const result=await sendTextBeeMessages(entries.slice(start,start+50),'জীবনগার্ড কর্মী নিবন্ধন',{organizationId,feature:'worker_registration',category:'routine'});if(result.accepted)accepted+=entries.slice(start,start+50).length;}
-  return {status:accepted===entries.length&&entries.length?'queued':accepted?'partial':entries.length?'failed':'outside_shift',recipient_count:accepted,skipped_outside_shift:workers.length-entries.length};
+  return {status:accepted===entries.length&&entries.length?'queued':accepted?'partial':'failed',recipient_count:accepted,failed_count:entries.length-accepted,skipped_invalid_phone:workers.length-entries.length};
 }
 async function sendWorkerWelcomeSms(worker, organizationId) { return sendWorkerWelcomeMessages([worker],organizationId); }
 async function syncEmergencySms({seed=false,incomingMessages=null}={}) {
