@@ -384,7 +384,7 @@ app.get('/api/admin/organizations',requireAdmin,adminPermission('organizations_r
   if(search){filters.push("(o.name LIKE ? ESCAPE '\\' OR o.phone LIKE ? ESCAPE '\\' OR o.id LIKE ? ESCAPE '\\')");args.push(like,like,like);}
   const where=`WHERE ${filters.join(' AND ')}`;
   const total=Number(db.prepare(`SELECT COUNT(*) AS n FROM organizations o ${where}`).get(...args).n||0);
-  const rows=db.prepare(`SELECT o.id,o.name,o.organization_type,o.phone,o.address,o.created_at,
+  const rows=db.prepare(`SELECT o.id,o.name,o.organization_type,o.phone,o.address,o.estimated_workers,o.created_at,
     (SELECT COUNT(*) FROM users u WHERE u.organization_id=o.id) AS users_count,
     (SELECT COUNT(*) FROM workers w WHERE w.organization_id=o.id) AS workers_count,
     (SELECT COUNT(*) FROM sites s WHERE s.organization_id=o.id) AS sites_count,
@@ -393,6 +393,21 @@ app.get('/api/admin/organizations',requireAdmin,adminPermission('organizations_r
     FROM organizations o ${where} ORDER BY o.created_at DESC LIMIT ? OFFSET ?`).all(...args,limit,offset);
   const items=rows.map(row=>({...row,phone:req.admin.role==='viewer'&&row.phone?`${row.phone.slice(0,3)}••••${row.phone.slice(-2)}`:row.phone}));
   res.set('Cache-Control','no-store').json({items,total,limit,offset});
+});
+app.patch('/api/admin/organizations/:id',adminCsrfAndOrigin,requireAdmin,adminPermission('organizations_edit'),(req,res)=>{
+  const organization=db.prepare("SELECT * FROM organizations o WHERE o.id=? AND NOT EXISTS (SELECT 1 FROM soft_delete_records sd WHERE sd.entity_type='organization' AND sd.entity_id=o.id)").get(req.params.id);
+  if(!organization)return sendError(res,404,'Organization not found.');
+  const name=String(req.body?.name||'').trim(),organizationType=String(req.body?.organization_type||'').trim(),phone=String(req.body?.phone||'').trim(),address=String(req.body?.address||'').trim(),estimatedWorkers=Number(req.body?.estimated_workers),reason=String(req.body?.reason||'').trim().slice(0,500);
+  if(!name||name.length>160)return sendError(res,400,'Enter an organization name between 1 and 160 characters.');
+  if(!organizationType||organizationType.length>80)return sendError(res,400,'Enter an organization type up to 80 characters.');
+  if(phone&&(!/^\+?[0-9][0-9 ()-]{5,23}$/.test(phone)||phone.replace(/\D/g,'').length<7||phone.replace(/\D/g,'').length>15))return sendError(res,400,'Enter a valid phone number with 7 to 15 digits.');
+  if(address.length>500)return sendError(res,400,'Address must be 500 characters or fewer.');
+  if(!Number.isSafeInteger(estimatedWorkers)||estimatedWorkers<0||estimatedWorkers>10000000)return sendError(res,400,'Estimated workers must be a whole number from 0 to 10000000.');
+  if(!reason)return sendError(res,422,'Include a reason for editing this organization.');
+  const before={name:organization.name,organization_type:organization.organization_type,phone:organization.phone,address:organization.address,estimated_workers:organization.estimated_workers},after={name,organization_type:organizationType,phone,address,estimated_workers:estimatedWorkers};
+  db.exec('BEGIN IMMEDIATE');
+  try{db.prepare('UPDATE organizations SET name=?,organization_type=?,phone=?,address=?,estimated_workers=? WHERE id=?').run(name,organizationType,phone,address,estimatedWorkers,organization.id);db.prepare('INSERT INTO admin_audit_log(id,admin_id,admin_role,action,target_type,target_id,ip,user_agent,before_json,after_json,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(token(18),req.admin.id,req.admin.role,'organization_updated','organization',organization.id,req.ip||'',String(req.get('user-agent')||'').slice(0,500),JSON.stringify(before),JSON.stringify(after),reason,now());db.exec('COMMIT');}catch(error){try{db.exec('ROLLBACK');}catch{}throw error;}
+  res.set('Cache-Control','no-store').json({organization:after});
 });
 app.delete('/api/admin/organizations/:id',adminCsrfAndOrigin,requireAdmin,adminPermission('organizations_hard_delete'),(req,res)=>{
   const organization=db.prepare("SELECT * FROM organizations o WHERE o.id=? AND NOT EXISTS (SELECT 1 FROM soft_delete_records sd WHERE sd.entity_type='organization' AND sd.entity_id=o.id)").get(req.params.id);
@@ -909,6 +924,19 @@ app.put('/api/account/organization', csrfAndOrigin, requireUser, (req, res) => {
   const result = db.prepare('UPDATE organizations SET name=? WHERE id=?').run(name, req.user.organization_id);
   if (!result.changes) return sendError(res, 404, 'Organization not found.');
   res.set('Cache-Control', 'no-store').json({ organization_name: name });
+});
+
+app.put('/api/account/phone', csrfAndOrigin, requireUser, async (req, res) => {
+  if (!rateAllowed(req, 'change-phone', 5, 900)) return sendError(res, 429, 'Too many phone-number changes. Try again later.');
+  const phone = typeof req.body.phone === 'string' ? req.body.phone.trim() : '';
+  const password = typeof req.body.password === 'string' ? req.body.password : '';
+  if (!/^\+?[0-9][0-9 ()-]{5,23}$/.test(phone) || phone.replace(/\D/g, '').length < 7 || phone.replace(/\D/g, '').length > 15) return sendError(res, 400, 'Enter a valid phone number with 7 to 15 digits.');
+  if (!password || password.length > 128) return sendError(res, 400, 'Enter your account password to change the phone number.');
+  const row = db.prepare('SELECT password_hash,password_salt FROM users WHERE id=?').get(req.user.id);
+  if (!row || !(await checkPassword(password, row.password_hash, row.password_salt))) return sendError(res, 401, 'Password did not match.');
+  db.prepare('UPDATE users SET phone=? WHERE id=?').run(phone, req.user.id);
+  db.prepare('UPDATE organizations SET phone=? WHERE id=?').run(phone, req.user.organization_id);
+  res.set('Cache-Control', 'no-store').json({ phone });
 });
 
 app.post('/api/account/change-password', csrfAndOrigin, requireUser, async (req, res) => {
