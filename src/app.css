@@ -673,3 +673,26 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
   .site-account-trigger{min-height:34px;padding-inline:9px;font-size:11px}
   .dash-title-actions .button{flex:1 1 calc(50% - 4px);padding-inline:7px;font-size:11px}
 }
+.brand-dashboard{min-width:0;gap:8px}
+.brand-dashboard .brand-mark{width:34px;height:34px;padding:2px;border-radius:10px}
+.brand-dashboard .brand-copy{gap:0}
+.brand-dashboard .brand-copy strong{font-size:17px}
+.brand-dashboard .brand-copy small{display:none}
+.sidebar>.brand-dashboard{padding:0 5px 21px}
+.dash-top>.brand-dashboard{margin-left:7px}
+.auth-intro{padding-left:clamp(48px,8vw,142px);padding-right:clamp(34px,6vw,96px)}
+.auth-intro>*{position:relative;z-index:1}
+.auth-intro ul li{display:flex;align-items:center;gap:10px;color:var(--ink);font-size:14px;font-weight:600;line-height:1.5}
+.auth-intro ul li>span{display:grid;place-items:center;width:23px;height:23px;flex:0 0 23px;border-radius:50%;background:color-mix(in srgb,var(--green) 14%,var(--surface));color:var(--green-strong);font-size:13px;font-weight:800}
+.pricing-home-section .pricing-intro{margin:0 auto 30px}
+.pricing-home-section{scroll-margin-top:78px}
+.pricing-home-section .pricing-intro h2{font:700 clamp(29px,4vw,40px)/1.15 'Poppins','DM Sans',sans-serif;letter-spacing:-.045em}
+.pricing-home-section .pricing-intro .eyebrow{color:var(--green-strong)}
+.pricing-home-section .pricing-footer{margin-top:30px}
+@media(max-width:900px) and (min-width:761px){.auth-intro{padding-left:clamp(28px,4vw,42px);padding-right:clamp(24px,3vw,34px)}}
+@media(max-width:760px){
+  .auth-intro{padding:20px 22px 18px}
+  .auth-intro ul li{font-size:13px}
+  .brand-dashboard .brand-mark{width:30px;height:30px}
+  .brand-dashboard .brand-copy strong{font-size:15px}
+}

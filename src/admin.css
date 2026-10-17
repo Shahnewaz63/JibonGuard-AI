@@ -45,7 +45,9 @@
 .admin-primary:hover:not(:disabled){background:#12624f}
 .admin-app button:disabled{cursor:not-allowed}
 .admin-app .admin-sidebar,.admin-app .admin-sidebar-bottom{background:var(--admin-surface)}
-.admin-app .admin-sidebar-bottom button{min-height:42px}
+.admin-app .admin-sidebar-bottom button{box-sizing:border-box;width:100%;min-height:42px}
+.admin-app .admin-sidebar-bottom button:last-child{min-height:44px;margin-top:5px;border-radius:8px;background:rgb(37,130,77);color:#fff;text-align:center;font-weight:700}
+.admin-app .admin-sidebar-bottom button:last-child:hover{background:rgb(37,130,77);filter:brightness(1.06)}
 .admin-plan-form>.admin-primary{justify-self:end;min-height:44px;min-width:190px;padding:0 18px;border-radius:8px}
 .admin-primary:hover:not(:disabled){background:rgb(37,130,77);filter:brightness(1.06)}
 .admin-app{width:100%;max-width:100vw;overflow-x:clip}
