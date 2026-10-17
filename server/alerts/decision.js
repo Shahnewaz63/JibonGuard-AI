@@ -69,7 +69,6 @@ export function validateAiOutput(value, allowedWorkerIds) {
 export function enforceGuardrails(decisions, context, history, config, now = new Date(), { aiControlled = false } = {}) {
   const allowedFloor = aiControlled ? [] : context.rule.floor;
   const floorTypes = new Set(allowedFloor.map(item => item.alert_type));
-  const consented = context.worker.consentStatus === 'consented' || Boolean(context.worker.consentAt);
   const timezone=context.weather.timezone||'UTC';
   const sentToday = Number(history.sentToday || 0);
   return decisions.flatMap(decision => {
@@ -78,7 +77,6 @@ export function enforceGuardrails(decisions, context, history, config, now = new
     const floor = Boolean(source.floor);
     let status = source.action, reason = source.reason;
     if (floorMatch) status = 'send_now';
-    if (!consented) return [{ ...source, action: 'skip', final_status: 'skipped', reason: 'Worker has not accepted alert consent.', floor }];
     if (source.action === 'skip') return [{ ...source, action: 'skip', final_status: 'skipped', reason, floor }];
     if(source.alert_type==='rain_clear'&&(context.state.lastAlertLevel!=='rain_2h'||Number(context.weather.currentPrecipitation)>0||context.weather.forecast?.slice(0,2).some(item=>item.rainProbability>=config.rainProbability)))return [{...source,action:'skip',final_status:'skipped',reason:'No recent rain alert is clear to close.',floor}];
     const targetTime=source.action==='schedule'?new Date(source.send_at):now,shiftStart=minutesOf(context.worker.shiftStart),shiftEnd=minutesOf(context.worker.shiftEnd),guardrailLevel=aiControlled?String(source.variables?.level||'').toUpperCase():(source.level||context.rule.riskLevel);

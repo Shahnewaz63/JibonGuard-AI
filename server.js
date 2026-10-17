@@ -751,7 +751,7 @@ app.put('/api/features', csrfAndOrigin, requireUser, (req, res) => {
 });
 app.get('/api/auth/me', requireUser, (req, res) => res.set('Cache-Control', 'no-store').json({ authenticated: true, user: req.user }));
 app.get('/api/workers', requireUser, (req, res) => {
-  const workers = db.prepare(`SELECT w.*,COALESCE((SELECT action FROM worker_consent_events e WHERE e.worker_id=w.id ORDER BY e.changed_at DESC,e.rowid DESC LIMIT 1),'pending') AS consent_status FROM workers w WHERE organization_id=? ORDER BY name COLLATE NOCASE`).all(req.user.organization_id);
+  const workers = db.prepare('SELECT * FROM workers WHERE organization_id=? ORDER BY name COLLATE NOCASE').all(req.user.organization_id);
   res.json({ workers });
 });
 app.get('/api/sites', requireUser, (req, res) => res.json({ sites: db.prepare('SELECT id,name,address,latitude,longitude,division,district,emergency_contact_phone,shade_available,water_available,rest_area,created_at,updated_at FROM sites WHERE organization_id=? ORDER BY name COLLATE NOCASE').all(req.user.organization_id) }));
@@ -787,16 +787,15 @@ app.get('/api/alerts/automated',requireUser,(req,res)=>{
 app.get('/api/dashboard/summary',requireUser,(req,res)=>{
   const org=req.user.organization_id,counts=db.prepare(`SELECT
     (SELECT COUNT(*) FROM workers WHERE organization_id=?) AS workers,
-    (SELECT COUNT(*) FROM workers WHERE organization_id=? AND consent_at IS NOT NULL) AS consented_workers,
     (SELECT COUNT(*) FROM sites WHERE organization_id=?) AS sites,
-    (SELECT COUNT(*) FROM break_logs WHERE organization_id=?) AS breaks`).get(org,org,org,org);
-  const workers=db.prepare('SELECT id,name,site,consent_at FROM workers WHERE organization_id=? ORDER BY name COLLATE NOCASE LIMIT 6').all(org);
+    (SELECT COUNT(*) FROM break_logs WHERE organization_id=?) AS breaks`).get(org,org,org);
+  const workers=db.prepare('SELECT id,name,site FROM workers WHERE organization_id=? ORDER BY name COLLATE NOCASE LIMIT 6').all(org);
   const breaks=db.prepare('SELECT id,title,site,break_date,break_time,source FROM break_logs WHERE organization_id=? ORDER BY break_date DESC,break_time DESC,created_at DESC LIMIT 5').all(org);
   const today=new Date();today.setHours(0,0,0,0);const cutoff=Math.floor(today.getTime()/1000);
   const alertCounts=db.prepare("SELECT SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) AS skipped,SUM(CASE WHEN status='scheduled' THEN 1 ELSE 0 END) AS scheduled FROM automated_alerts WHERE organization_id=? AND created_at>=?").get(org,cutoff);
   const delayed=[...ALERT_WEATHER_STATUS.entries()].some(([key,value])=>key.startsWith(`${org}:`)&&value.delayed);
   const config=alertSettingsFor(org);
-  res.set('Cache-Control','no-store').json({user:req.user,workers,breaks,counts:{workers:Number(counts.workers||0),consentedWorkers:Number(counts.consented_workers||0),sites:Number(counts.sites||0),breaks:Number(counts.breaks||0)},automationSettings:config,automationAvailable:ALERT_CONFIG.enabled,aiAvailable:Boolean(ALERT_CONFIG.aiEnabled&&GEMINI_API_KEY),automationInfo:{items:[],counts:{sent:alertCounts.sent||0,skipped:alertCounts.skipped||0,scheduled:alertCounts.scheduled||0},weatherDelayed:delayed}});
+  res.set('Cache-Control','no-store').json({user:req.user,workers,breaks,counts:{workers:Number(counts.workers||0),sites:Number(counts.sites||0),breaks:Number(counts.breaks||0)},automationSettings:config,automationAvailable:ALERT_CONFIG.enabled,aiAvailable:Boolean(ALERT_CONFIG.aiEnabled&&GEMINI_API_KEY),automationInfo:{items:[],counts:{sent:alertCounts.sent||0,skipped:alertCounts.skipped||0,scheduled:alertCounts.scheduled||0},weatherDelayed:delayed}});
 });
 app.post('/api/alerts/simulate',csrfAndOrigin,requireUser,requirePlanFeature('simulator'),async(req,res)=>{
   const siteId=String(req.body.site_id||''),temperatureC=Number(req.body.temperature_c),rainEtaRaw=req.body.rain_eta_minutes,timeOfDay=String(req.body.time_of_day||'12:00');
@@ -829,13 +828,9 @@ app.get('/api/sms', requireUser, async (req, res) => {
     const failedResponse=[sentResponse,receivedResponse].find(response=>!response.ok);
     if (failedResponse) return sendError(res, failedResponse.status===401?401:502, failedResponse.status===401?'TextBee rejected the API key. Check TEXTBEE_API_KEY.':`TextBee message history request failed (HTTP ${failedResponse.status}).`);
     const [sentResult,receivedResult]=await Promise.all([sentResponse.json(),receivedResponse.json()]);
-    const workers = db.prepare('SELECT phone FROM workers WHERE organization_id=?').all(req.user.organization_id);
-    const phoneKeys = value => {
-      const ascii=String(value||'').replace(/[\u09e6-\u09ef]/g,digit=>String(digit.charCodeAt(0)-0x09e6));
-      const digits=ascii.replace(/\D/g,'');
-      return [normalizePhone(ascii),digits.length>=10?digits.slice(-10):null].filter(Boolean);
-    };
-    const numbers = new Set(workers.flatMap(row=>phoneKeys(row.phone)));
+    const workers = db.prepare('SELECT organization_id,phone FROM workers').all(),phoneOwners=new Map();
+    for(const worker of workers){const phone=normalizePhone(worker.phone);if(!phone)continue;if(!phoneOwners.has(phone))phoneOwners.set(phone,new Set());phoneOwners.get(phone).add(worker.organization_id);}
+    const numbers = new Set(workers.filter(worker=>worker.organization_id===req.user.organization_id).map(worker=>normalizePhone(worker.phone)).filter(phone=>phone&&phoneOwners.get(phone)?.size===1));
     const hiddenMessageIds=new Set(db.prepare('SELECT id FROM sms_deleted_messages WHERE organization_id=?').all(req.user.organization_id).map(row=>row.id));
     const sentMessages=(Array.isArray(sentResult.data)?sentResult.data:[]).map(item=>({...item,direction:'sent'}));
     const receivedMessages=(Array.isArray(receivedResult.data)?receivedResult.data:[]).map(item=>({...item,direction:'received'}));
@@ -843,7 +838,7 @@ app.get('/api/sms', requireUser, async (req, res) => {
     for (const item of [...sentMessages,...receivedMessages]) {
       const sender=String(item.sender||''), recipient=String(item.recipient||'');
       const direction=item.direction;
-      const matched=phoneKeys(direction==='received'?sender:recipient).some(phone=>numbers.has(phone));
+      const matched=smsPhoneKeys(direction==='received'?sender:recipient).some(phone=>numbers.has(phone));
       if (!matched || !item._id || !['sent','received'].includes(direction) || hiddenMessageIds.has(String(item._id))) continue;
       const stamp = direction==='received'?(item.receivedAt||item.createdAt):(item.sentAt||item.requestedAt||item.createdAt);
       incomingById.set(String(item._id),{id:String(item._id),organization_id:req.user.organization_id,direction,sender,recipient,message:String(item.message||''),status:String(item.status||'unknown'),device_name:String(item.device?.name||''),message_at:stamp||new Date().toISOString(),created_at:now()});
@@ -859,20 +854,19 @@ app.get('/api/sms', requireUser, async (req, res) => {
     for(let offset=0;offset<incoming.length;offset+=80)upsertBatch(incoming.slice(offset,offset+80));
     const newReceived=incoming.filter(row=>row.direction==='received'&&!existingIds.has(row.id));
     for(const row of newReceived){const emergency=Boolean(emergencySmsCode(row.message));metering.recordUsage({organizationId:req.user.organization_id,eventType:'sms_inbound',provider:'textbee',feature:emergency?'emergency_code':'inbound',quantity:1,unit:'message',status:row.status,category:emergency?'safety':'routine',metadata:{segments:calculateSmsSegments(row.message).segments},refType:'provider_message',refId:row.id,idempotencyKey:`sms-in:${req.user.organization_id}:${row.id}`});}
-    const synced=incoming.length,receivedMatched=incoming.filter(row=>row.direction==='received').length;
+    const synced=incoming.length,receivedMatched=incoming.filter(row=>row.direction==='received').length,receivedForOrg=receivedMessages.filter(item=>smsPhoneKeys(item.sender).some(phone=>numbers.has(phone))).length;
     const messages=localMessages();
-    res.set('Cache-Control','no-store').json({messages,configured:true,synced,receivedFromTextbee:receivedMessages.length,receivedMatched});
+    res.set('Cache-Control','no-store').json({messages,configured:true,synced,receivedFromTextbee:receivedForOrg,receivedMatched});
   } catch { return sendError(res,502,'Could not reach TextBee. Try syncing again shortly.'); }
 });
 app.get('/api/privacy/export', requireUser, (req, res) => {
   const organization = db.prepare('SELECT name,organization_type,phone,address,estimated_workers,created_at FROM organizations WHERE id=?').get(req.user.organization_id);
   const privacy = db.prepare('SELECT privacy_notice_version,privacy_consent_at,created_at FROM users WHERE id=?').get(req.user.id);
-  const workers = db.prepare('SELECT id,name,phone,site,site_id,job_type,workload,risk_level,shift_start,shift_end,age_group,has_personal_risk_factor,outdoor_minutes,last_break,consent_at,consent_method,created_at,updated_at FROM workers WHERE organization_id=? ORDER BY name COLLATE NOCASE').all(req.user.organization_id);
+  const workers = db.prepare('SELECT id,name,phone,site,site_id,job_type,workload,risk_level,shift_start,shift_end,age_group,has_personal_risk_factor,outdoor_minutes,last_break,created_at,updated_at FROM workers WHERE organization_id=? ORDER BY name COLLATE NOCASE').all(req.user.organization_id);
   const sites = db.prepare('SELECT id,name,address,latitude,longitude,shade_available,water_available,rest_area,created_at,updated_at FROM sites WHERE organization_id=? ORDER BY name COLLATE NOCASE').all(req.user.organization_id);
   const break_logs = db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,workload_levels,created_at FROM break_logs WHERE organization_id=? ORDER BY break_date DESC,break_time DESC').all(req.user.organization_id);
   const sms_messages = db.prepare('SELECT id,direction,sender,recipient,message,status,device_name,message_at FROM sms_messages WHERE organization_id=? ORDER BY message_at DESC').all(req.user.organization_id);
-  const worker_consent_events = db.prepare('SELECT worker_id,action,method,note,changed_by,changed_at FROM worker_consent_events WHERE organization_id=? ORDER BY changed_at DESC,rowid DESC').all(req.user.organization_id);
-  res.set('Content-Disposition', 'attachment; filename=jibonguard-account-data.json').json({ account: req.user, organization, workers, sites, worker_consent_events, break_logs, sms_messages, privacy, exported_at: new Date().toISOString() });
+  res.set('Content-Disposition', 'attachment; filename=jibonguard-account-data.json').json({ account: req.user, organization, workers, sites, break_logs, sms_messages, privacy, exported_at: new Date().toISOString() });
 });
 
 app.put('/api/account/organization', csrfAndOrigin, requireUser, (req, res) => {
@@ -1417,7 +1411,7 @@ app.post('/api/ai/chat', csrfAndOrigin, requireUser, async (req,res) => {
       contents.at(-1).parts.push({text:`Attached file: ${name}`},{inline_data:{mime_type:mimeType,data}});
     }
   }
-  const instruction="You are JibonGuard's in-app assistant. Help organization administrators understand the dashboard, site weather, worker consent, break logs, and practical heat and weather safety. Be concise and clear. Do not claim to see private organization records or live weather unless supplied in the conversation. Never give a medical diagnosis or claim an emergency is safe; direct urgent situations to local emergency services and official instructions. Do not ask for passwords, API keys, or personal worker details.";
+  const instruction="You are JibonGuard's in-app assistant. Help organization administrators understand the dashboard, site weather, worker teams, break logs, and practical heat and weather safety. Be concise and clear. Do not claim to see private organization records or live weather unless supplied in the conversation. Never give a medical diagnosis or claim an emergency is safe; direct urgent situations to local emergency services and official instructions. Do not ask for passwords, API keys, or personal worker details.";
   try { res.json({ reply:await geminiGenerate(contents,instruction,false,{organizationId:req.user.organization_id,feature:'chat'}) }); } catch(error) { sendError(res,503,error.message); }
 });
 // Gemini voice is temporarily available to every signed-in account as a demo.
@@ -1456,7 +1450,7 @@ app.post('/api/ai/live-token', csrfAndOrigin, requireUser, async (req,res) => {
 });
 
 async function sendTextBeeBreakSms(recipients, record, usageContext={}) {
-  if (!recipients.length) return { status:'no_recipients',recipient_count:0,message:'No consented workers with usable phone numbers are assigned to this site.' };
+  if (!recipients.length) return { status:'no_recipients',recipient_count:0,message:'No workers with usable phone numbers are assigned to this site.' };
   const apiKey=(process.env.TEXTBEE_API_KEY||process.env.TEXTBEE_DEV_API||'').trim(), subscription=(process.env.TEXTBEE_SIM_SUBSCRIPTION_ID||process.env.SIM_SUBSCRIPTION_ID||'').trim(), base=(process.env.TEXTBEE_BASE_URL||'https://api.textbee.dev/api/v1').replace(/\/$/,'');
   if (!apiKey) return {status:'not_configured',recipient_count:0,message:'Break saved, but SMS is not configured. Set TEXTBEE_API_KEY in JibonGuard AI/.env.'};
   if (subscription && !/^\d+$/.test(subscription)) return {status:'not_configured',recipient_count:0,message:'Break saved, but the configured TextBee SIM ID is invalid. Clear TEXTBEE_SIM_SUBSCRIPTION_ID to use the device default SIM.'};
@@ -1513,9 +1507,9 @@ async function dispatchScheduledBreakSms() {
       const firstWorker=rows.map(row=>row.worker_id&&db.prepare('SELECT site_id FROM workers WHERE id=? AND organization_id=?').get(row.worker_id,item.organization_id)).find(Boolean),timezone=firstWorker?await timezoneForSite(firstWorker.site_id,item.organization_id):'Asia/Dhaka';
       const recipients=[];
       for(const row of rows){
-        const worker=row.worker_id?db.prepare('SELECT id,name,phone,consent_at,workload,shift_start,shift_end FROM workers WHERE id=? AND organization_id=?').get(row.worker_id,item.organization_id):null;
+        const worker=row.worker_id?db.prepare('SELECT id,name,phone,workload,shift_start,shift_end FROM workers WHERE id=? AND organization_id=?').get(row.worker_id,item.organization_id):null;
         let error='';
-        if(!worker||!worker.consent_at)error='Worker consent is not active at send time.';
+        if(!worker)error='Worker record is no longer available.';
         else if(normalizePhone(worker.phone)!==normalizePhone(row.recipient))error='Worker phone changed before send.';
         else if(workloadLevels.length&&!workloadLevels.includes(worker.workload))error='Worker workload is no longer selected for this alert.';
         else if(!workerIsOnShift(worker,new Date(),timezone))error='Worker is outside their shift at send time.';
@@ -1544,8 +1538,7 @@ const EMERGENCY_CODES = {
 };
 function smsPhoneKeys(value) {
   const ascii=String(value||'').replace(/[\u09e6-\u09ef]/g,digit=>String(digit.charCodeAt(0)-0x09e6));
-  const digits=ascii.replace(/\D/g,'');
-  return [...new Set([normalizePhone(ascii),digits.length>=10?digits.slice(-10):null].filter(Boolean))];
+  return [...new Set([normalizePhone(ascii)].filter(Boolean))];
 }
 function emergencySmsCode(message) {
   const value=toAsciiDigits(String(message||'').trim());
@@ -1562,21 +1555,21 @@ async function buildAlertContexts(site,organizationId,config,{simulation=null}={
   const nowDate=new Date();if(simulation?.timeOfDay){const [hour,minute]=simulation.timeOfDay.split(':').map(Number);nowDate.setHours(hour,minute,0,0);}const currentStamp=Date.parse(`${String(current.time||'').slice(0,16)}:00Z`),rainForecast=slots.map(slot=>({slot,etaMinutes:Math.max(0,Math.round((Date.parse(`${slot.time}:00Z`)-currentStamp)/60000))})).find(({slot,etaMinutes})=>etaMinutes<=360&&(slot.rainProbability>=config.rainProbability||slot.precipitation>=0.2||[51,53,55,61,63,65,80,81,82].includes(slot.weatherCode)));
   const lightning=slots.some(slot=>[95,96,99].includes(slot.weatherCode));
   const weather={temperatureC:simulation?simulation.temperatureC:Number(current.temperature_2m),apparentC:simulation?simulation.temperatureC:Number(current.apparent_temperature),wbgtC:null,humidity:Number(current.relative_humidity_2m),solar:slots[0]?.solar??0,windSpeed:Number(current.wind_speed_10m),currentPrecipitation:simulation?0:Number(current.precipitation)||0,weatherCode:simulation?0:Number(current.weather_code),lightning, rainProbability:simulation?(simulation.rainEtaMinutes!=null&&simulation.rainEtaMinutes<=config.rainLeadMinutes?config.rainProbability:0):(rainForecast?.slot.rainProbability||0),rainEtaMinutes:simulation?simulation.rainEtaMinutes:(rainForecast?.etaMinutes??null),expectedRainStart:simulation?.rainEtaMinutes==null?null:rainForecast?.slot.time||null,forecast:slots,dataAgeMinutes:age,weatherDelayed:delayed,timezone:raw.timezone||'UTC',officialHeatwave:false};
-  const workers=db.prepare(`SELECT w.*,COALESCE((SELECT action FROM worker_consent_events e WHERE e.worker_id=w.id ORDER BY e.changed_at DESC,e.rowid DESC LIMIT 1),'pending') AS consent_status FROM workers w WHERE w.organization_id=? AND w.site_id=? ORDER BY w.id`).all(organizationId,site.id);
+  const workers=db.prepare('SELECT * FROM workers WHERE organization_id=? AND site_id=? ORDER BY id').all(organizationId,site.id);
   return workers.map(worker=>{
     const lastBreak=worker.last_break?new Date(worker.last_break):null,continuousHours=lastBreak&&!Number.isNaN(lastBreak.getTime())?Math.max(0,(nowDate-lastBreak)/3600000):Number(worker.outdoor_minutes||0)/60;
     const lastAlerts=db.prepare('SELECT alert_type,MAX(COALESCE(sent_at,scheduled_at)) AS at FROM automated_alerts WHERE organization_id=? AND worker_id=? AND status IN (\'sent\',\'scheduled\',\'queued\') GROUP BY alert_type ORDER BY at DESC').all(organizationId,worker.id);
     const lastByType=Object.fromEntries(lastAlerts.filter(item=>item.at).map(item=>[item.alert_type,new Date(item.at*1000).toISOString()]));
     const today=new Date();today.setHours(0,0,0,0);const sentToday=db.prepare("SELECT COUNT(*) AS n FROM automated_alerts WHERE organization_id=? AND worker_id=? AND created_at>=? AND status IN ('sent','queued','scheduled')").get(organizationId,worker.id,Math.floor(today.getTime()/1000)).n;
-    const context={worker:{id:worker.id,jobType:worker.job_type,workload:worker.workload,riskLevel:worker.risk_level,consentStatus:worker.consent_status,consentAt:worker.consent_at,shiftStart:worker.shift_start,shiftEnd:worker.shift_end,newWorker:worker.created_at>now()-14*86400,ageGroup:worker.age_group,hasPersonalRiskFactor:Boolean(worker.has_personal_risk_factor),continuousHours},state:{continuousHours,totalHoursToday:Number(worker.outdoor_minutes||0)/60,lastBreak:worker.last_break||null,lastAlertLevel:lastAlerts[0]?.alert_type||null,lastAlertTime:lastAlerts[0]?.at?new Date(lastAlerts[0].at*1000).toISOString():null,alertsSentToday:sentToday,lastAcknowledgement:null},site:{id:site.id,shadeAvailable:Boolean(site.shade_available),waterAvailable:Boolean(site.water_available),restArea:Boolean(site.rest_area)},weather:{...weather},now:nowDate};
+    const context={worker:{id:worker.id,jobType:worker.job_type,workload:worker.workload,riskLevel:worker.risk_level,shiftStart:worker.shift_start,shiftEnd:worker.shift_end,newWorker:worker.created_at>now()-14*86400,ageGroup:worker.age_group,hasPersonalRiskFactor:Boolean(worker.has_personal_risk_factor),continuousHours},state:{continuousHours,totalHoursToday:Number(worker.outdoor_minutes||0)/60,lastBreak:worker.last_break||null,lastAlertLevel:lastAlerts[0]?.alert_type||null,lastAlertTime:lastAlerts[0]?.at?new Date(lastAlerts[0].at*1000).toISOString():null,alertsSentToday:sentToday,lastAcknowledgement:null},site:{id:site.id,shadeAvailable:Boolean(site.shade_available),waterAvailable:Boolean(site.water_available),restArea:Boolean(site.rest_area)},weather:{...weather},now:nowDate};
     const cooldownRemaining=Math.max(0,config.cooldownMinutes-Math.min(config.cooldownMinutes,...Object.values(lastByType).map(value=>Math.max(0,(nowDate.getTime()-Date.parse(value))/60000)))),clock=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:weather.timezone,hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(nowDate).map(part=>[part.type,part.value])),clockMinutes=Number(clock.hour)*60+Number(clock.minute),clockMinute=value=>{const [h,m]=String(value).split(':').map(Number);return h*60+m;},quietStart=clockMinute(config.quietHours.start),quietEnd=clockMinute(config.quietHours.end);
     context.limits={cooldownRemaining,dailyCapRemaining:Math.max(0,config.dailyCap-sentToday),quietHours:quietStart<quietEnd?clockMinutes>=quietStart&&clockMinutes<quietEnd:clockMinutes>=quietStart||clockMinutes<quietEnd};return context;
   });
 }
 function alertEventKey(decision,context){const weather=context.weather;if(decision.alert_type==='rain_2h')return `rain:${context.site.id}:${weather.expectedRainStart||Math.floor(now()/3600)}`;if(decision.alert_type==='lightning')return `lightning:${context.site.id}:${weather.expectedRainStart||Math.floor(now()/3600)}`;if(['heat_nudge','shade_break'].includes(decision.alert_type))return `${decision.alert_type}:${context.site.id}:${new Date().toISOString().slice(0,10)}`;return `${decision.alert_type}:${context.site.id}:${Math.floor(now()/1800)}`;}
 async function dispatchAlertQueue(){
-  const queued=db.prepare("SELECT a.*,w.phone,w.consent_at,w.shift_start,w.shift_end FROM automated_alerts a JOIN workers w ON w.id=a.worker_id WHERE a.status IN ('queued','scheduled') AND a.scheduled_at<=? ORDER BY a.scheduled_at LIMIT 200").all(now()),ready=[];
-  for(const row of queued){if(!row.consent_at){db.prepare("UPDATE automated_alerts SET status='skipped',reason='Consent withdrawn before dispatch.' WHERE id=?").run(row.id);continue;}let timezone='Asia/Dhaka';try{timezone=JSON.parse(row.input_context).weather?.timezone||timezone;}catch{}if(!workerIsOnShift(row,new Date(),timezone)){db.prepare("UPDATE automated_alerts SET status='skipped',reason='Outside the worker shift at send time.' WHERE id=?").run(row.id);continue;}ready.push({...row,phone:normalizePhone(row.phone)});}
+  const queued=db.prepare("SELECT a.*,w.phone,w.shift_start,w.shift_end FROM automated_alerts a JOIN workers w ON w.id=a.worker_id WHERE a.status IN ('queued','scheduled') AND a.scheduled_at<=? ORDER BY a.scheduled_at LIMIT 200").all(now()),ready=[];
+  for(const row of queued){let timezone='Asia/Dhaka';try{timezone=JSON.parse(row.input_context).weather?.timezone||timezone;}catch{}if(!workerIsOnShift(row,new Date(),timezone)){db.prepare("UPDATE automated_alerts SET status='skipped',reason='Outside the worker shift at send time.' WHERE id=?").run(row.id);continue;}ready.push({...row,phone:normalizePhone(row.phone)});}
   const sendable=[];
   for(const row of ready){if(!row.phone)continue;let message=row.message;if(row.alert_type==='rain_2h'&&!row.floor){let eta=null;try{eta=Number(JSON.parse(row.input_context).weather?.rainEtaMinutes);}catch{}const elapsed=Math.max(0,(now()-row.created_at)/60);if(!Number.isFinite(eta)||elapsed>=eta){db.prepare("UPDATE automated_alerts SET status='skipped',reason='Rain forecast window passed before dispatch.' WHERE id=?").run(row.id);continue;}message=renderAlertTemplate('rain_2h',{minutes:Math.max(1,Math.round(eta-elapsed))});db.prepare('UPDATE automated_alerts SET message=? WHERE id=?').run(message,row.id);}sendable.push({...row,message});}
   const groups=await dispatchAlertGroups(sendable.map(row=>({id:row.id,phone:row.phone,message:row.message,channel:row.channel})),{smsSender:async entries=>{const refs=new Set(entries.flatMap(entry=>entry.referenceIds||[])),related=sendable.filter(row=>refs.has(row.id)),result=await sendTextBeeMessages(entries,entries[0]?.message||'JibonGuard safety alert',{organizationId:sendable[0]?.organization_id,siteId:sendable[0]?.site_id,feature:'ai_alert_automation',category:related.some(row=>row.floor||row.alert_type==='lightning')?'safety':'routine'});return {accepted:result.accepted};}});
@@ -1681,6 +1674,9 @@ async function syncEmergencySms({seed=false}={}) {
     const sender=String(item.sender||''),matches=[...new Set(smsPhoneKeys(sender).flatMap(key=>byPhone.get(key)||[]))];
     if(!matches.length)continue;
     const orgs=new Map();for(const worker of matches){if(!orgs.has(worker.organization_id))orgs.set(worker.organization_id,[]);orgs.get(worker.organization_id).push(worker);}
+    // TextBee credentials are shared at server level. Do not fan a shared
+    // phone number's incoming message into multiple organization accounts.
+    if(orgs.size!==1)continue;
     for(const [orgId,orgMatches] of orgs){
       const stamp=item.receivedAt||item.createdAt||new Date().toISOString();
       const inserted=insert.run(id,orgId,sender,String(item.message||''),String(item.status||'received'),String(item.device?.name||''),stamp,now());
@@ -1725,8 +1721,8 @@ function normalizeWorkloadLevels(value) {
   if(!Array.isArray(value)||!value.length||value.some(level=>!WORKLOAD_LEVELS.includes(level)))return null;
   return [...new Set(value)];
 }
-function consentedRecipients(org, siteId) {
-  const rows=db.prepare('SELECT id AS worker_id,name,phone,workload,shift_start,shift_end FROM workers WHERE organization_id=? AND site_id=? AND consent_at IS NOT NULL').all(org,siteId);
+function siteWorkersWithPhones(org, siteId) {
+  const rows=db.prepare('SELECT id AS worker_id,name,phone,workload,shift_start,shift_end FROM workers WHERE organization_id=? AND site_id=?').all(org,siteId);
   return rows.map(row=>({...row,phone:normalizePhone(row.phone)})).filter(row=>row.phone);
 }
 app.post('/api/breaks',csrfAndOrigin,requireUser,async(req,res)=>{
@@ -1737,9 +1733,9 @@ app.post('/api/breaks',csrfAndOrigin,requireUser,async(req,res)=>{
   if(validDate.getUTCFullYear()!==year||validDate.getUTCMonth()!==month-1||validDate.getUTCDate()!==day)return sendError(res,400,'Enter a valid break date.');
   const site=db.prepare('SELECT id,name,latitude,longitude FROM sites WHERE id=? AND organization_id=?').get(siteId,req.user.organization_id);
   if (!site) return sendError(res,400,'Choose a worksite from your saved Sites list.');
-  const siteConsented=consentedRecipients(req.user.organization_id,siteId),consented=siteConsented.filter(worker=>workloadLevels.includes(worker.workload));
+  const siteWorkers=siteWorkersWithPhones(req.user.organization_id,siteId),selectedWorkers=siteWorkers.filter(worker=>workloadLevels.includes(worker.workload));
   const timezone=status==='logged'?await timezoneForSite(siteId,req.user.organization_id):null;
-  const inShift=status==='logged'?consented.filter(worker=>workerIsOnShift(worker,new Date(),timezone)):consented;
+  const inShift=status==='logged'?selectedWorkers.filter(worker=>workerIsOnShift(worker,new Date(),timezone)):selectedWorkers;
   const recipients=[...new Map(inShift.map(worker=>[worker.phone,{...worker,refId:worker.id}])).values()];
   const workerCount=db.prepare('SELECT COUNT(*) AS count FROM workers WHERE organization_id=?').get(req.user.organization_id).count,id=token(12),stamp=now();
   const parsedSchedule=Number(d.scheduled_at), scheduledAt=Number.isFinite(parsedSchedule)&&parsedSchedule>0?Math.floor(parsedSchedule):Math.floor(new Date(`${date}T${time}:00`).getTime()/1000);
@@ -1749,11 +1745,11 @@ app.post('/api/breaks',csrfAndOrigin,requireUser,async(req,res)=>{
   const record=db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at FROM break_logs WHERE id=?').get(id);
   if(status==='scheduled'){
     const count=queueBreakSms(req.user.organization_id,id,recipients,{...record,scheduled_at:scheduledAt},scheduledAt);
-    return res.status(201).json({break:record,sms:{status:'scheduled',recipient_count:count,message:count?`SMS queued for ${date} at ${time} for selected workload levels.`:'Safety log scheduled; no consented workers in the selected workload levels are assigned to this site.'}});
+    return res.status(201).json({break:record,sms:{status:'scheduled',recipient_count:count,message:count?`SMS queued for ${date} at ${time} for selected workload levels.`:'Safety log scheduled; no workers with valid phone numbers at this worksite match the selected workload levels.'}});
   }
   const sms=await sendTextBeeBreakSms(recipients,{...record,scheduled_at:scheduledAt},{organizationId:req.user.organization_id,siteId:site.id,refPrefix:id,feature:alertType==='break'?'break_reminder':'safety_alert',category:alertType==='break'?'routine':'safety'});
-  if(siteConsented.length&&!consented.length)sms.message='Break saved, but no consented worker at this site matches the selected workload levels.';
-  else if(consented.length&&!recipients.length)sms.message='Break saved, but no selected worker is currently within their shift; no SMS was sent.';
+  if(siteWorkers.length&&!selectedWorkers.length)sms.message='Break saved, but no worker at this site matches the selected workload levels.';
+  else if(selectedWorkers.length&&!recipients.length)sms.message='Break saved, but no selected worker is currently within their shift; no SMS was sent.';
   res.status(201).json({break:record,sms});
 });
 app.put('/api/breaks',csrfAndOrigin,requireUser,async(req,res)=>{
@@ -1778,7 +1774,7 @@ app.put('/api/breaks',csrfAndOrigin,requireUser,async(req,res)=>{
     db.prepare("DELETE FROM scheduled_break_sms WHERE break_id=? AND organization_id=? AND status='scheduled'").run(id,req.user.organization_id);
     if(status==='scheduled'){
       const siteRow=db.prepare('SELECT id FROM sites WHERE id=? AND organization_id=?').get(siteId,req.user.organization_id);
-      const count=queueBreakSms(req.user.organization_id,id,consentedRecipients(req.user.organization_id,siteRow.id).filter(worker=>workloadLevels.includes(worker.workload)),{...record,scheduled_at:scheduledAt},scheduledAt);
+      const count=queueBreakSms(req.user.organization_id,id,siteWorkersWithPhones(req.user.organization_id,siteRow.id).filter(worker=>workloadLevels.includes(worker.workload)),{...record,scheduled_at:scheduledAt},scheduledAt);
       return res.json({break:record,sms:{status:'scheduled',recipient_count:count,message:`SMS queue updated for ${date} at ${time} for selected workload levels.`}});
     }
   }
@@ -1806,7 +1802,7 @@ app.post('/api/breaks/ai-schedule',csrfAndOrigin,requireUser,async(req,res)=>{
   }
   if (!pending.length) { if(errors.length)return sendError(res,502,errors[0]); return res.json({created:[],message:'AI found no suitable weather-based break to schedule, or weather/Gemini was unavailable.'}); }
   const created=[],sms=[];let already=0,workerCount=db.prepare('SELECT COUNT(*) AS count FROM workers WHERE organization_id=?').get(req.user.organization_id).count;
-  for(const item of pending){const duplicate=db.prepare("SELECT 1 FROM break_logs WHERE organization_id=? AND site=? AND break_date=? AND break_time=? AND source='ai' LIMIT 1").get(req.user.organization_id,item.site.name,item.date,item.time);if(duplicate){already++;continue;}const id=token(12);db.prepare(`INSERT INTO break_logs(id,organization_id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at) VALUES(?,?,?,?,?,?,?,?, 'scheduled','ai',?,?,?)`).run(id,req.user.organization_id,item.title,item.site.name,item.date,item.time,item.duration,workerCount,item.alert_type,item.rationale,now());const record=db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at FROM break_logs WHERE id=?').get(id);created.push(record);const at=Math.floor(new Date(`${item.date}T${item.time}:00Z`).getTime()/1000),count=queueBreakSms(req.user.organization_id,id,consentedRecipients(req.user.organization_id,item.site.id),{...record,scheduled_at:at},at);sms.push({status:'scheduled',recipient_count:count});}
+  for(const item of pending){const duplicate=db.prepare("SELECT 1 FROM break_logs WHERE organization_id=? AND site=? AND break_date=? AND break_time=? AND source='ai' LIMIT 1").get(req.user.organization_id,item.site.name,item.date,item.time);if(duplicate){already++;continue;}const id=token(12);db.prepare(`INSERT INTO break_logs(id,organization_id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at) VALUES(?,?,?,?,?,?,?,?, 'scheduled','ai',?,?,?)`).run(id,req.user.organization_id,item.title,item.site.name,item.date,item.time,item.duration,workerCount,item.alert_type,item.rationale,now());const record=db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at FROM break_logs WHERE id=?').get(id);created.push(record);const at=Math.floor(new Date(`${item.date}T${item.time}:00Z`).getTime()/1000),count=queueBreakSms(req.user.organization_id,id,siteWorkersWithPhones(req.user.organization_id,item.site.id),{...record,scheduled_at:at},at);sms.push({status:'scheduled',recipient_count:count});}
   const suffix=already?` ${already} matching AI log(s) already existed.`:'';
   res.status(201).json({created,sms,message:`AI scheduled ${created.length} weather-based break log(s); worker messages are queued for their break times.${suffix}`});
 });
