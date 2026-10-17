@@ -11,7 +11,7 @@ import { decideAlerts } from './server/alerts/index.js';
 import { renderAlertTemplate } from './server/alerts/templates.js';
 import { dispatchAlertGroups } from './server/alerts/gateway.js';
 import { runMigrations } from './server/db/migrations.js';
-import { applyPlanCatalogMigration } from './server/billing/planCatalog.js';
+import { applyBasicCapacityMigration, applyPlanCatalogMigration } from './server/billing/planCatalog.js';
 import { createJobRunner } from './server/jobs/runner.js';
 import { writeAdminAudit } from './server/billing/audit.js';
 import { hasPermission } from './server/billing/permissions.js';
@@ -110,6 +110,7 @@ for(const row of db.prepare('SELECT id,workload_levels FROM break_logs').all()){
 }
 if (!USING_POSTGRES) runMigrations(db, { databasePath: DB_PATH, development: !IS_PRODUCTION });
 applyPlanCatalogMigration(db);
+applyBasicCapacityMigration(db);
 const jobRunner = createJobRunner({ db });
 const metering = createMeteringService(db, { logger: console, defaultCurrency: 'BDT' });
 const USAGE_ROLLUP_INTERVAL_MS=Math.max(60000,Number(process.env.BILLING_ROLLUP_INTERVAL_MS||86400000));

@@ -6,7 +6,7 @@ const PLAN_FEATURES = {
 };
 
 const PLANS = [
-  { id:'sample-basic', name:'Basic', slug:'basic', description:'SMS safety alerts, AI safety tools, CSV imports, and core weather insights for small teams.', status:'active', sort:10, badge:'', monthly:99900, yearly:999000, limits:{workers:10,sites:2,users:2,sms_segments_month:300,ai_tokens_month:100000,voice_minutes_month:0,weather_checks_month:1000,retention_days:30}, features:PLAN_FEATURES.basic },
+  { id:'sample-basic', name:'Basic', slug:'basic', description:'SMS safety alerts, AI safety tools, CSV imports, and core weather insights for small teams.', status:'active', sort:10, badge:'', monthly:99900, yearly:999000, limits:{workers:30,sites:5,users:2,sms_segments_month:300,ai_tokens_month:100000,voice_minutes_month:0,weather_checks_month:1000,retention_days:30}, features:PLAN_FEATURES.basic },
   { id:'sample-pro', name:'Pro', slug:'pro', description:'Everything in Basic, plus AI speech and live browser voice tools with larger team, SMS, and token allowances.', status:'active', sort:20, badge:'Popular', monthly:249900, yearly:2499000, limits:{workers:50,sites:10,users:5,sms_segments_month:2000,ai_tokens_month:1000000,voice_minutes_month:120,weather_checks_month:10000,retention_days:90}, features:PLAN_FEATURES.pro },
   { id:'sample-promax', name:'Legacy', slug:'legacy', description:'High-capacity enterprise plan with expanded team limits and 25 million AI tokens per month. Contact us for custom pricing.', status:'active', sort:30, badge:'Enterprise', monthly:0, yearly:0, limits:{workers:5000,sites:500,users:100,sms_segments_month:100000,ai_tokens_month:25000000,voice_minutes_month:10000,weather_checks_month:1000000,retention_days:730}, features:PLAN_FEATURES.legacy },
 ];
@@ -55,4 +55,19 @@ export function applyPlanCatalogMigration(db, { now = () => Math.floor(Date.now(
     try { db.exec('ROLLBACK'); } catch {}
     throw error;
   }
+}
+
+export function applyBasicCapacityMigration(db,{now=()=>Math.floor(Date.now()/1000)}={}){
+  const version=10;
+  db.exec('CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at INTEGER NOT NULL)');
+  if(db.prepare('SELECT 1 FROM schema_migrations WHERE version=?').get(version))return false;
+  const stamp=now();
+  db.exec('BEGIN');
+  try{
+    db.prepare("UPDATE plan_limits SET value=30,unlimited=0,updated_at=? WHERE plan_id='sample-basic' AND limit_key='workers'").run(stamp);
+    db.prepare("UPDATE plan_limits SET value=5,unlimited=0,updated_at=? WHERE plan_id='sample-basic' AND limit_key='sites'").run(stamp);
+    db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)').run(version,'basic_plan_capacity_30_workers_5_sites',stamp);
+    db.exec('COMMIT');
+    return true;
+  }catch(error){try{db.exec('ROLLBACK');}catch{}throw error;}
 }

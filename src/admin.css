@@ -15,8 +15,8 @@
 .admin-auth-switch{display:block;margin:17px auto 0;padding:5px;border:0;background:transparent;color:var(--admin-brand);font:inherit;font-size:12px;font-weight:700;cursor:pointer}
 .admin-auth-switch:hover{text-decoration:underline}
 .admin-auth-switch:focus-visible{outline:2px solid var(--admin-brand);outline-offset:3px;border-radius:3px}
-:root{--admin-button:#16745e}
-:root[data-admin-theme=dark]{--admin-button:#16745e;color-scheme:dark}
+:root{--admin-button:rgb(37,130,77)}
+:root[data-admin-theme=dark]{--admin-button:rgb(37,130,77);color-scheme:dark}
 :root:has(.admin-app),:root:has(.admin-auth-wrap),:root:has(.admin-app) body,:root:has(.admin-auth-wrap) body{min-height:100%;background:var(--admin-bg)}
 .admin-app,.admin-auth-wrap{min-height:100vh;min-height:100dvh}
 .admin-app{background:var(--admin-bg)}
@@ -44,6 +44,13 @@
 .admin-primary{min-height:42px;border-radius:8px;background:var(--admin-button);color:#fff}
 .admin-primary:hover:not(:disabled){background:#12624f}
 .admin-app button:disabled{cursor:not-allowed}
+.admin-app .admin-sidebar,.admin-app .admin-sidebar-bottom{background:var(--admin-surface)}
+.admin-app .admin-sidebar-bottom button{min-height:42px}
+.admin-plan-form>.admin-primary{justify-self:end;min-height:44px;min-width:190px;padding:0 18px;border-radius:8px}
+.admin-primary:hover:not(:disabled){background:rgb(37,130,77);filter:brightness(1.06)}
+.admin-app{width:100%;max-width:100vw;overflow-x:clip}
+html:has(.admin-app),body:has(.admin-app),#root:has(.admin-app){overflow-x:hidden}
+@media(max-width:650px){.admin-plan-form>.admin-primary{justify-self:stretch;width:100%;min-width:0}}
 html[data-admin-theme=dark],html[data-admin-theme=dark] body,html[data-admin-theme=dark] #root{min-height:100%;background:#101815!important;color:#eef5f1;color-scheme:dark}
 html[data-admin-theme=light],html[data-admin-theme=light] body,html[data-admin-theme=light] #root{min-height:100%;background:#f4f7f6!important;color:#172c27;color-scheme:light}
 .admin-app{min-height:100vh;min-height:100dvh;align-items:stretch;background:var(--admin-bg)!important;color:var(--admin-text)}
