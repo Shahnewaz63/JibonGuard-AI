@@ -845,3 +845,47 @@ button:not(.mobile-menu):not(.editor-close):not(.chat-attach-button):not(.chat-m
   .theme-button{gap:4px;padding-inline:7px}
   .dash-title-actions .button{min-width:100%;}
 }
+
+/* Prevent worker rows and break records from overflowing phone screens. */
+@media(max-width:650px){
+  .worker-layout .panel-head{display:grid;grid-template-columns:minmax(0,1fr);align-items:start;gap:12px}
+  .worker-layout .worker-list-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%;gap:8px}
+  .worker-list-actions>.button,.worker-list-actions>.upload-button{width:100%;min-width:0;min-height:44px;padding-inline:8px;font-size:13px}
+  .worker-list-actions>.upload-button{grid-column:1/-1}
+  .worker-layout .table-tools{display:grid;grid-template-columns:minmax(0,1fr);gap:8px}
+  .worker-layout .table-tools input,.worker-layout .table-tools select{width:100%;min-width:0}
+  .worker-layout .table-scroll{overflow:visible}
+  .worker-layout .table-scroll table{display:block;width:100%;min-width:0;border-collapse:separate;border-spacing:0}
+  .worker-layout .table-scroll thead{display:none}
+  .worker-layout .table-scroll tbody{display:grid;gap:10px;width:100%}
+  .worker-layout .table-scroll tbody tr{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"worker select" "site site" "role role" "actions actions";gap:7px 10px;padding:13px;border:1px solid var(--line);border-radius:12px;background:var(--surface);box-shadow:0 3px 12px #173d2b08}
+  .worker-layout .table-scroll tbody td{display:flex;align-items:center;gap:8px;min-width:0;padding:0;border:0;background:transparent!important;overflow-wrap:anywhere}
+  .worker-layout .table-scroll tbody td::before{content:attr(data-label);flex:0 0 68px;color:var(--muted);font-size:12px;font-weight:700}
+  .worker-layout .table-scroll tbody td:first-child{grid-area:select;justify-self:end}
+  .worker-layout .table-scroll tbody td:first-child::before{display:none}
+  .worker-layout .table-scroll tbody td:nth-child(2){grid-area:worker;flex-wrap:wrap}
+  .worker-layout .table-scroll tbody td:nth-child(2)::before{display:none}
+  .worker-layout .table-scroll tbody td:nth-child(2) strong{font-size:15px}
+  .worker-layout .table-scroll tbody td:nth-child(3){grid-area:site}
+  .worker-layout .table-scroll tbody td:nth-child(4){grid-area:role;align-items:flex-start;flex-wrap:wrap}
+  .worker-layout .table-scroll tbody td:nth-child(4) small{flex-basis:calc(100% - 76px);margin-left:76px;font-size:12px!important}
+  .worker-layout .table-scroll tbody td:nth-child(5){grid-area:actions;display:grid;grid-template-columns:1fr 1fr;gap:8px;padding-top:8px;border-top:1px solid var(--line)}
+  .worker-layout .table-scroll tbody td:nth-child(5)::before{display:none}
+  .worker-layout .table-scroll .tiny-action{min-height:42px;margin:0}
+  .break-item{display:grid;grid-template-columns:20px 38px minmax(0,1fr);grid-template-areas:"select icon content" "status status action";align-items:center;gap:9px 10px;padding:13px 0}
+  .break-item>input[type=checkbox]{grid-area:select;justify-self:center}
+  .break-item>.break-icon{grid-area:icon;width:38px;height:38px}
+  .break-item>div{grid-area:content;min-width:0}
+  .break-item>div strong{font-size:15px;line-height:1.35;overflow-wrap:anywhere}
+  .break-item>div small{font-size:12px!important;line-height:1.45;overflow-wrap:anywhere}
+  .break-item>div p{font-size:13px!important;line-height:1.45}
+  .break-item>.badge{grid-area:status;justify-self:start;margin-left:30px;max-width:100%;white-space:normal}
+  .break-item>.tiny-action{grid-area:action;justify-self:end;min-height:40px}
+}
+@media(max-width:380px){
+  .worker-layout .table-scroll tbody tr{padding:11px}
+  .worker-layout .table-scroll tbody td::before{flex-basis:60px}
+  .worker-layout .table-scroll tbody td:nth-child(4) small{flex-basis:calc(100% - 68px);margin-left:68px}
+  .break-item{grid-template-columns:18px 34px minmax(0,1fr);gap:8px}
+  .break-item>.break-icon{width:34px;height:34px}
+}

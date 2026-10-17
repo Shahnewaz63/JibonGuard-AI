@@ -129,6 +129,9 @@ html[data-admin-theme=light],html[data-admin-theme=light] body,html[data-admin-t
   .admin-app{grid-template-columns:220px minmax(0,1fr)}
 }
 @media(max-width:650px){
+  .admin-app{display:block;min-height:100vh;min-height:100dvh;background:var(--admin-bg)!important}
+  .admin-sidebar{position:relative;top:auto;height:auto;min-height:0;padding:12px 14px;border-right:0;border-bottom:1px solid var(--admin-line)}
+  .admin-main{min-height:calc(100vh - 88px);min-height:calc(100dvh - 88px);padding:18px 13px 36px;background:var(--admin-bg)!important}
   .admin-sidebar nav button{min-height:44px;padding:10px 12px;font-size:14px}
   .admin-topbar{align-items:flex-start}
   .admin-topbar-actions{align-items:flex-end;gap:8px}

@@ -22,6 +22,7 @@ async function adminPost(url, body, method = 'POST') {
 }
 const money = (amount, currency = 'BDT') => formatMoney(Number(amount||0),currency,'en-BD');
 const majorAmount = (minor,currency='BDT') => (Number(minor||0)/(10**fractionDigits(currency))).toFixed(fractionDigits(currency));
+function readAdminTheme(){try{return localStorage.getItem('jg-admin-theme')==='dark';}catch{return false;}}
 
 export default function AdminApp() {
   const [admin,setAdmin]=useState(null);
@@ -29,10 +30,10 @@ export default function AdminApp() {
   const [email,setEmail]=useState(''),[password,setPassword]=useState(''),[privateKey,setPrivateKey]=useState(''),[authMode,setAuthMode]=useState('login'),[authNotice,setAuthNotice]=useState('');
   const [query,setQuery]=useState(''),[planForm,setPlanForm]=useState(false),[editingPlan,setEditingPlan]=useState(''),[plan,setPlan]=useState({name:'',slug:'',description:'',status:'draft',currency:'BDT',monthly_price:'0',yearly_price:'0',trial_days:0,badge_text:'',features:{}}),[passwordForm,setPasswordForm]=useState({current_password:'',new_password:'',confirm_password:''});
   const [rateForm,setRateForm]=useState({event_type:'sms_outbound',provider:'textbee',model:'',feature:'',unit:'segment',unit_cost_minor:0,unit_price_minor:0,currency:'BDT',reason:''});
-  const [dark,setDark]=useState(()=>localStorage.getItem('jg-admin-theme')==='dark');
+  const [dark,setDark]=useState(readAdminTheme);
   const navItems=[['overview','Overview'],['health','System health'],['analytics','Revenue & profit',['super_admin','finance','viewer']],['organizations','Organizations'],['plans','Plans & pricing',['super_admin','finance','viewer']],['subscriptions','Subscriptions',['super_admin','finance','viewer']],['invoices','Invoices',['super_admin','finance','viewer']],['payments','Payments',['super_admin','finance','viewer']],['expenses','Expenses',['super_admin','finance']],['usage','Usage'],['rates','Costs & rates',['super_admin','finance','viewer']],['settings','Billing settings',['super_admin']],['security','Account security'],['audit','Audit log',['super_admin','viewer']],['sessions','Sessions']].filter(([, ,roles])=>!roles||roles.includes(admin?.role));
 
-  useEffect(()=>{const theme=dark?'dark':'light';document.documentElement.dataset.adminTheme=theme;document.documentElement.dataset.theme=theme;localStorage.setItem('jg-admin-theme',theme);},[dark]);
+  useEffect(()=>{const theme=dark?'dark':'light';document.documentElement.dataset.adminTheme=theme;document.documentElement.dataset.theme=theme;try{localStorage.setItem('jg-admin-theme',theme);}catch{}},[dark]);
   useEffect(()=>{api('/api/admin/auth/me').then(result=>setAdmin(result.admin)).catch(err=>{if(err.status!==401)setError(err.message);});},[]);
   useEffect(()=>{
     if(!admin)return;
