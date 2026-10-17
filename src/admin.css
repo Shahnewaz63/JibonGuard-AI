@@ -31,3 +31,28 @@
 .admin-security-form>.admin-primary{grid-column:1/-1}
 .admin-app ::selection,.admin-auth-wrap ::selection{background:var(--admin-brand);color:#fff}
 @media(max-width:650px){.admin-sidebar{height:auto}.admin-plan-form>.admin-primary,.admin-rate-actions>.admin-primary,.admin-security-form>.admin-primary{grid-column:1/-1;width:100%;min-width:0}.admin-rate-actions{display:grid;grid-template-columns:1fr}.admin-security-form{grid-template-columns:1fr}}
+
+/* Match admin controls to the shared frontend typography and sizing. */
+.admin-app,.admin-auth-wrap{font-family:'DM Sans','Noto Sans Bengali','Hind Siliguri','Nirmala UI',system-ui,sans-serif}
+.admin-app button,.admin-auth-wrap button{font-family:inherit}
+.admin-app input,.admin-app textarea,.admin-app select,.admin-auth-card input{min-height:44px;border-radius:8px;color:var(--admin-text)}
+.admin-app textarea{line-height:1.55}
+.admin-app input::placeholder,.admin-app textarea::placeholder{color:var(--admin-muted);opacity:.85}
+.admin-app button:focus-visible,.admin-auth-wrap button:focus-visible,.admin-app a:focus-visible,.admin-auth-wrap a:focus-visible{outline:3px solid color-mix(in srgb,var(--admin-brand) 58%,transparent);outline-offset:2px}
+.admin-app .admin-table-wrap td strong{color:var(--admin-text);font-size:13px;font-weight:700}
+.admin-app .admin-table-wrap td{line-height:1.5}
+.admin-primary{min-height:42px;border-radius:8px;background:var(--admin-button);color:#fff}
+.admin-primary:hover:not(:disabled){background:#12624f}
+.admin-app button:disabled{cursor:not-allowed}
+html[data-admin-theme=dark],html[data-admin-theme=dark] body,html[data-admin-theme=dark] #root{min-height:100%;background:#101815!important;color:#eef5f1;color-scheme:dark}
+html[data-admin-theme=light],html[data-admin-theme=light] body,html[data-admin-theme=light] #root{min-height:100%;background:#f4f7f6!important;color:#172c27;color-scheme:light}
+.admin-app{min-height:100vh;min-height:100dvh;align-items:stretch;background:var(--admin-bg)!important;color:var(--admin-text)}
+.admin-main{min-height:100vh;min-height:100dvh;background:var(--admin-bg)}
+.admin-sidebar{height:100vh;height:100dvh;box-sizing:border-box;background:var(--admin-surface)}
+.admin-mark{background:var(--admin-button)}
+.admin-app .admin-table-wrap th{background:var(--admin-soft)!important;color:var(--admin-text)!important;border-bottom:1px solid var(--admin-line)}
+.admin-app .admin-table-wrap td{background:var(--admin-surface);color:var(--admin-muted);border-bottom-color:var(--admin-line)}
+.admin-app .admin-table-wrap td strong{color:var(--admin-text)!important;font-weight:750}
+.admin-app .admin-table-wrap tbody tr:hover td{background:var(--admin-soft)}
+.admin-app .admin-table-wrap td small{color:var(--admin-muted)}
+.admin-app input:focus,.admin-app textarea:focus,.admin-app select:focus{border-color:var(--admin-brand);outline:2px solid color-mix(in srgb,var(--admin-brand) 20%,transparent)}

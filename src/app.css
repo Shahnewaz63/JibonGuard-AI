@@ -580,3 +580,47 @@ html[data-theme=dark] .chat-user { background: #347b4b; color: #fff; }
 
 .sidebar-account-actions{display:none}
 @media(max-width:760px){.sidebar-account-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}.sidebar-account-actions a,.sidebar-account-actions button{min-height:40px;display:grid;place-items:center;padding:7px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--green);font:inherit;font-size:12px;font-weight:700}.sidebar-account-actions button{cursor:pointer}}
+
+/* Shared finishing pass: legible controls and theme-aware status colors. */
+body{background:var(--paper);color:var(--ink)}
+button,input,select,textarea{font-family:inherit}
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid color-mix(in srgb,var(--green) 58%,transparent);outline-offset:2px}
+.button,.theme-button,.upload-button,.tiny-action,.text-button{font-weight:650;transition:background-color .16s ease,border-color .16s ease,color .16s ease,box-shadow .16s ease,transform .16s ease}
+.button.primary{background:var(--green-strong);color:#fff}
+.button.primary:hover:not(:disabled){background:var(--green);box-shadow:0 3px 10px color-mix(in srgb,var(--green) 18%,transparent)}
+.button.secondary{border-color:var(--line);background:var(--surface);color:var(--ink)}
+.button.secondary:hover:not(:disabled){border-color:var(--green);background:var(--soft);color:var(--green-strong)}
+.button.danger,.danger-button{border:1px solid color-mix(in srgb,#b5473e 34%,var(--line));background:color-mix(in srgb,#b5473e 9%,var(--surface));color:color-mix(in srgb,#b5473e 78%,var(--ink))}
+.button.danger:hover:not(:disabled),.danger-button:hover:not(:disabled){border-color:#b5473e;background:color-mix(in srgb,#b5473e 16%,var(--surface))}
+.badge.good{background:color-mix(in srgb,#37a25a 15%,var(--surface));color:color-mix(in srgb,#238044 76%,var(--ink))}
+.badge.pending{background:color-mix(in srgb,#d79a31 16%,var(--surface));color:color-mix(in srgb,#946719 76%,var(--ink))}
+.badge.ai{background:color-mix(in srgb,#5482c4 15%,var(--surface));color:color-mix(in srgb,#3e66a2 78%,var(--ink))}
+.worker-list-actions{gap:8px}
+.worker-list-actions>.button,.worker-list-actions>.upload-button{box-sizing:border-box;min-height:40px;padding:0 13px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);font-size:12px;font-weight:650;line-height:1;}
+.worker-list-actions>.button:hover,.worker-list-actions>.upload-button:hover{border-color:var(--green);background:var(--soft);color:var(--green-strong)}
+.worker-list-actions>.upload-button{position:relative;display:inline-flex;align-items:center;justify-content:center;min-width:112px;overflow:hidden;cursor:pointer}
+.worker-list-actions>.upload-button input{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
+.table-scroll td strong{color:var(--ink);font-weight:700}
+.table-scroll td:nth-child(2) strong{font-size:var(--type-sm)}
+.table-scroll .tiny-action{min-height:36px;margin:1px 3px 1px 0;padding:0 10px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--green-strong);font-size:12px;font-weight:650;white-space:nowrap}
+.table-scroll .tiny-action:hover{border-color:var(--green);background:var(--soft)}
+.table-scroll .tiny-action.danger{border-color:color-mix(in srgb,#b5473e 32%,var(--line));background:color-mix(in srgb,#b5473e 8%,var(--surface));color:color-mix(in srgb,#b5473e 80%,var(--ink))}
+.table-scroll .tiny-action.danger:hover{border-color:#b5473e;background:color-mix(in srgb,#b5473e 15%,var(--surface))}
+.table-scroll td{color:var(--muted)}
+.table-scroll th{color:var(--muted)}
+.table-scroll tbody tr:hover td{background:var(--wash)}
+.table-scroll table{border-color:var(--line)}
+.table-scroll .table-avatar{background:var(--soft);color:var(--green-strong)}
+.panel,.metric,.account-card,.site-card,.risk-card{background:var(--surface);border-color:var(--line)}
+.table-tools input,.table-tools select,.field input,.field select,.form-stack input,.form-stack select,.form-stack textarea,.chat-window textarea{min-height:44px;border-radius:8px;background:var(--surface);color:var(--ink)}
+.field input::placeholder,.table-tools input::placeholder,.form-stack textarea::placeholder,.chat-window textarea::placeholder{color:var(--muted);opacity:.85}
+.field input:disabled,.field select:disabled,.form-stack input:disabled,.form-stack select:disabled,.form-stack textarea:disabled{background:var(--wash);color:var(--muted);cursor:not-allowed}
+.chat-user{background:color-mix(in srgb,var(--green) 17%,var(--surface));color:var(--ink)}
+.risk-label{background:color-mix(in srgb,#d79a31 17%,var(--surface));color:color-mix(in srgb,#946719 82%,var(--ink))}
+.risk-label.risk-high{background:color-mix(in srgb,#d66c49 17%,var(--surface));color:color-mix(in srgb,#ad4b32 82%,var(--ink))}
+@media(max-width:760px){
+  .worker-list-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%;gap:8px}
+  .worker-list-actions>.button,.worker-list-actions>.upload-button{width:100%;min-width:0;min-height:42px;padding-inline:8px;font-size:12px}
+  .worker-list-actions>.upload-button{grid-column:span 2}
+  .table-scroll .tiny-action{min-height:38px;padding-inline:10px}
+}
