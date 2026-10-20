@@ -129,11 +129,19 @@ for (const row of db.prepare("SELECT DISTINCT organization_id,site FROM workers 
 }
 
 const WEATHER_CACHE = new Map();
+const OPEN_METEO_CACHE = new Map();
+const OPEN_METEO_IN_FLIGHT = new Map();
 const GEO_CACHE = new Map();
 const RATE_LIMITS = new Map();
 const ALERT_WEATHER_CACHE = new Map();
 const ALERT_WEATHER_STATUS = new Map();
 const SITE_TIMEZONES = new Map();
+function clearSiteCaches(siteId){
+  for(const key of WEATHER_CACHE.keys())if(key.startsWith(`${siteId}:`))WEATHER_CACHE.delete(key);
+  ALERT_WEATHER_CACHE.delete(siteId);SITE_TIMEZONES.delete(siteId);
+  for(const key of ALERT_WEATHER_STATUS.keys())if(key.endsWith(`:${siteId}`))ALERT_WEATHER_STATUS.delete(key);
+}
+let lastRateLimitCleanupAt=0,rateLimitCalls=0;
 const hashToken = value => SESSION_SECRET ? createHmac('sha256', SESSION_SECRET).update(value).digest('hex') : createHash('sha256').update(value).digest('hex');
 function issueAuthOtp(userId,purpose,remember=false,nextPath='/dashboard.html') {
   const id=token(24),code=String(randomInt(0,1_000_000)).padStart(6,'0'),stamp=now();
@@ -148,6 +156,11 @@ async function emailAuthOtp(user,challenge,purpose) {
 const rateAllowed = (req, key, limit = 5, windowSeconds = 900) => {
   const address = req.ip || req.socket.remoteAddress || 'unknown';
   const id = `${key}:${address}`, cutoff = Date.now() - windowSeconds * 1000;
+  const stamp=Date.now();
+  if((++rateLimitCalls%1000===0||stamp-lastRateLimitCleanupAt>60000)&&RATE_LIMITS.size){
+    for(const [entry,stamps] of RATE_LIMITS){const active=stamps.filter(value=>value>=stamp-900000);if(active.length)RATE_LIMITS.set(entry,active);else RATE_LIMITS.delete(entry);}
+    lastRateLimitCleanupAt=stamp;
+  }
   const entries = (RATE_LIMITS.get(id) || []).filter(stamp => stamp >= cutoff);
   if (entries.length >= limit) { RATE_LIMITS.set(id, entries); return false; }
   entries.push(Date.now()); RATE_LIMITS.set(id, entries); return true;
@@ -847,7 +860,8 @@ app.post('/api/alerts/simulate',csrfAndOrigin,requireUser,requirePlanFeature('si
   const config=runtimeAlertConfig(alertSettingsFor(req.user.organization_id)),contexts=await buildAlertContexts(site,req.user.organization_id,config,{simulation:{temperatureC,rainEtaMinutes:rainEtaRaw===''?null:Number(rainEtaRaw),timeOfDay}});
   const aiClient=async(items,cfg)=>{if(!cfg.aiEnabled||!rateAllowed(req,'alert-simulation',4,3600))return {decisions:[],status:'disabled'};const {callAlertAi}=await import('./server/alerts/ai.js');return callAlertAi(items,cfg);};
   config.organizationId=req.user.organization_id;
-  const result=await decideAlerts(contexts,{config,aiClient,getHistory:workerId=>{const count=db.prepare("SELECT COUNT(*) AS n FROM automated_alerts WHERE organization_id=? AND worker_id=? AND created_at>=? AND status IN ('sent','queued','scheduled')").get(req.user.organization_id,workerId,now()-86400).n;return {sentToday:count,lastByType:{}};}});
+  const contextByWorker=new Map(contexts.map(item=>[item.worker.id,item]));
+  const result=await decideAlerts(contexts,{config,aiClient,getHistory:workerId=>{const row=contextByWorker.get(workerId);return {sentToday:row?.state.alertsSentToday||0,lastByType:row?.alertHistory||{}};}});
   const names=new Map(db.prepare('SELECT id,name FROM workers WHERE organization_id=? AND site_id=?').all(req.user.organization_id,siteId).map(worker=>[worker.id,worker.name]));
   res.json({aiStatus:result.aiStatus,weatherDelayed:contexts.some(item=>item.weather.weatherDelayed),decisions:result.decisions.map(item=>({workerId:item.workerId,workerName:names.get(item.workerId)||'Worker',action:item.final_status,alertType:item.alert_type,channel:item.channel,sendAt:item.send_at||null,reason:item.reason,message:item.message,floor:item.floor}))});
 });
@@ -1302,7 +1316,7 @@ app.put('/api/sites', csrfAndOrigin, requireUser, (req, res) => {
     const result = db.prepare('UPDATE sites SET name=?,address=?,latitude=?,longitude=?,division=?,district=?,emergency_contact_phone=?,shade_available=?,water_available=?,rest_area=?,updated_at=? WHERE id=? AND organization_id=?').run(values.name, values.address, values.latitude, values.longitude,values.division,values.district,values.emergencyContactPhone,values.shadeAvailable?1:0,values.waterAvailable?1:0,values.restArea?1:0, now(), id, req.user.organization_id);
     if (!result.changes) return sendError(res, 404, 'Site not found.');
     db.prepare('UPDATE workers SET site=? WHERE site_id=? AND organization_id=?').run(values.name, id, req.user.organization_id);
-    WEATHER_CACHE.delete(id);
+    clearSiteCaches(id);
     res.json({ site: db.prepare('SELECT id,name,address,latitude,longitude,division,district,emergency_contact_phone,shade_available,water_available,rest_area,created_at,updated_at FROM sites WHERE id=?').get(id) });
   } catch (error) { sendError(res, error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 409 : 400, error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 'A worksite with this name already exists in your organization.' : 'Could not update this worksite. Please check the details and try again.'); }
 });
@@ -1314,7 +1328,7 @@ app.delete('/api/sites', csrfAndOrigin, requireUser, (req, res) => {
     if(!site){db.exec('ROLLBACK');return sendError(res,404,'Site not found.');}
     const removedWorkers=db.prepare('DELETE FROM workers WHERE organization_id=? AND site_id=?').run(org,id).changes;
     db.prepare('DELETE FROM sites WHERE id=? AND organization_id=?').run(id,org);
-    db.exec('COMMIT');WEATHER_CACHE.delete(id);res.json({message:'Site and its assigned workers removed.',removedWorkers});
+    db.exec('COMMIT');clearSiteCaches(id);res.json({message:'Site and its assigned workers removed.',removedWorkers});
   } catch(error) { try{db.exec('ROLLBACK');}catch{} sendError(res,500,'Could not delete the site and its workers.'); }
 });
 app.post('/api/records/bulk-delete',csrfAndOrigin,requireUser,(req,res)=>{
@@ -1327,7 +1341,7 @@ app.post('/api/records/bulk-delete',csrfAndOrigin,requireUser,(req,res)=>{
       if(item.type==='workers')changed=db.prepare('DELETE FROM workers WHERE id=? AND organization_id=?').run(item.id,org).changes;
       else if(item.type==='sites'){
         const site=db.prepare('SELECT id FROM sites WHERE id=? AND organization_id=?').get(item.id,org);
-        if(site){const removedWorkers=db.prepare('DELETE FROM workers WHERE organization_id=? AND site_id=?').run(org,item.id).changes;changed=db.prepare('DELETE FROM sites WHERE id=? AND organization_id=?').run(item.id,org).changes;counts.workers=(counts.workers||0)+removedWorkers;WEATHER_CACHE.delete(item.id);}
+        if(site){const removedWorkers=db.prepare('DELETE FROM workers WHERE organization_id=? AND site_id=?').run(org,item.id).changes;changed=db.prepare('DELETE FROM sites WHERE id=? AND organization_id=?').run(item.id,org).changes;counts.workers=(counts.workers||0)+removedWorkers;clearSiteCaches(item.id);}
       }
       else if(item.type==='breaks')changed=db.prepare('DELETE FROM break_logs WHERE id=? AND organization_id=?').run(item.id,org).changes;
       else if(item.type==='sms'){
@@ -1352,14 +1366,23 @@ async function openMeteo(site, forecastDays = 1, organizationId = null) {
     forecast_days: String(forecastDays), timezone: 'auto', temperature_unit: 'celsius', wind_speed_unit: 'ms', precipitation_unit: 'mm' });
   const host = OPEN_METEO_API_KEY ? 'customer-api.open-meteo.com' : 'api.open-meteo.com';
   if (OPEN_METEO_API_KEY) params.set('apikey', OPEN_METEO_API_KEY);
-  const started=Date.now(),orgId=organizationId||db.prepare('SELECT organization_id FROM sites WHERE id=?').get(site.id)?.organization_id||null;
-  let response;
-  try{response=await fetch(`https://${host}/v1/forecast?${params}`, { signal: AbortSignal.timeout(15000), headers: { Accept: 'application/json', 'User-Agent': 'JibonGuard/1.0' } });}
-  catch(error){if(orgId)metering.recordUsage({organizationId:orgId,siteId:site.id,eventType:'weather_api_call',provider:'open_meteo',feature:'weather',quantity:1,unit:'call',status:'failed',idempotencyKey:`weather:${token(16)}`});throw error;}
-  const raw = await response.json().catch(() => ({}));
-  if(orgId)metering.recordUsage({organizationId:orgId,siteId:site.id,eventType:'weather_api_call',provider:'open_meteo',feature:'weather',quantity:1,unit:'call',status:response.ok&&raw.current?'success':'failed',latencyMs:Date.now()-started,idempotencyKey:`weather:${token(16)}`});
-  if (!response.ok || !raw.current) throw new Error(response.status === 429 ? 'Open-Meteo request limit reached. Weather will be available again shortly.' : response.status === 401 || response.status === 403 ? 'Open-Meteo rejected the customer API key. Check OPEN_METEO_API_KEY in .env.' : raw.reason || `Open-Meteo could not return weather right now (HTTP ${response.status}).`);
-  return raw;
+  const orgId=organizationId||db.prepare('SELECT organization_id FROM sites WHERE id=?').get(site.id)?.organization_id||null;
+  const key=`${orgId||'public'}:${site.latitude}:${site.longitude}:${forecastDays}`,cached=OPEN_METEO_CACHE.get(key);
+  if(cached&&cached.expires>Date.now())return cached.raw;
+  if(OPEN_METEO_IN_FLIGHT.has(key))return OPEN_METEO_IN_FLIGHT.get(key);
+  const request=(async()=>{
+    const started=Date.now();let response;
+    try{response=await fetch(`https://${host}/v1/forecast?${params}`, { signal: AbortSignal.timeout(15000), headers: { Accept: 'application/json', 'User-Agent': 'JibonGuard/1.0' } });}
+    catch(error){if(orgId)metering.recordUsage({organizationId:orgId,siteId:site.id,eventType:'weather_api_call',provider:'open_meteo',feature:'weather',quantity:1,unit:'call',status:'failed',idempotencyKey:`weather:${token(16)}`});throw error;}
+    const raw=await response.json().catch(()=>({}));
+    if(orgId)metering.recordUsage({organizationId:orgId,siteId:site.id,eventType:'weather_api_call',provider:'open_meteo',feature:'weather',quantity:1,unit:'call',status:response.ok&&raw.current?'success':'failed',latencyMs:Date.now()-started,idempotencyKey:`weather:${token(16)}`});
+    if(!response.ok||!raw.current)throw new Error(response.status===429?'Open-Meteo request limit reached. Weather will be available again shortly.':response.status===401||response.status===403?'Open-Meteo rejected the customer API key. Check OPEN_METEO_API_KEY in .env.':raw.reason||`Open-Meteo could not return weather right now (HTTP ${response.status}).`);
+    OPEN_METEO_CACHE.set(key,{raw,expires:Date.now()+5*60*1000});
+    if(OPEN_METEO_CACHE.size>500){const stamp=Date.now();for(const [cacheKey,value] of OPEN_METEO_CACHE)if(value.expires<=stamp)OPEN_METEO_CACHE.delete(cacheKey);}
+    return raw;
+  })();
+  OPEN_METEO_IN_FLIGHT.set(key,request);
+  try{return await request;}finally{if(OPEN_METEO_IN_FLIGHT.get(key)===request)OPEN_METEO_IN_FLIGHT.delete(key);}
 }
 async function timezoneForSite(siteId, organizationId) {
   const cached=SITE_TIMEZONES.get(siteId);
@@ -1398,6 +1421,14 @@ app.get('/api/sites/:siteId/weather', requireUser, async (req, res) => {
   if (site.latitude == null || site.longitude == null) return sendError(res, 422, "Add this site's latitude and longitude in Site settings to load weather.");
   const cacheKey = `${site.id}:${site.latitude}:${site.longitude}`, cached = WEATHER_CACHE.get(cacheKey);
   if (cached && cached.expires > Date.now()) return res.json({ site_id: site.id, weather: cached.value, cached: true });
+  if(cached&&Date.now()-cached.expires<60*60*1000){
+    const refreshKey=`weather-view:${cacheKey}`;
+    if(!OPEN_METEO_IN_FLIGHT.has(refreshKey)){
+      const refresh=openMeteo(site,1,req.user.organization_id).then(raw=>{const value=shapeWeather(raw);WEATHER_CACHE.set(cacheKey,{expires:Date.now()+600000,value});}).catch(error=>console.error(`Weather refresh failed for site ${site.id}: ${error.name}`)).finally(()=>OPEN_METEO_IN_FLIGHT.delete(refreshKey));
+      OPEN_METEO_IN_FLIGHT.set(refreshKey,refresh);
+    }
+    return res.json({site_id:site.id,weather:cached.value,cached:true,stale:true});
+  }
   try { const result = shapeWeather(await openMeteo(site,1,req.user.organization_id)); WEATHER_CACHE.set(cacheKey, { expires:Date.now()+600000,value:result }); res.json({ site_id:site.id,weather:result,cached:false }); }
   catch (error) { sendError(res, 502, error.message || "Could not reach Open-Meteo. Check the server's internet connection and try again."); }
 });
@@ -1633,12 +1664,28 @@ async function buildAlertContexts(site,organizationId,config,{simulation=null}={
   const lightning=slots.some(slot=>[95,96,99].includes(slot.weatherCode));
   const weather={temperatureC:simulation?simulation.temperatureC:Number(current.temperature_2m),apparentC:simulation?simulation.temperatureC:Number(current.apparent_temperature),wbgtC:null,humidity:Number(current.relative_humidity_2m),solar:slots[0]?.solar??0,windSpeed:Number(current.wind_speed_10m),currentPrecipitation:simulation?0:Number(current.precipitation)||0,weatherCode:simulation?0:Number(current.weather_code),lightning, rainProbability:simulation?(simulation.rainEtaMinutes!=null&&simulation.rainEtaMinutes<=config.rainLeadMinutes?config.rainProbability:0):(rainForecast?.slot.rainProbability||0),rainEtaMinutes:simulation?simulation.rainEtaMinutes:(rainForecast?.etaMinutes??null),expectedRainStart:simulation?.rainEtaMinutes==null?null:rainForecast?.slot.time||null,forecast:slots,dataAgeMinutes:age,weatherDelayed:delayed,timezone:raw.timezone||'UTC',officialHeatwave:false};
   const workers=db.prepare('SELECT * FROM workers WHERE organization_id=? AND site_id=? ORDER BY id').all(organizationId,site.id);
+  if(!workers.length)return [];
+  // Load alert history in two grouped reads instead of issuing two database
+  // round trips for every worker at the site (especially costly on Postgres).
+  const today=new Date();today.setHours(0,0,0,0);const todayStart=Math.floor(today.getTime()/1000);
+  const alertHistory=db.prepare(`SELECT a.worker_id,a.alert_type,MAX(COALESCE(a.sent_at,a.scheduled_at)) AS at
+    FROM automated_alerts a JOIN workers w ON w.id=a.worker_id AND w.organization_id=a.organization_id
+    WHERE a.organization_id=? AND w.site_id=? AND a.status IN ('sent','scheduled','queued')
+    GROUP BY a.worker_id,a.alert_type`).all(organizationId,site.id);
+  const historyByWorker=new Map();
+  for(const item of alertHistory){if(!historyByWorker.has(item.worker_id))historyByWorker.set(item.worker_id,[]);historyByWorker.get(item.worker_id).push(item);}
+  const sentCounts=db.prepare(`SELECT a.worker_id,COUNT(*) AS n FROM automated_alerts a
+    JOIN workers w ON w.id=a.worker_id AND w.organization_id=a.organization_id
+    WHERE a.organization_id=? AND w.site_id=? AND a.created_at>=? AND a.status IN ('sent','queued','scheduled')
+    GROUP BY a.worker_id`).all(organizationId,site.id,todayStart);
+  const sentTodayByWorker=new Map(sentCounts.map(item=>[item.worker_id,Number(item.n)||0]));
+  const nowStamp=now();
   return workers.map(worker=>{
     const lastBreak=worker.last_break?new Date(worker.last_break):null,continuousHours=lastBreak&&!Number.isNaN(lastBreak.getTime())?Math.max(0,(nowDate-lastBreak)/3600000):Number(worker.outdoor_minutes||0)/60;
-    const lastAlerts=db.prepare('SELECT alert_type,MAX(COALESCE(sent_at,scheduled_at)) AS at FROM automated_alerts WHERE organization_id=? AND worker_id=? AND status IN (\'sent\',\'scheduled\',\'queued\') GROUP BY alert_type ORDER BY at DESC').all(organizationId,worker.id);
+    const lastAlerts=(historyByWorker.get(worker.id)||[]).sort((a,b)=>(b.at||0)-(a.at||0));
     const lastByType=Object.fromEntries(lastAlerts.filter(item=>item.at).map(item=>[item.alert_type,new Date(item.at*1000).toISOString()]));
-    const today=new Date();today.setHours(0,0,0,0);const sentToday=db.prepare("SELECT COUNT(*) AS n FROM automated_alerts WHERE organization_id=? AND worker_id=? AND created_at>=? AND status IN ('sent','queued','scheduled')").get(organizationId,worker.id,Math.floor(today.getTime()/1000)).n;
-    const context={worker:{id:worker.id,jobType:worker.job_type,workload:worker.workload,riskLevel:worker.risk_level,shiftStart:worker.shift_start,shiftEnd:worker.shift_end,newWorker:worker.created_at>now()-14*86400,ageGroup:worker.age_group,hasPersonalRiskFactor:Boolean(worker.has_personal_risk_factor),continuousHours},state:{continuousHours,totalHoursToday:Number(worker.outdoor_minutes||0)/60,lastBreak:worker.last_break||null,lastAlertLevel:lastAlerts[0]?.alert_type||null,lastAlertTime:lastAlerts[0]?.at?new Date(lastAlerts[0].at*1000).toISOString():null,alertsSentToday:sentToday,lastAcknowledgement:null},site:{id:site.id,shadeAvailable:Boolean(site.shade_available),waterAvailable:Boolean(site.water_available),restArea:Boolean(site.rest_area)},weather:{...weather},now:nowDate};
+    const sentToday=sentTodayByWorker.get(worker.id)||0;
+    const context={worker:{id:worker.id,jobType:worker.job_type,workload:worker.workload,riskLevel:worker.risk_level,shiftStart:worker.shift_start,shiftEnd:worker.shift_end,newWorker:worker.created_at>nowStamp-14*86400,ageGroup:worker.age_group,hasPersonalRiskFactor:Boolean(worker.has_personal_risk_factor),continuousHours},state:{continuousHours,totalHoursToday:Number(worker.outdoor_minutes||0)/60,lastBreak:worker.last_break||null,lastAlertLevel:lastAlerts[0]?.alert_type||null,lastAlertTime:lastAlerts[0]?.at?new Date(lastAlerts[0].at*1000).toISOString():null,alertsSentToday:sentToday,lastAcknowledgement:null},alertHistory:lastByType,site:{id:site.id,shadeAvailable:Boolean(site.shade_available),waterAvailable:Boolean(site.water_available),restArea:Boolean(site.rest_area)},weather:{...weather},now:nowDate};
     const cooldownRemaining=Math.max(0,config.cooldownMinutes-Math.min(config.cooldownMinutes,...Object.values(lastByType).map(value=>Math.max(0,(nowDate.getTime()-Date.parse(value))/60000)))),clock=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:weather.timezone,hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(nowDate).map(part=>[part.type,part.value])),clockMinutes=Number(clock.hour)*60+Number(clock.minute),clockMinute=value=>{const [h,m]=String(value).split(':').map(Number);return h*60+m;},quietStart=clockMinute(config.quietHours.start),quietEnd=clockMinute(config.quietHours.end);
     context.limits={cooldownRemaining,dailyCapRemaining:Math.max(0,config.dailyCap-sentToday),quietHours:quietStart<quietEnd?clockMinutes>=quietStart&&clockMinutes<quietEnd:clockMinutes>=quietStart||clockMinutes<quietEnd};return context;
   });
@@ -1655,19 +1702,33 @@ async function dispatchAlertQueue(){
   return groups.length;
 }
 let alertSchedulerRunning=false;
+async function forEachConcurrent(items,limit,callback){let cursor=0;await Promise.all(Array.from({length:Math.min(limit,items.length)},async()=>{while(cursor<items.length){const index=cursor++;await callback(items[index]);}}));}
 async function runAlertAutomationTick(){
   if(alertSchedulerRunning)return;alertSchedulerRunning=true;
   const failures=[];
   try{for(const organization of db.prepare('SELECT id FROM organizations').all()){
     const settings=alertSettingsFor(organization.id),config=runtimeAlertConfig(settings);config.organizationId=organization.id;if(!config.enabled)continue;
     const sites=db.prepare('SELECT * FROM sites WHERE organization_id=? AND latitude IS NOT NULL AND longitude IS NOT NULL ORDER BY id').all(organization.id);
-    for(const site of sites)try{
-      const contexts=await buildAlertContexts(site,organization.id,config);if(!contexts.length)continue;
-      const result=await decideAlerts(contexts,{config,getHistory:workerId=>{const row=contexts.find(item=>item.worker.id===workerId);const sent=db.prepare("SELECT alert_type,MAX(COALESCE(sent_at,scheduled_at)) AS stamp FROM automated_alerts WHERE organization_id=? AND worker_id=? AND status IN ('sent','scheduled','queued') GROUP BY alert_type").all(organization.id,workerId);return {sentToday:row?.state.alertsSentToday||0,lastByType:Object.fromEntries(sent.filter(item=>item.stamp).map(item=>[item.alert_type,new Date(item.stamp*1000).toISOString()]))};}});
-      for(const decision of result.decisions){const context=contexts.find(item=>item.worker.id===decision.workerId);if(!context)continue;const eventKey=alertEventKey(decision,context),existing=db.prepare("SELECT id FROM automated_alerts WHERE organization_id=? AND worker_id=? AND event_key=? AND status IN ('sent','queued','scheduled')").get(organization.id,decision.workerId,eventKey);let status=decision.final_status==='skipped'?'skipped':decision.final_status==='scheduled'?'scheduled':'queued',reason=decision.reason;const mergeTarget=!existing&&decision.action==='merge'?db.prepare("SELECT id,message,scheduled_at FROM automated_alerts WHERE organization_id=? AND worker_id=? AND channel=? AND status IN ('queued','scheduled') ORDER BY scheduled_at LIMIT 1").get(organization.id,decision.workerId,decision.channel):null;if(existing){status='skipped';reason='Duplicate weather event already alerted.';}else if(mergeTarget){status='merged';reason='Merged with a pending template alert.';db.prepare("UPDATE automated_alerts SET message=message||char(10)||?,reason=reason||? WHERE id=?").run(decision.message,` Merged ${decision.alert_type} reminder.`,mergeTarget.id);}const scheduledAt=status==='scheduled'?Math.floor(Date.parse(decision.send_at)/1000):mergeTarget?mergeTarget.scheduled_at:now(),id=token(12),safeContext={worker:{...context.worker,phone:undefined,name:undefined},state:context.state,site:context.site,weather:context.weather,rule:context.rule,limits:context.limits};
-        db.prepare('INSERT INTO automated_alerts(id,organization_id,worker_id,site_id,event_key,alert_type,channel,action,status,scheduled_at,created_at,reason,input_hash,model_output,input_context,variables,message,floor) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,organization.id,decision.workerId,site.id,eventKey,decision.alert_type,decision.channel,decision.action,status,scheduledAt,now(),reason,decision.inputHash,decision.modelOutput==null?'':JSON.stringify(decision.modelOutput),JSON.stringify(safeContext),JSON.stringify(decision.variables||{}),decision.message,decision.floor?1:0);
+    await forEachConcurrent(sites,4,async site=>{try{
+      const contexts=await buildAlertContexts(site,organization.id,config);if(!contexts.length)return;
+      const contextByWorker=new Map(contexts.map(item=>[item.worker.id,item]));
+      const result=await decideAlerts(contexts,{config,getHistory:workerId=>{const row=contextByWorker.get(workerId);return {sentToday:row?.state.alertsSentToday||0,lastByType:row?.alertHistory||{}};}});
+      const pending=db.prepare("SELECT id,worker_id,event_key,channel,message,scheduled_at,status FROM automated_alerts WHERE organization_id=? AND site_id=? AND status IN ('sent','queued','scheduled') ORDER BY scheduled_at").all(organization.id,site.id);
+      const existingKeys=new Set(pending.map(row=>`${row.worker_id}\0${row.event_key}`)),mergeTargets=new Map();
+      for(const row of pending)if(['queued','scheduled'].includes(row.status)&&!mergeTargets.has(`${row.worker_id}\0${row.channel}`))mergeTargets.set(`${row.worker_id}\0${row.channel}`,row);
+      const insertAlert=db.prepare('INSERT INTO automated_alerts(id,organization_id,worker_id,site_id,event_key,alert_type,channel,action,status,scheduled_at,created_at,reason,input_hash,model_output,input_context,variables,message,floor) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+      for(const decision of result.decisions){
+        const context=contextByWorker.get(decision.workerId);if(!context)continue;
+        const eventKey=alertEventKey(decision,context),eventLookup=`${decision.workerId}\0${eventKey}`,existing=existingKeys.has(eventLookup);
+        let status=decision.final_status==='skipped'?'skipped':decision.final_status==='scheduled'?'scheduled':'queued',reason=decision.reason;
+        const mergeKey=`${decision.workerId}\0${decision.channel}`,mergeTarget=!existing&&decision.action==='merge'?mergeTargets.get(mergeKey):null;
+        if(existing){status='skipped';reason='Duplicate weather event already alerted.';}
+        else if(mergeTarget){status='merged';reason='Merged with a pending template alert.';db.prepare("UPDATE automated_alerts SET message=message||char(10)||?,reason=reason||? WHERE id=?").run(decision.message,` Merged ${decision.alert_type} reminder.`,mergeTarget.id);}
+        const scheduledAt=status==='scheduled'?Math.floor(Date.parse(decision.send_at)/1000):mergeTarget?mergeTarget.scheduled_at:now(),id=token(12),safeContext={worker:{...context.worker,phone:undefined,name:undefined},state:context.state,site:context.site,weather:context.weather,rule:context.rule,limits:context.limits};
+        insertAlert.run(id,organization.id,decision.workerId,site.id,eventKey,decision.alert_type,decision.channel,decision.action,status,scheduledAt,now(),reason,decision.inputHash,decision.modelOutput==null?'':JSON.stringify(decision.modelOutput),JSON.stringify(safeContext),JSON.stringify(decision.variables||{}),decision.message,decision.floor?1:0);
+        if(status!=='skipped')existingKeys.add(eventLookup);
       }
-    }catch(error){console.error(`Alert automation failed for site ${site.id}: ${error.name}`);failures.push({siteId:site.id,error});}
+    }catch(error){console.error(`Alert automation failed for site ${site.id}: ${error.name}`);failures.push({siteId:site.id,error});}});
   }await dispatchAlertQueue();if(failures.length)throw new Error(`${failures.length} alert site(s) failed`);}catch(error){console.error(`Alert automation cycle failed: ${error.name}`);throw error;}finally{alertSchedulerRunning=false;}
 }
 jobRunner.register('alert_automation', runAlertAutomationTick, { jitterMs: 0 });

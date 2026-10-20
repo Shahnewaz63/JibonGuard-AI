@@ -142,6 +142,16 @@ const migrations = [
     name: 'disable_admin_two_factor_signin',
     sql: `UPDATE admin_users SET totp_required=0,totp_enabled=0,totp_secret_encrypted=NULL; DELETE FROM admin_recovery_codes;`,
   },
+  {
+    version: 9,
+    name: 'operational_query_indexes',
+    sql: `
+      CREATE INDEX IF NOT EXISTS workers_org_site_idx ON workers(organization_id,site_id);
+      CREATE INDEX IF NOT EXISTS automated_alerts_worker_history_idx ON automated_alerts(organization_id,worker_id,status,created_at DESC);
+      CREATE INDEX IF NOT EXISTS automated_alerts_site_pending_idx ON automated_alerts(organization_id,site_id,status,scheduled_at);
+      CREATE INDEX IF NOT EXISTS sms_messages_org_direction_date_idx ON sms_messages(organization_id,direction,message_at DESC);
+    `,
+  },
 ];
 
 export function runMigrations(db, { databasePath, development = true, clock = () => Math.floor(Date.now() / 1000) } = {}) {
