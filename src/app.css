@@ -926,3 +926,4 @@ button:not(.mobile-menu):not(.editor-close):not(.chat-attach-button):not(.chat-m
 .metric>span,.badge,.table-scroll th,.tiny-action{font-size:12px!important}
 .org-card small,.support-card small,.support-card a,.profile small,.simple-list small,.break-item small,.site-heading small,.site-weather small,.site-card-footer,.dash-footer small{font-size:13px!important;line-height:1.45}
 @media(max-width:760px){.auth-form-wrap>.back-link{margin-bottom:28px}}
+.automation-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}

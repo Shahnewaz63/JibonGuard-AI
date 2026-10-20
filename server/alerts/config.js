@@ -7,7 +7,7 @@ export function loadAlertConfig(env = process.env) {
   return {
     enabled: env.ALERT_AUTOMATION_ENABLED !== 'false',
     aiEnabled: env.AI_ALERTS_ENABLED === 'true',
-    model: env.AI_ALERTS_MODEL || env.GEMINI_MODEL || 'gemini-2.5-flash',
+    model: env.AI_ALERTS_MODEL || env.GEMINI_MODEL || 'gemini-3.5-flash-lite',
     apiKey: (env.GEMINI_API_KEY || '').trim(),
     timeoutMs: number(env.AI_ALERTS_TIMEOUT_MS, 8000, 1000, 30000),
     retryCount: number(env.AI_ALERTS_RETRIES, 1, 0, 3),

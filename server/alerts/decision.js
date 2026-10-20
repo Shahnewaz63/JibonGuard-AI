@@ -72,6 +72,7 @@ export function enforceGuardrails(decisions, context, history, config, now = new
   const timezone=context.weather.timezone||'UTC';
   const sentToday = Number(history.sentToday || 0);
   return decisions.flatMap(decision => {
+    if(context.worker.consentStatus&&context.worker.consentStatus!=='consented')return [{...decision,action:'skip',final_status:'skipped',reason:'Worker SMS consent has not been recorded.',floor:false}];
     const floorMatch = allowedFloor.find(item => item.alert_type === decision.alert_type);
     const source = floorMatch ? { ...floorMatch, variables: floorMatch.variables || {} } : decision;
     const floor = Boolean(source.floor);

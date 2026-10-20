@@ -11,10 +11,12 @@ export function createGeminiClient({ apiKey = '', model = 'gemini-3.5-flash-lite
     if (apiKey) {
       for (let attempt = 0; attempt <= Math.min(1, Math.max(0, retries)); attempt++) {
         try {
+          const generationConfig={responseMimeType:'application/json',maxOutputTokens};
+          if(model.startsWith('gemini-3'))generationConfig.thinkingConfig={thinkingLevel:'minimal'};
           const response = await fetchImpl(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
             method: 'POST', signal: AbortSignal.timeout(timeoutMs),
             headers: { 'x-goog-api-key': apiKey, 'Content-Type': 'application/json', Accept: 'application/json' },
-            body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: boundedJson(payload) }] }], generationConfig: { responseMimeType: 'application/json', maxOutputTokens } }),
+            body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: boundedJson(payload) }] }], generationConfig }),
           });
           if (!response.ok) throw new Error(`Gemini HTTP ${response.status}`);
           const body = await response.json();

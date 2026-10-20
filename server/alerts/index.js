@@ -9,7 +9,7 @@ export async function decideAlerts(contexts, { config = ALERT_CONFIG, aiClient =
     return { ...context, rule, candidates, hash: inputHash({ ...context, worker: { ...context.worker, phone: undefined, name: undefined } }) };
   });
   const fresh = working.filter(context => Number(context.weather.dataAgeMinutes ?? 0) <= config.staleWeatherMinutes);
-  const eligibleForAi = fresh;
+  const eligibleForAi = fresh.filter(context=>!context.worker.consentStatus||context.worker.consentStatus==='consented');
   const ai = eligibleForAi.length ? await aiClient(eligibleForAi, config) : { decisions: [], modelOutput: null, status: fresh.length === 0 ? 'stale' : config.aiEnabled ? 'ok' : 'disabled' };
   const aiControlsAllAlerts = Boolean(config.aiEnabled && ai.status === 'ok');
   const byWorker = new Map(ai.decisions.map(decision => [decision.worker_id, decision]));
@@ -19,7 +19,9 @@ export async function decideAlerts(contexts, { config = ALERT_CONFIG, aiClient =
     const floor = context.rule.floor;
     const aiDecision = byWorker.get(context.worker.id);
     let chosen;
-    if (aiControlsAllAlerts && !weatherStale) {
+    if(context.worker.consentStatus&&context.worker.consentStatus!=='consented'){
+      chosen=[{action:'skip',final_status:'skipped',alert_type:'heat_nudge',channel:'sms',reason:'Worker SMS consent has not been recorded.',floor:false}];
+    } else if (aiControlsAllAlerts && !weatherStale) {
       // A successful AI cycle chooses whether each eligible worker receives an alert.
       const optional = aiDecision && aiDecision.action !== 'skip' && !floor.some(item => item.alert_type === aiDecision.alert_type) ? [aiDecision] : [];
       chosen = [...floor, ...optional];

@@ -153,6 +153,13 @@ async function emailAuthOtp(user,challenge,purpose) {
   const action=purpose==='signup'?'verify your email and finish creating your account':'finish signing in';
   await sendEmail(user.email,purpose==='signup'?'Verify your JibonGuard account':'Your JibonGuard sign-in code',`Hello ${user.full_name},\n\nYour one-time code to ${action} is: ${challenge.code}\n\nThis code expires in 10 minutes. If you did not request it, you can ignore this email.`);
 }
+function createUserSession(req,res,userId,remember,nextPath){
+  const lifetime=remember?REMEMBER_LIFETIME:SESSION_LIFETIME,opaque=token(32),cookie=parseCookies(req)[SESSION_COOKIE];
+  if(cookie)db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(cookie));
+  db.prepare('INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)').run(hashToken(opaque),userId,now(),now()+lifetime);
+  const csrf=token(32);res.cookie(SESSION_COOKIE,opaque,cookieOptions(true,lifetime));res.cookie(CSRF_COOKIE,csrf,cookieOptions(false,REMEMBER_LIFETIME));
+  return {csrf_token:csrf,next:safeNext(nextPath)};
+}
 const rateAllowed = (req, key, limit = 5, windowSeconds = 900) => {
   const address = req.ip || req.socket.remoteAddress || 'unknown';
   const id = `${key}:${address}`, cutoff = Date.now() - windowSeconds * 1000;
@@ -578,6 +585,23 @@ app.get('/api/pricing',(_req,res)=>{
   res.set('Cache-Control','no-store').json({plans:items});
 });
 function billingSetting(key,fallback){try{return JSON.parse(db.prepare('SELECT value_json FROM billing_settings WHERE setting_key=?').get(key)?.value_json??JSON.stringify(fallback));}catch{return fallback;}}
+function loginOtpEnabled(){return billingSetting('login_otp_enabled',true)!==false;}
+app.get('/api/admin/settings/authentication',requireAdmin,adminPermission('settings_write'),(_req,res)=>{
+  res.set('Cache-Control','no-store').json({enabled:loginOtpEnabled()});
+});
+app.put('/api/admin/settings/authentication',adminCsrfAndOrigin,requireAdmin,adminPermission('settings_write'),(req,res)=>{
+  const enabled=req.body?.enabled,reason=String(req.body?.reason||'').trim().slice(0,500);
+  if(typeof enabled!=='boolean'||!reason)return sendError(res,422,'Choose whether login OTP is required and enter a reason for the change.');
+  const before=loginOtpEnabled(),stamp=now();
+  db.exec('BEGIN IMMEDIATE');
+  try{
+    db.prepare('INSERT INTO billing_settings(setting_key,value_json,updated_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json,updated_by=excluded.updated_by,updated_at=excluded.updated_at').run('login_otp_enabled',JSON.stringify(enabled),req.admin.id,stamp);
+    if(!enabled)db.prepare("DELETE FROM auth_otp_challenges WHERE purpose='login'").run();
+    writeAdminAudit(db,{adminId:req.admin.id,role:req.admin.role,action:'auth.login_otp_setting_changed',targetType:'authentication_settings',targetId:'organization_login_otp',ip:req.ip||'',userAgent:req.get('user-agent')||'',before:{enabled:before},after:{enabled},reason,now:stamp});
+    db.exec('COMMIT');
+  }catch(error){try{db.exec('ROLLBACK');}catch{}throw error;}
+  res.set('Cache-Control','no-store').json({enabled,message:enabled?'Login OTP is now required.':'Login OTP is disabled for existing verified accounts. Signup email verification remains required.'});
+});
 function createPlanInvoice({organizationId,subscriptionId,planName,amountMinor,currency,stamp}){
   const next=Number(billingSetting('invoice_next_sequence',1)),prefix=String(billingSetting('invoice_prefix','JG-'));
   if(!Number.isSafeInteger(next)||next<1||!Number.isSafeInteger(amountMinor)||amountMinor<0)throw new Error('Invoice numbering or amount settings are invalid.');
@@ -834,6 +858,11 @@ app.put('/api/alerts/settings',csrfAndOrigin,requireUser,(req,res)=>{
   db.prepare('INSERT INTO alert_settings(organization_id,settings_json,enabled,ai_enabled,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(organization_id) DO UPDATE SET settings_json=excluded.settings_json,enabled=excluded.enabled,ai_enabled=excluded.ai_enabled,updated_at=excluded.updated_at').run(org,JSON.stringify(settings),settings.enabled?1:0,settings.aiEnabled?1:0,now());
   res.json({settings:alertSettingsFor(org)});
 });
+app.post('/api/alerts/run-now',csrfAndOrigin,requireUser,requirePlanFeature('ai_alert_automation'),async(req,res)=>{
+  const result=await runAlertAutomation(req.user.organization_id);
+  if(result?.error)return sendError(res,502,'Alert automation cycle failed. Check the automation log for the latest error.');
+  res.set('Cache-Control','no-store').json({ok:true,skipped:Boolean(result?.skipped),message:result?.skipped?'An alert automation cycle is already running.':'Alert automation cycle completed.'});
+});
 app.get('/api/alerts/automated',requireUser,(req,res)=>{
   const today=new Date();today.setHours(0,0,0,0);const cutoff=Math.floor(today.getTime()/1000),items=db.prepare('SELECT a.id,a.site_id,s.name AS site,w.name AS worker_name,a.alert_type,a.channel,a.action,a.status,a.scheduled_at,a.created_at,a.sent_at,a.reason,a.floor FROM automated_alerts a LEFT JOIN sites s ON s.id=a.site_id LEFT JOIN workers w ON w.id=a.worker_id WHERE a.organization_id=? AND a.created_at>=? ORDER BY a.created_at DESC LIMIT 100').all(req.user.organization_id,cutoff);
   const counts=db.prepare("SELECT SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) AS skipped,SUM(CASE WHEN status='scheduled' THEN 1 ELSE 0 END) AS scheduled FROM automated_alerts WHERE organization_id=? AND created_at>=?").get(req.user.organization_id,cutoff);
@@ -877,11 +906,11 @@ app.get('/api/sms', requireUser, async (req, res) => {
   }
   const organizationPhones=new Set([...phoneOwners].filter(([,orgs])=>orgs.has(req.user.organization_id)).map(([phone])=>phone));
   const recentReplyOwners=new Map();
-  const recentOwnersForPhone=phone=>{if(!recentReplyOwners.has(phone))recentReplyOwners.set(phone,recentSmsOwners(phone));return recentReplyOwners.get(phone);};
+  const recentOwnerForPhone=phone=>{if(!recentReplyOwners.has(phone))recentReplyOwners.set(phone,recentSmsOwner(phone));return recentReplyOwners.get(phone);};
   const inboundBelongsToOrganization=phone=>{
     const owners=phoneOwners.get(phone);if(!owners?.has(req.user.organization_id))return false;
     if(owners.size===1)return true;
-    const recent=recentOwnersForPhone(phone);return recent.size===1&&recent.has(req.user.organization_id);
+    return recentOwnerForPhone(phone)===req.user.organization_id;
   };
   const belongsToOrganization=item=>{
     if(item.direction==='sent')return item.id.startsWith('app-')&&smsPhoneKeys(item.recipient).some(phone=>organizationPhones.has(phone));
@@ -1037,7 +1066,9 @@ app.post('/api/auth/login', csrfAndOrigin, async (req, res) => {
     catch (error) { db.prepare('DELETE FROM auth_otp_challenges WHERE id=?').run(challenge.challengeId); console.error('Signup verification OTP delivery failed:', JSON.stringify({ code: error.code, command: error.command, responseCode: error.responseCode })); return sendError(res,502,'We could not send a verification code. Check the server SMTP log for the delivery reason, then try again.'); }
     return res.json({otp_required:true,purpose:'signup',challenge_id:challenge.challengeId,email:user.email,resend_after:OTP_RESEND_COOLDOWN_SECONDS,message:'This account still needs email verification. We sent a verification code.'});
   }
-  const remember=req.body.remember===true,challenge=issueAuthOtp(user.id,'login',remember,nextPath);
+  const remember=req.body.remember===true;
+  if(!loginOtpEnabled())return res.json({otp_required:false,...createUserSession(req,res,user.id,remember,nextPath)});
+  const challenge=issueAuthOtp(user.id,'login',remember,nextPath);
   try { await emailAuthOtp(user,challenge,'login'); }
   catch (error) { db.prepare('DELETE FROM auth_otp_challenges WHERE id=?').run(challenge.challengeId); console.error('Sign-in OTP delivery failed:', JSON.stringify({ code:error.code,command:error.command,responseCode:error.responseCode })); return sendError(res,502,'We could not send a sign-in code. Check the server SMTP settings and try again.'); }
   res.json({otp_required:true,purpose:'login',challenge_id:challenge.challengeId,email:user.email,resend_after:OTP_RESEND_COOLDOWN_SECONDS,message:'We sent a 6-digit sign-in code to your email. Enter it to continue.'});
@@ -1048,22 +1079,21 @@ app.post('/api/auth/verify-otp', csrfAndOrigin, (req,res)=>{
   if(!/^[A-Za-z0-9_-]{24,64}$/.test(id)||!/^\d{6}$/.test(code))return sendError(res,400,'Enter the 6-digit code from your email.');
   const challenge=db.prepare('SELECT c.*,u.email_verified_at FROM auth_otp_challenges c JOIN users u ON u.id=c.user_id WHERE c.id=?').get(id);
   if(!challenge||challenge.expires_at<now())return sendError(res,400,'That code expired. Request a new one and try again.');
+  if(challenge.purpose==='login'&&!loginOtpEnabled()){db.prepare('DELETE FROM auth_otp_challenges WHERE id=?').run(id);return sendError(res,409,'Login OTP is disabled. Sign in again with your password.');}
   if(challenge.attempts>=5)return sendError(res,429,'Too many incorrect codes. Request a new code.');
   if(hashToken(`${id}:${code}`)!==challenge.otp_hash){const attempts=challenge.attempts+1;db.prepare('UPDATE auth_otp_challenges SET attempts=? WHERE id=?').run(attempts,id);return sendError(res,attempts>=5?429:400,attempts>=5?'Too many incorrect codes. Request a new code.':'The code is incorrect. Check the email and try again.');}
   db.prepare('DELETE FROM auth_otp_challenges WHERE id=?').run(id);
   if(challenge.purpose==='signup') db.prepare('UPDATE users SET email_verified_at=? WHERE id=?').run(now(),challenge.user_id);
   else if(!challenge.email_verified_at)return sendError(res,400,'Verify your email before signing in.');
-  const remember=Boolean(challenge.remember),lifetime=remember?REMEMBER_LIFETIME:SESSION_LIFETIME,opaque=token(32),cookie=parseCookies(req)[SESSION_COOKIE];
-  if(cookie)db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hashToken(cookie));
-  db.prepare('INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)').run(hashToken(opaque),challenge.user_id,now(),now()+lifetime);
-  const csrf=token(32);res.cookie(SESSION_COOKIE,opaque,cookieOptions(true,lifetime));res.cookie(CSRF_COOKIE,csrf,cookieOptions(false,REMEMBER_LIFETIME));
-  res.json({message:challenge.purpose==='signup'?'Email verified. Your account is ready.':'Signed in.',csrf_token:csrf,next:safeNext(challenge.next_path)});
+  const remember=Boolean(challenge.remember),session=createUserSession(req,res,challenge.user_id,remember,challenge.next_path);
+  res.json({message:challenge.purpose==='signup'?'Email verified. Your account is ready.':'Signed in.',...session});
 });
 app.post('/api/auth/resend-otp',csrfAndOrigin,async(req,res)=>{
   if(!rateAllowed(req,'resend-otp',4))return sendError(res,429,'Too many code requests. Please try again later.');
   const id=String(req.body.challenge_id||''),email=String(req.body.email||'').trim().toLowerCase();
   const prior=db.prepare('SELECT c.*,u.email,u.full_name,u.email_verified_at FROM auth_otp_challenges c JOIN users u ON u.id=c.user_id WHERE c.id=? AND u.email=? COLLATE NOCASE AND c.created_at>=?').get(id,email,now()-86400);
   if(!prior)return sendError(res,400,'This code request can no longer be renewed. Start sign-in again.');
+  if(prior.purpose==='login'&&!loginOtpEnabled()){db.prepare('DELETE FROM auth_otp_challenges WHERE id=?').run(id);return sendError(res,409,'Login OTP is disabled. Sign in again with your password.');}
   if(prior.purpose==='signup'&&prior.email_verified_at)return sendError(res,400,'Email is already verified. Return to sign in.');
   const resendAfter=Math.max(0,OTP_RESEND_COOLDOWN_SECONDS-(now()-prior.created_at));
   if(resendAfter>0)return res.status(429).json({error:`Please wait ${resendAfter} seconds before requesting another code.`,resend_after:resendAfter});
@@ -1293,6 +1323,22 @@ app.put('/api/workers', csrfAndOrigin, requireUser, (req, res) => {
     if (!result.changes) return sendError(res, 404, 'Worker not found.');
     res.json({ worker: db.prepare('SELECT * FROM workers WHERE id=?').get(id) });
   } catch (error) { sendError(res, error.status || 400, error.message); }
+});
+app.post('/api/workers/consent', csrfAndOrigin, requireUser, (req, res) => {
+  const workerId=String(req.body.worker_id||''),action=String(req.body.action||''),method=String(req.body.method||'').trim().toLowerCase(),note=String(req.body.note||'').trim().slice(0,240),org=req.user.organization_id;
+  if(!workerId||!['consented','withdrawn'].includes(action))return sendError(res,400,'Choose a worker and a valid consent action.');
+  if(action==='consented'&&!['verbal','written','sms','other'].includes(method))return sendError(res,400,'Record how the worker gave consent.');
+  const worker=db.prepare('SELECT id FROM workers WHERE id=? AND organization_id=?').get(workerId,org);
+  if(!worker)return sendError(res,404,'Worker not found.');
+  const stamp=now();
+  db.exec('BEGIN IMMEDIATE');
+  try{
+    db.prepare('UPDATE workers SET consent_at=?,consent_method=?,updated_at=? WHERE id=? AND organization_id=?').run(action==='consented'?stamp:null,action==='consented'?method:'',stamp,workerId,org);
+    db.prepare('INSERT INTO worker_consent_events(id,organization_id,worker_id,action,method,note,changed_by,changed_at) VALUES(?,?,?,?,?,?,?,?)').run(token(12),org,workerId,action,action==='consented'?method:'',note,req.user.id,stamp);
+    if(action==='withdrawn')db.prepare("UPDATE automated_alerts SET status='skipped',reason='Worker withdrew SMS consent.' WHERE organization_id=? AND worker_id=? AND status IN ('queued','scheduled')").run(org,workerId);
+    db.exec('COMMIT');
+  }catch(error){try{db.exec('ROLLBACK');}catch{}throw error;}
+  res.json({worker:db.prepare('SELECT * FROM workers WHERE id=? AND organization_id=?').get(workerId,org)});
 });
 app.delete('/api/workers', csrfAndOrigin, requireUser, (req, res) => {
   const id = String(req.query.id || ''), result = db.prepare('DELETE FROM workers WHERE id=? AND organization_id=?').run(id, req.user.organization_id);
@@ -1642,11 +1688,14 @@ function smsPhoneKeys(value) {
   const ascii=String(value||'').replace(/[\u09e6-\u09ef]/g,digit=>String(digit.charCodeAt(0)-0x09e6));
   return [...new Set([normalizePhone(ascii)].filter(Boolean))];
 }
-function recentSmsOwners(phone){
-  const cutoff=now();
-  const rows=db.prepare(`SELECT DISTINCT organization_id FROM sms_messages WHERE direction='sent' AND status IN ('queued','sent') AND id LIKE 'app-%' AND recipient=? AND created_at>=?
-    UNION SELECT DISTINCT organization_id FROM scheduled_break_sms WHERE recipient=? AND status='sent' AND COALESCE(sent_at,created_at)>=?`).all(phone,cutoff-86400,phone,cutoff-86400);
-  return new Set(rows.map(row=>row.organization_id));
+function recentSmsOwner(phone){
+  const rows=db.prepare(`SELECT organization_id,MAX(contacted_at) AS contacted_at FROM (
+      SELECT organization_id,MAX(created_at) AS contacted_at FROM sms_messages WHERE direction='sent' AND status IN ('queued','sent') AND id LIKE 'app-%' AND recipient=? GROUP BY organization_id
+      UNION ALL
+      SELECT organization_id,MAX(COALESCE(sent_at,created_at)) AS contacted_at FROM scheduled_break_sms WHERE recipient=? AND status='sent' GROUP BY organization_id
+    ) contacts GROUP BY organization_id ORDER BY contacted_at DESC LIMIT 2`).all(phone,phone);
+  if(!rows.length)return null;
+  return rows.length===1||Number(rows[0].contacted_at)>Number(rows[1].contacted_at)?rows[0].organization_id:null;
 }
 function emergencySmsCode(message) {
   const value=toAsciiDigits(String(message||'').trim());
@@ -1685,14 +1734,14 @@ async function buildAlertContexts(site,organizationId,config,{simulation=null}={
     const lastAlerts=(historyByWorker.get(worker.id)||[]).sort((a,b)=>(b.at||0)-(a.at||0));
     const lastByType=Object.fromEntries(lastAlerts.filter(item=>item.at).map(item=>[item.alert_type,new Date(item.at*1000).toISOString()]));
     const sentToday=sentTodayByWorker.get(worker.id)||0;
-    const context={worker:{id:worker.id,jobType:worker.job_type,workload:worker.workload,riskLevel:worker.risk_level,shiftStart:worker.shift_start,shiftEnd:worker.shift_end,newWorker:worker.created_at>nowStamp-14*86400,ageGroup:worker.age_group,hasPersonalRiskFactor:Boolean(worker.has_personal_risk_factor),continuousHours},state:{continuousHours,totalHoursToday:Number(worker.outdoor_minutes||0)/60,lastBreak:worker.last_break||null,lastAlertLevel:lastAlerts[0]?.alert_type||null,lastAlertTime:lastAlerts[0]?.at?new Date(lastAlerts[0].at*1000).toISOString():null,alertsSentToday:sentToday,lastAcknowledgement:null},alertHistory:lastByType,site:{id:site.id,shadeAvailable:Boolean(site.shade_available),waterAvailable:Boolean(site.water_available),restArea:Boolean(site.rest_area)},weather:{...weather},now:nowDate};
+    const context={worker:{id:worker.id,jobType:worker.job_type,workload:worker.workload,riskLevel:worker.risk_level,shiftStart:worker.shift_start,shiftEnd:worker.shift_end,newWorker:worker.created_at>nowStamp-14*86400,ageGroup:worker.age_group,hasPersonalRiskFactor:Boolean(worker.has_personal_risk_factor),consentStatus:worker.consent_at?'consented':'pending',continuousHours},state:{continuousHours,totalHoursToday:Number(worker.outdoor_minutes||0)/60,lastBreak:worker.last_break||null,lastAlertLevel:lastAlerts[0]?.alert_type||null,lastAlertTime:lastAlerts[0]?.at?new Date(lastAlerts[0].at*1000).toISOString():null,alertsSentToday:sentToday,lastAcknowledgement:null},alertHistory:lastByType,site:{id:site.id,shadeAvailable:Boolean(site.shade_available),waterAvailable:Boolean(site.water_available),restArea:Boolean(site.rest_area)},weather:{...weather},now:nowDate};
     const cooldownRemaining=Math.max(0,config.cooldownMinutes-Math.min(config.cooldownMinutes,...Object.values(lastByType).map(value=>Math.max(0,(nowDate.getTime()-Date.parse(value))/60000)))),clock=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:weather.timezone,hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(nowDate).map(part=>[part.type,part.value])),clockMinutes=Number(clock.hour)*60+Number(clock.minute),clockMinute=value=>{const [h,m]=String(value).split(':').map(Number);return h*60+m;},quietStart=clockMinute(config.quietHours.start),quietEnd=clockMinute(config.quietHours.end);
     context.limits={cooldownRemaining,dailyCapRemaining:Math.max(0,config.dailyCap-sentToday),quietHours:quietStart<quietEnd?clockMinutes>=quietStart&&clockMinutes<quietEnd:clockMinutes>=quietStart||clockMinutes<quietEnd};return context;
   });
 }
 function alertEventKey(decision,context){const weather=context.weather;if(decision.alert_type==='rain_2h')return `rain:${context.site.id}:${weather.expectedRainStart||Math.floor(now()/3600)}`;if(decision.alert_type==='lightning')return `lightning:${context.site.id}:${weather.expectedRainStart||Math.floor(now()/3600)}`;if(['heat_nudge','shade_break'].includes(decision.alert_type))return `${decision.alert_type}:${context.site.id}:${new Date().toISOString().slice(0,10)}`;return `${decision.alert_type}:${context.site.id}:${Math.floor(now()/1800)}`;}
-async function dispatchAlertQueue(){
-  const queued=db.prepare("SELECT a.*,w.phone,w.shift_start,w.shift_end FROM automated_alerts a JOIN workers w ON w.id=a.worker_id WHERE a.status IN ('queued','scheduled') AND a.scheduled_at<=? ORDER BY a.scheduled_at LIMIT 200").all(now()),ready=[];
+async function dispatchAlertQueue(organizationId=null){
+  const queued=organizationId?db.prepare("SELECT a.*,w.phone,w.shift_start,w.shift_end FROM automated_alerts a JOIN workers w ON w.id=a.worker_id WHERE a.organization_id=? AND a.status IN ('queued','scheduled') AND a.scheduled_at<=? ORDER BY a.scheduled_at LIMIT 200").all(organizationId,now()):db.prepare("SELECT a.*,w.phone,w.shift_start,w.shift_end FROM automated_alerts a JOIN workers w ON w.id=a.worker_id WHERE a.status IN ('queued','scheduled') AND a.scheduled_at<=? ORDER BY a.scheduled_at LIMIT 200").all(now()),ready=[];
   for(const row of queued){let timezone='Asia/Dhaka';try{timezone=JSON.parse(row.input_context).weather?.timezone||timezone;}catch{}if(!workerIsOnShift(row,new Date(),timezone)){db.prepare("UPDATE automated_alerts SET status='skipped',reason='Outside the worker shift at send time.' WHERE id=?").run(row.id);continue;}ready.push({...row,phone:normalizePhone(row.phone)});}
   const sendable=[];
   for(const row of ready){if(!row.phone)continue;let message=row.message;if(row.alert_type==='rain_2h'&&!row.floor){let eta=null;try{eta=Number(JSON.parse(row.input_context).weather?.rainEtaMinutes);}catch{}const elapsed=Math.max(0,(now()-row.created_at)/60);if(!Number.isFinite(eta)||elapsed>=eta){db.prepare("UPDATE automated_alerts SET status='skipped',reason='Rain forecast window passed before dispatch.' WHERE id=?").run(row.id);continue;}message=renderAlertTemplate('rain_2h',{minutes:Math.max(1,Math.round(eta-elapsed))});db.prepare('UPDATE automated_alerts SET message=? WHERE id=?').run(message,row.id);}sendable.push({...row,message});}
@@ -1703,10 +1752,10 @@ async function dispatchAlertQueue(){
 }
 let alertSchedulerRunning=false;
 async function forEachConcurrent(items,limit,callback){let cursor=0;await Promise.all(Array.from({length:Math.min(limit,items.length)},async()=>{while(cursor<items.length){const index=cursor++;await callback(items[index]);}}));}
-async function runAlertAutomationTick(){
+async function runAlertAutomationTick({organizationId=null}={}){
   if(alertSchedulerRunning)return;alertSchedulerRunning=true;
   const failures=[];
-  try{for(const organization of db.prepare('SELECT id FROM organizations').all()){
+  try{for(const organization of organizationId?db.prepare('SELECT id FROM organizations WHERE id=?').all(organizationId):db.prepare('SELECT id FROM organizations').all()){
     const settings=alertSettingsFor(organization.id),config=runtimeAlertConfig(settings);config.organizationId=organization.id;if(!config.enabled)continue;
     const sites=db.prepare('SELECT * FROM sites WHERE organization_id=? AND latitude IS NOT NULL AND longitude IS NOT NULL ORDER BY id').all(organization.id);
     await forEachConcurrent(sites,4,async site=>{try{
@@ -1729,10 +1778,10 @@ async function runAlertAutomationTick(){
         if(status!=='skipped')existingKeys.add(eventLookup);
       }
     }catch(error){console.error(`Alert automation failed for site ${site.id}: ${error.name}`);failures.push({siteId:site.id,error});}});
-  }await dispatchAlertQueue();if(failures.length)throw new Error(`${failures.length} alert site(s) failed`);}catch(error){console.error(`Alert automation cycle failed: ${error.name}`);throw error;}finally{alertSchedulerRunning=false;}
+  }await dispatchAlertQueue(organizationId);if(failures.length)throw new Error(`${failures.length} alert site(s) failed`);}catch(error){console.error(`Alert automation cycle failed: ${error.name}`);throw error;}finally{alertSchedulerRunning=false;}
 }
 jobRunner.register('alert_automation', runAlertAutomationTick, { jitterMs: 0 });
-async function runAlertAutomation(){ return jobRunner.execute('alert_automation'); }
+async function runAlertAutomation(organizationId=null){ return jobRunner.execute('alert_automation',organizationId?{organizationId}:{}); }
 function meterSmsAttempt(entries,usageContext={},status,attemptId=token(16)){
   const {organizationId,siteId=null,category='routine',feature='sms'}=usageContext;
   if(!organizationId)return;
@@ -1821,9 +1870,9 @@ async function syncEmergencySms({seed=false,incomingMessages=null}={}) {
     // TextBee credentials are shared at server level. Do not fan a shared
     // phone number's incoming message into multiple organization accounts.
     if(orgs.size>1){
-      const recentOwners=new Set(smsPhoneKeys(sender).flatMap(key=>[...recentSmsOwners(key)]));
-      if(recentOwners.size!==1)continue;
-      for(const orgId of [...orgs.keys()])if(!recentOwners.has(orgId))orgs.delete(orgId);
+      const recentOwner=smsPhoneKeys(sender).map(recentSmsOwner).find(Boolean);
+      if(!recentOwner||!orgs.has(recentOwner))continue;
+      for(const orgId of [...orgs.keys()])if(orgId!==recentOwner)orgs.delete(orgId);
     }
     for(const [orgId,orgMatches] of orgs){
       const stamp=item.receivedAt||item.createdAt||new Date().toISOString();
