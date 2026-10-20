@@ -1515,17 +1515,17 @@ app.get('/api/geocode/reverse', requireUser, async (req, res) => {
   } catch { if(!metered)metering.recordUsage({organizationId:req.user.organization_id,eventType:'geocode_call',provider:'nominatim',feature:'reverse',quantity:1,unit:'call',status:'failed',latencyMs:Date.now()-started,idempotencyKey:`geocode:${requestId}`});sendError(res, 502, 'Could not retrieve this place from OpenStreetMap. You can still save the coordinates.'); }
 });
 
-async function geminiGenerate(contents, instruction, jsonResponse = false, { organizationId = null, feature = 'chat' } = {}) {
+async function geminiGenerate(contents, instruction, jsonResponse = false, { organizationId = null, feature = 'chat', timeoutMs = 20000, maxOutputTokens = 700 } = {}) {
   if (!GEMINI_API_KEY) throw new Error('Gemini is not configured. Set GEMINI_API_KEY in the server .env file.');
   const started=Date.now(),inputText=`${instruction}\n${JSON.stringify(contents)}`;
-  const quota=checkUsageDispatch(db,{organizationId,eventType:'ai_call',quantity:estimateGeminiTokens(inputText,'').inputTokens+700});
+  const quota=checkUsageDispatch(db,{organizationId,eventType:'ai_call',quantity:estimateGeminiTokens(inputText,'').inputTokens+maxOutputTokens});
   if(!quota.allowed)throw Object.assign(new Error('AI usage allowance reached for this plan.'),{code:'PLAN_USAGE_LIMIT'});
   const recordGemini=(status,usage,latency)=>metering.recordUsage({organizationId,eventType:'ai_call',provider:'gemini',feature,quantity:usage.inputTokens+usage.outputTokens,unit:'token',rateDivisor:1000000,tokensInput:usage.inputTokens,tokensOutput:usage.outputTokens,estimated:usage.estimated,status,model:GEMINI_MODEL,latencyMs:latency,metadata:{estimated:usage.estimated},idempotencyKey:`gemini:${token(16)}`});
-  const generationConfig = { maxOutputTokens:700 };
+  const generationConfig = { maxOutputTokens };
   if (GEMINI_MODEL.startsWith('gemini-3')) generationConfig.thinkingConfig={thinkingLevel:GEMINI_MODEL==='gemini-3.5-flash-lite'?'minimal':'low'};
   if (jsonResponse) generationConfig.responseMimeType='application/json';
   let response;
-  try { response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`,{method:'POST',signal:AbortSignal.timeout(50000),headers:{'x-goog-api-key':GEMINI_API_KEY,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({systemInstruction:{parts:[{text:instruction}]},contents,generationConfig})}); }
+  try { response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`,{method:'POST',signal:AbortSignal.timeout(timeoutMs),headers:{'x-goog-api-key':GEMINI_API_KEY,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({systemInstruction:{parts:[{text:instruction}]},contents,generationConfig})}); }
   catch { const usage={...estimateGeminiTokens(inputText,''),outputTokens:0};recordGemini('failed',usage,Date.now()-started);throw new Error("Could not connect to Gemini. Check the server's internet connection."); }
   const result=await response.json().catch(()=>({}));
   const candidate=result.candidates?.[0]||{}, answer=(candidate.content?.parts||[]).map(part=>part.text||'').join('\n').trim();
@@ -1985,29 +1985,40 @@ app.put('/api/breaks',csrfAndOrigin,requireUser,async(req,res)=>{
 });
 app.post('/api/breaks/ai-schedule',csrfAndOrigin,requireUser,async(req,res)=>{
   if (!rateAllowed(req,'gemini-schedule',4,3600)) return sendError(res,429,'AI scheduling limit reached. Try again later.');
-  if (!GEMINI_API_KEY) return sendError(res,503,'Gemini is not configured. Set GEMINI_API_KEY in JibonGuard AI/.env and restart the server.');
   const sites=db.prepare('SELECT id,name,address,latitude,longitude FROM sites WHERE organization_id=? ORDER BY name COLLATE NOCASE LIMIT 20').all(req.user.organization_id);
   if (!sites.length) return sendError(res,422,'Add a saved worksite with map coordinates before asking AI to schedule breaks.');
   if (!sites.some(site=>site.latitude!=null&&site.longitude!=null)) return sendError(res,422,'Add latitude and longitude to at least one saved worksite before AI scheduling.');
-  const pending=[], errors=[];
-  for (const site of sites.filter(item=>item.latitude!=null&&item.longitude!=null)) {
-    try {
-      const weather=await openMeteo(site,1,req.user.organization_id),current=weather.current,hourly=weather.hourly||{},forecast=(hourly.time||[]).slice(0,24).filter((_,i)=>i%2===0).map((time,i)=>({time,temperature_c:(hourly.temperature_2m||[])[i*2],feels_like_c:(hourly.apparent_temperature||[])[i*2],rain_probability_percent:(hourly.precipitation_probability||[])[i*2],weather_code:(hourly.weather_code||[])[i*2],wind_speed_m_s:(hourly.wind_speed_10m||[])[i*2]}));
-      const context={site:site.name,address:site.address,timezone:weather.timezone||'UTC',current:{temperature_2m:current.temperature_2m,apparent_temperature:current.apparent_temperature,relative_humidity_2m:current.relative_humidity_2m,precipitation:current.precipitation,weather_code:current.weather_code,wind_speed_10m:current.wind_speed_10m,wind_gusts_10m:current.wind_gusts_10m},next_hours:forecast};
-      const instruction='Recommend at most one safety log using only supplied Open-Meteo data. Return JSON with action (schedule or no_schedule), alert_type (break, rain, or storm), duration_minutes (10, 15, or 20), rationale (under 35 words). Use storm for thunderstorms or dangerous wind, rain for substantial rain risk, and a routine water/shade break for dangerous heat. Choose no_schedule only when no safety action is warranted. Never invent observations.';
-      const decision=JSON.parse(await geminiGenerate([{role:'user',parts:[{text:JSON.stringify(context)}]}],instruction,true,{organizationId:req.user.organization_id,feature:'break_suggestion'}));
-      const code=Number(current.weather_code),gusts=Number(current.wind_gusts_10m),apparent=Number(current.apparent_temperature),maxRain=Math.max(0,...forecast.map(item=>Number(item.rain_probability_percent)||0));
-      if([95,96,99].includes(code)||gusts>=20)Object.assign(decision,{action:'schedule',alert_type:'storm'});else if(maxRain>=70)Object.assign(decision,{action:'schedule',alert_type:'rain'});else if(apparent>=35)Object.assign(decision,{action:'schedule',alert_type:'break'});
-      if(decision.action!=='schedule'||!['break','rain','storm'].includes(decision.alert_type))continue;
-      const stamp=String(current.time||new Date().toISOString()).slice(0,16),localClock=new Date(`${stamp}:00Z`),scheduled=new Date(localClock);scheduled.setUTCMinutes(0,0,0);if(scheduled<=new Date(localClock.getTime()+1200000))scheduled.setUTCHours(scheduled.getUTCHours()+1);while(scheduled.getUTCHours()%2)scheduled.setUTCHours(scheduled.getUTCHours()+1);
-      pending.push({site,title:BREAK_ALERTS[decision.alert_type],alert_type:decision.alert_type,duration:[10,15,20].includes(Number(decision.duration_minutes))?Number(decision.duration_minutes):15,rationale:String(decision.rationale||'Weather safety break recommended.').replace(/\s+/g,' ').slice(0,300),date:scheduled.toISOString().slice(0,10),time:`${String(scheduled.getUTCHours()).padStart(2,'0')}:${String(scheduled.getUTCMinutes()).padStart(2,'0')}`});
-    }catch(error){if(error.code==='PLAN_USAGE_LIMIT')return sendError(res,402,error.message);console.error(`AI schedule skipped ${site.id}: ${error.name}`);errors.push(error.message);}
+  const eligibleSites=sites.filter(site=>site.latitude!=null&&site.longitude!=null),errors=[];
+  const weatherResults=await Promise.all(eligibleSites.map(async(site,index)=>{
+    try{
+      const weather=await openMeteo(site,1,req.user.organization_id),current=weather.current||{},hourly=weather.hourly||{},forecast=(hourly.time||[]).slice(0,24).filter((_,i)=>i%2===0).map((time,i)=>({time,temperature_c:(hourly.temperature_2m||[])[i*2],feels_like_c:(hourly.apparent_temperature||[])[i*2],rain_probability_percent:(hourly.precipitation_probability||[])[i*2],weather_code:(hourly.weather_code||[])[i*2],wind_speed_m_s:(hourly.wind_speed_10m||[])[i*2]}));
+      return {site,site_key:`site_${index+1}`,weather,current,forecast,context:{site_key:`site_${index+1}`,timezone:weather.timezone||'UTC',current:{temperature_2m:current.temperature_2m,apparent_temperature:current.apparent_temperature,relative_humidity_2m:current.relative_humidity_2m,precipitation:current.precipitation,weather_code:current.weather_code,wind_speed_10m:current.wind_speed_10m,wind_gusts_10m:current.wind_gusts_10m},next_hours:forecast}};
+    }catch(error){console.error(`AI schedule weather skipped ${site.id}: ${error.name}`);errors.push(error);return null;}
+  }));
+  const weatherQuotaError=errors.find(error=>error.code==='PLAN_USAGE_LIMIT');if(weatherQuotaError)return sendError(res,402,weatherQuotaError.message);
+  const contexts=weatherResults.filter(Boolean);
+  if(!contexts.length){const quotaError=errors.find(error=>error.code==='PLAN_USAGE_LIMIT');if(quotaError)return sendError(res,402,quotaError.message);return sendError(res,502,'Weather data could not be loaded for any saved worksite. Check the site coordinates and try again.');}
+  let modelDecisions=new Map(),aiFallback=!GEMINI_API_KEY;
+  if(GEMINI_API_KEY)try{
+    const instruction='For each supplied worksite, recommend at most one safety log using only its supplied Open-Meteo data. Return JSON exactly as {"decisions":[{"site_key":"site_1","action":"schedule"|"no_schedule","alert_type":"break"|"rain"|"storm","duration_minutes":10|15|20,"rationale":"under 35 words"}]}. Include every site_key once. Use storm for thunderstorms or dangerous wind, rain for substantial rain risk, and a routine water/shade break for dangerous heat. Choose no_schedule when no safety action is warranted. Never invent observations.';
+    const answer=await geminiGenerate([{role:'user',parts:[{text:JSON.stringify(contexts.map(item=>item.context))}]}],instruction,true,{organizationId:req.user.organization_id,feature:'break_suggestion',timeoutMs:12000,maxOutputTokens:1600});
+    const parsed=JSON.parse(answer),decisions=Array.isArray(parsed?.decisions)?parsed.decisions:[];
+    for(const decision of decisions){if(contexts.some(item=>item.site_key===decision.site_key)&&['schedule','no_schedule'].includes(decision.action)&&['break','rain','storm'].includes(decision.alert_type))modelDecisions.set(decision.site_key,decision);}
+  }catch(error){if(error.code==='PLAN_USAGE_LIMIT')return sendError(res,402,error.message);aiFallback=true;errors.push(error);console.error(`AI schedule model fallback (${error.name})`);}
+  const pending=[];
+  for(const item of contexts){
+    const current=item.current,decision=modelDecisions.get(item.site_key)||{action:'no_schedule',alert_type:'break'};
+    const code=Number(current.weather_code),gusts=Number(current.wind_gusts_10m),apparent=Number(current.apparent_temperature),maxRain=Math.max(0,...item.forecast.map(forecast=>Number(forecast.rain_probability_percent)||0));
+    if([95,96,99].includes(code)||gusts>=20)Object.assign(decision,{action:'schedule',alert_type:'storm'});else if(maxRain>=70)Object.assign(decision,{action:'schedule',alert_type:'rain'});else if(apparent>=35)Object.assign(decision,{action:'schedule',alert_type:'break'});
+    if(decision.action!=='schedule')continue;
+    const stamp=String(current.time||new Date().toISOString()).slice(0,16),localClock=new Date(`${stamp}:00Z`),scheduled=new Date(localClock);scheduled.setUTCMinutes(0,0,0);if(scheduled<=new Date(localClock.getTime()+1200000))scheduled.setUTCHours(scheduled.getUTCHours()+1);while(scheduled.getUTCHours()%2)scheduled.setUTCHours(scheduled.getUTCHours()+1);
+    pending.push({site:item.site,title:BREAK_ALERTS[decision.alert_type],alert_type:decision.alert_type,duration:[10,15,20].includes(Number(decision.duration_minutes))?Number(decision.duration_minutes):15,rationale:String(decision.rationale||'Weather safety break recommended.').replace(/\s+/g,' ').slice(0,300),date:scheduled.toISOString().slice(0,10),time:`${String(scheduled.getUTCHours()).padStart(2,'0')}:${String(scheduled.getUTCMinutes()).padStart(2,'0')}`});
   }
-  if (!pending.length) { if(errors.length)return sendError(res,502,errors[0]); return res.json({created:[],message:'AI found no suitable weather-based break to schedule, or weather/Gemini was unavailable.'}); }
+  if (!pending.length) return res.json({created:[],message:aiFallback?'AI was slow or unavailable. Weather safety rules found no schedule that needs to be created.':'AI found no suitable weather-based break to schedule.'});
   const created=[],sms=[];let already=0,workerCount=db.prepare('SELECT COUNT(*) AS count FROM workers WHERE organization_id=?').get(req.user.organization_id).count;
   for(const item of pending){const duplicate=db.prepare("SELECT 1 FROM break_logs WHERE organization_id=? AND site=? AND break_date=? AND break_time=? AND source='ai' LIMIT 1").get(req.user.organization_id,item.site.name,item.date,item.time);if(duplicate){already++;continue;}const id=token(12);db.prepare(`INSERT INTO break_logs(id,organization_id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at) VALUES(?,?,?,?,?,?,?,?, 'scheduled','ai',?,?,?)`).run(id,req.user.organization_id,item.title,item.site.name,item.date,item.time,item.duration,workerCount,item.alert_type,item.rationale,now());const record=db.prepare('SELECT id,title,site,break_date,break_time,duration_minutes,worker_count,status,source,alert_type,ai_rationale,created_at FROM break_logs WHERE id=?').get(id);created.push(record);const at=Math.floor(new Date(`${item.date}T${item.time}:00Z`).getTime()/1000),count=queueBreakSms(req.user.organization_id,id,siteWorkersWithPhones(req.user.organization_id,item.site.id),{...record,scheduled_at:at},at);sms.push({status:'scheduled',recipient_count:count});}
   const suffix=already?` ${already} matching AI log(s) already existed.`:'';
-  res.status(201).json({created,sms,message:`AI scheduled ${created.length} weather-based break log(s); worker messages are queued for their break times.${suffix}`});
+  res.status(201).json({created,sms,message:`${aiFallback?'AI was unavailable; ':'AI '}scheduled ${created.length} weather-based break log(s) from current weather conditions; worker messages are queued for their break times.${suffix}`});
 });
 
 function requireCronSecret(req,res){
