@@ -102,7 +102,7 @@ Organizations can enable automation from **AI automation** in the dashboard. The
 
 Configure the master switch and defaults with `ALERT_AUTOMATION_ENABLED`, `ALERT_HEAT_TRIGGER_C`, `ALERT_RAIN_LEAD_MINUTES`, `ALERT_RAIN_PROBABILITY`, `ALERT_COOLDOWN_MINUTES`, `ALERT_DAILY_CAP`, `ALERT_QUIET_START`, `ALERT_QUIET_END`, `ALERT_AUTOMATION_INTERVAL_MS`, and the `AI_ALERTS_*` variables in `.env`. Organization-level overrides are saved by the dashboard.
 
-On Vercel, configure `CRON_SECRET` as a random value of at least 32 characters. Vercel runs inbound SMS sync once per minute and alert automation every 15 minutes through authenticated cron routes. Vercel cron schedules require a plan that supports minute-level schedules. The normal Node server runs these jobs using its built-in timers.
+On Vercel Hobby, configure `CRON_SECRET` as a random value of at least 32 characters. Its single daily cron calls authenticated inbound SMS sync and alert automation. Hobby cannot provide the 30-second SMS polling or 15-minute alert cycle; enable the TextBee webhook for timely inbound messages or use a Vercel plan with more frequent cron schedules. The normal Node server runs these jobs using its built-in timers.
 
 The automation settings page includes a simulator for temperature, rain ETA, and time-of-day scenarios. It does not enqueue or send. Run the rule and guardrail tests with `npm test`. Where this project has no WBGT measurement, apparent temperature is used as a labeled proxy; worker acknowledgement tracking is not currently connected. All Bangla automation templates are marked for native-speaker review. Alert records support safety follow-up and must not be used to rank or punish workers for taking breaks.
 

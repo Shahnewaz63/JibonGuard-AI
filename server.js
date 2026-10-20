@@ -1972,6 +1972,14 @@ app.get('/api/cron/alert-automation',async(req,res)=>{
   if(result?.error)return sendError(res,502,'Alert automation cycle failed.');
   return res.json({ok:true,skipped:Boolean(result?.skipped)});
 });
+app.get('/api/cron/daily-maintenance',async(req,res)=>{
+  if(!requireCronSecret(req,res))return;
+  const inbound=await pollEmergencySms();
+  const alerts=await runAlertAutomation();
+  const jobs={inboundSms:inbound?.error?'failed':inbound?.skipped?'skipped':'ok',alertAutomation:alerts?.error?'failed':alerts?.skipped?'skipped':'ok'};
+  if(Object.values(jobs).includes('failed'))return res.status(502).json({ok:false,jobs});
+  return res.json({ok:true,jobs});
+});
 app.use('/api', (req, res) => sendError(res, 404, 'Not found.'));
 {
   const dist = path.join(__dirname, 'dist');
