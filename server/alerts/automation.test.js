@@ -1,11 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ALERT_CONFIG } from './config.js';
+import { ALERT_CONFIG, loadAlertConfig } from './config.js';
 import { decideAlerts } from './index.js';
 import { callAlertAi } from './ai.js';
 import { dispatchAlertGroups } from './gateway.js';
 
 const config = { ...ALERT_CONFIG, enabled: true, aiEnabled: false, baseHeatTriggerC: 34, workloadOffsets: { Light: 0, Standard: 2, Moderate: 2, Heavy: 4 }, rainLeadMinutes: 120, rainProbability: 60, cooldownMinutes: 40, dailyCap: 2, quietHours: { start: '20:00', end: '06:00' }, staleWeatherMinutes: 45 };
+
+test('alert scheduler defaults to 15 minutes and honors a valid configured interval', () => {
+  assert.equal(loadAlertConfig({}).intervalMs, 15 * 60 * 1000);
+  assert.equal(loadAlertConfig({ ALERT_AUTOMATION_INTERVAL_MS: '900000' }).intervalMs, 15 * 60 * 1000);
+  assert.equal(loadAlertConfig({ ALERT_AUTOMATION_INTERVAL_MS: '0' }).intervalMs, 60 * 1000);
+});
 const context = (overrides = {}) => ({
   worker: { id: 'worker_1', workload: 'Light', riskLevel: '', consentStatus: 'consented', shiftStart: '07:00', shiftEnd: '17:00', continuousHours: 1, ...overrides.worker },
   site: { id: 'site_1', shadeAvailable: true, waterAvailable: true, ...overrides.site },

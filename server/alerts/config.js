@@ -11,7 +11,9 @@ export function loadAlertConfig(env = process.env) {
     apiKey: (env.GEMINI_API_KEY || '').trim(),
     timeoutMs: number(env.AI_ALERTS_TIMEOUT_MS, 8000, 1000, 30000),
     retryCount: number(env.AI_ALERTS_RETRIES, 1, 0, 3),
-    intervalMs: 15 * 60 * 1000,
+    // Keep the documented 15-minute cycle configurable, and reject accidental
+    // zero/negative or excessively frequent polling values.
+    intervalMs: number(env.ALERT_AUTOMATION_INTERVAL_MS, 15 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000),
     baseHeatTriggerC: number(env.ALERT_HEAT_TRIGGER_C, 34, 28, 42),
     workloadOffsets: { Light: 0, Standard: 2, Moderate: 2, Heavy: 4 },
     rainLeadMinutes: number(env.ALERT_RAIN_LEAD_MINUTES, 120, 15, 360),

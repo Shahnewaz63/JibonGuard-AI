@@ -6,6 +6,10 @@
       "maxDuration": 60
     }
   },
+  "crons": [
+    { "path": "/api/cron/inbound-sms", "schedule": "* * * * *" },
+    { "path": "/api/cron/alert-automation", "schedule": "*/15 * * * *" }
+  ],
   "rewrites": [
     {
       "source": "/api",

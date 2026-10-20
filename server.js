@@ -1657,6 +1657,7 @@ async function dispatchAlertQueue(){
 let alertSchedulerRunning=false;
 async function runAlertAutomationTick(){
   if(alertSchedulerRunning)return;alertSchedulerRunning=true;
+  const failures=[];
   try{for(const organization of db.prepare('SELECT id FROM organizations').all()){
     const settings=alertSettingsFor(organization.id),config=runtimeAlertConfig(settings);config.organizationId=organization.id;if(!config.enabled)continue;
     const sites=db.prepare('SELECT * FROM sites WHERE organization_id=? AND latitude IS NOT NULL AND longitude IS NOT NULL ORDER BY id').all(organization.id);
@@ -1666,11 +1667,11 @@ async function runAlertAutomationTick(){
       for(const decision of result.decisions){const context=contexts.find(item=>item.worker.id===decision.workerId);if(!context)continue;const eventKey=alertEventKey(decision,context),existing=db.prepare("SELECT id FROM automated_alerts WHERE organization_id=? AND worker_id=? AND event_key=? AND status IN ('sent','queued','scheduled')").get(organization.id,decision.workerId,eventKey);let status=decision.final_status==='skipped'?'skipped':decision.final_status==='scheduled'?'scheduled':'queued',reason=decision.reason;const mergeTarget=!existing&&decision.action==='merge'?db.prepare("SELECT id,message,scheduled_at FROM automated_alerts WHERE organization_id=? AND worker_id=? AND channel=? AND status IN ('queued','scheduled') ORDER BY scheduled_at LIMIT 1").get(organization.id,decision.workerId,decision.channel):null;if(existing){status='skipped';reason='Duplicate weather event already alerted.';}else if(mergeTarget){status='merged';reason='Merged with a pending template alert.';db.prepare("UPDATE automated_alerts SET message=message||char(10)||?,reason=reason||? WHERE id=?").run(decision.message,` Merged ${decision.alert_type} reminder.`,mergeTarget.id);}const scheduledAt=status==='scheduled'?Math.floor(Date.parse(decision.send_at)/1000):mergeTarget?mergeTarget.scheduled_at:now(),id=token(12),safeContext={worker:{...context.worker,phone:undefined,name:undefined},state:context.state,site:context.site,weather:context.weather,rule:context.rule,limits:context.limits};
         db.prepare('INSERT INTO automated_alerts(id,organization_id,worker_id,site_id,event_key,alert_type,channel,action,status,scheduled_at,created_at,reason,input_hash,model_output,input_context,variables,message,floor) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,organization.id,decision.workerId,site.id,eventKey,decision.alert_type,decision.channel,decision.action,status,scheduledAt,now(),reason,decision.inputHash,decision.modelOutput==null?'':JSON.stringify(decision.modelOutput),JSON.stringify(safeContext),JSON.stringify(decision.variables||{}),decision.message,decision.floor?1:0);
       }
-    }catch(error){console.error(`Alert automation failed for site ${site.id}: ${error.message}`);}
-  }await dispatchAlertQueue();}catch(error){console.error(`Alert automation cycle failed: ${error.message}`);}finally{alertSchedulerRunning=false;}
+    }catch(error){console.error(`Alert automation failed for site ${site.id}: ${error.name}`);failures.push({siteId:site.id,error});}
+  }await dispatchAlertQueue();if(failures.length)throw new Error(`${failures.length} alert site(s) failed`);}catch(error){console.error(`Alert automation cycle failed: ${error.name}`);throw error;}finally{alertSchedulerRunning=false;}
 }
 jobRunner.register('alert_automation', runAlertAutomationTick, { jitterMs: 0 });
-async function runAlertAutomation(){ await jobRunner.execute('alert_automation'); }
+async function runAlertAutomation(){ return jobRunner.execute('alert_automation'); }
 function meterSmsAttempt(entries,usageContext={},status,attemptId=token(16)){
   const {organizationId,siteId=null,category='routine',feature='sms'}=usageContext;
   if(!organizationId)return;
@@ -1793,12 +1794,12 @@ async function syncEmergencySms({seed=false,incomingMessages=null}={}) {
 }
 let emergencySmsPollRunning=false;
 async function pollEmergencySms() {
-  if(emergencySmsPollRunning)return;
+  if(emergencySmsPollRunning)return {skipped:true};
   emergencySmsPollRunning=true;
   try{
     const seeded=db.prepare("SELECT value FROM sms_sync_state WHERE key='emergency_seeded'").get();
-    await syncEmergencySms({seed:!seeded});
-  }catch(error){console.error(`Emergency SMS poll failed (${error.name})`);}
+    return await syncEmergencySms({seed:!seeded});
+  }catch(error){console.error(`Emergency SMS poll failed (${error.name})`);return {error:String(error.name||'Error')};}
   finally{emergencySmsPollRunning=false;}
 }
 const WORKLOAD_LEVELS=['Light','Standard','Heavy'];
@@ -1893,6 +1894,23 @@ app.post('/api/breaks/ai-schedule',csrfAndOrigin,requireUser,async(req,res)=>{
   res.status(201).json({created,sms,message:`AI scheduled ${created.length} weather-based break log(s); worker messages are queued for their break times.${suffix}`});
 });
 
+function requireCronSecret(req,res){
+  const secret=String(process.env.CRON_SECRET||'');
+  const supplied=String(req.get('authorization')||'').replace(/^Bearer\s+/i,'');
+  if(secret.length<32||!/^[A-Za-z0-9_-]+$/.test(secret)||!/^[A-Za-z0-9_-]+$/.test(supplied)||supplied.length!==secret.length||!timingSafeEqual(Buffer.from(supplied),Buffer.from(secret))){sendError(res,401,'Unauthorized scheduled job request.');return false;}
+  return true;
+}
+app.get('/api/cron/inbound-sms',async(req,res)=>{
+  if(!requireCronSecret(req,res))return;
+  try{const result=await pollEmergencySms();if(result?.error)return sendError(res,502,'Inbound SMS sync failed.');return res.json({ok:true,...result});}
+  catch(error){console.error(`Inbound SMS cron failed: ${error.name}`);return sendError(res,502,'Inbound SMS sync failed.');}
+});
+app.get('/api/cron/alert-automation',async(req,res)=>{
+  if(!requireCronSecret(req,res))return;
+  const result=await runAlertAutomation();
+  if(result?.error)return sendError(res,502,'Alert automation cycle failed.');
+  return res.json({ok:true,skipped:Boolean(result?.skipped)});
+});
 app.use('/api', (req, res) => sendError(res, 404, 'Not found.'));
 {
   const dist = path.join(__dirname, 'dist');
