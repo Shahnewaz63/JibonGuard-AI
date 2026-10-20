@@ -1,4 +1,4 @@
-const PLAN_CATALOG_VERSION = 9;
+const PLAN_CATALOG_VERSION = 1001;
 const PLAN_FEATURES = {
   basic: ['ai_chat','ai_alert_automation','simulator','csv_import','data_export'],
   pro: ['ai_chat','ai_alert_automation','simulator','voice_alerts','csv_import','data_export'],
@@ -58,7 +58,7 @@ export function applyPlanCatalogMigration(db, { now = () => Math.floor(Date.now(
 }
 
 export function applyBasicCapacityMigration(db,{now=()=>Math.floor(Date.now()/1000)}={}){
-  const version=10;
+  const version=1002;
   db.exec('CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at INTEGER NOT NULL)');
   if(db.prepare('SELECT 1 FROM schema_migrations WHERE version=?').get(version))return false;
   const stamp=now();
@@ -67,6 +67,23 @@ export function applyBasicCapacityMigration(db,{now=()=>Math.floor(Date.now()/10
     db.prepare("UPDATE plan_limits SET value=30,unlimited=0,updated_at=? WHERE plan_id='sample-basic' AND limit_key='workers'").run(stamp);
     db.prepare("UPDATE plan_limits SET value=5,unlimited=0,updated_at=? WHERE plan_id='sample-basic' AND limit_key='sites'").run(stamp);
     db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)').run(version,'basic_plan_capacity_30_workers_5_sites',stamp);
+    db.exec('COMMIT');
+    return true;
+  }catch(error){try{db.exec('ROLLBACK');}catch{}throw error;}
+}
+
+export function applyBasicPlanEnforcementMigration(db,{now=()=>Math.floor(Date.now()/1000)}={}){
+  const version=1003;
+  db.exec('CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at INTEGER NOT NULL)');
+  if(db.prepare('SELECT 1 FROM schema_migrations WHERE version=?').get(version))return false;
+  const stamp=now(),price=db.prepare("SELECT amount_minor,currency FROM plan_prices WHERE plan_id='sample-basic' AND billing_cycle='monthly' ORDER BY effective_from DESC,version DESC LIMIT 1").get()||{amount_minor:0,currency:'BDT'};
+  db.exec('BEGIN');
+  try{
+    db.prepare("INSERT INTO subscriptions(id,organization_id,plan_id,status,billing_cycle,price_minor,currency,current_period_start,current_period_end,created_at,updated_at) SELECT 'basic-default-'||o.id,o.id,'sample-basic','active','monthly',0,?,?,?, ?,? FROM organizations o WHERE NOT EXISTS(SELECT 1 FROM subscriptions s WHERE s.organization_id=o.id)")
+      .run(price.currency,stamp,stamp+30*86400,stamp,stamp);
+    db.prepare("UPDATE plan_overage_settings SET policy='block',updated_at=? WHERE plan_id='sample-basic'").run(stamp);
+    db.prepare("INSERT INTO plan_overage_settings(plan_id,policy,updated_at) VALUES('sample-basic','block',?) ON CONFLICT(plan_id) DO UPDATE SET policy='block',updated_at=excluded.updated_at").run(stamp);
+    db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)').run(version,'enforce_basic_plan_usage_limits',stamp);
     db.exec('COMMIT');
     return true;
   }catch(error){try{db.exec('ROLLBACK');}catch{}throw error;}

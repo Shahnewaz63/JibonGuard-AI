@@ -32,7 +32,7 @@ function calculateOverage(db,event,createdAt,quantity){
     if(Number.isSafeInteger(row?.value))allowance=row.value;
   }
   if(allowance===null)return 0;
-  const periodConsumed=Number(db.prepare('SELECT COALESCE(SUM(quantity),0) AS n FROM usage_events WHERE organization_id=? AND event_type=? AND created_at>=? AND created_at<?').get(event.organizationId,event.eventType,subscription.current_period_start,subscription.current_period_end).n||0);
+  const periodConsumed=Number(db.prepare("SELECT COALESCE(SUM(quantity),0) AS n FROM usage_events WHERE organization_id=? AND event_type=? AND status IN ('queued','sent','delivered','success') AND created_at>=? AND created_at<?").get(event.organizationId,event.eventType,subscription.current_period_start,subscription.current_period_end).n||0);
   const unitScale=event.eventType==='voice_seconds'?60:1,limit=allowance*unitScale,already=periodConsumed;
   const policy=db.prepare('SELECT policy FROM plan_overage_settings WHERE plan_id=?').get(subscription.plan_id)?.policy||'soft_warn';
   if(policy!=='charge_overage')return 0;

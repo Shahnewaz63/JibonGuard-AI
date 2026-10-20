@@ -11,7 +11,7 @@ import { decideAlerts } from './server/alerts/index.js';
 import { renderAlertTemplate } from './server/alerts/templates.js';
 import { dispatchAlertGroups } from './server/alerts/gateway.js';
 import { runMigrations } from './server/db/migrations.js';
-import { applyBasicCapacityMigration, applyPlanCatalogMigration } from './server/billing/planCatalog.js';
+import { applyBasicCapacityMigration, applyBasicPlanEnforcementMigration, applyPlanCatalogMigration } from './server/billing/planCatalog.js';
 import { createJobRunner } from './server/jobs/runner.js';
 import { writeAdminAudit } from './server/billing/audit.js';
 import { hasPermission } from './server/billing/permissions.js';
@@ -111,6 +111,7 @@ for(const row of db.prepare('SELECT id,workload_levels FROM break_logs').all()){
 if (!USING_POSTGRES) runMigrations(db, { databasePath: DB_PATH, development: !IS_PRODUCTION });
 applyPlanCatalogMigration(db);
 applyBasicCapacityMigration(db);
+applyBasicPlanEnforcementMigration(db);
 const jobRunner = createJobRunner({ db });
 const metering = createMeteringService(db, { logger: console, defaultCurrency: 'BDT' });
 const USAGE_ROLLUP_INTERVAL_MS=Math.max(60000,Number(process.env.BILLING_ROLLUP_INTERVAL_MS||86400000));
@@ -487,7 +488,7 @@ function savePlanSettings(planId,input,stamp){
     db.prepare('INSERT INTO plan_limits(plan_id,limit_key,value,unlimited,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(plan_id,limit_key) DO UPDATE SET value=excluded.value,unlimited=excluded.unlimited,updated_at=excluded.updated_at').run(planId,key,limit.unlimited?null:limit.value,limit.unlimited?1:0,stamp);
   }
   for(const [key,enabled] of Object.entries(input.features||{}))db.prepare('INSERT INTO plan_features(plan_id,feature_key,enabled,updated_at) VALUES(?,?,?,?) ON CONFLICT(plan_id,feature_key) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at').run(planId,key,enabled?1:0,stamp);
-  if(input.overage)db.prepare('INSERT INTO plan_overage_settings(plan_id,policy,warning_80,warning_100,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(plan_id) DO UPDATE SET policy=excluded.policy,warning_80=excluded.warning_80,warning_100=excluded.warning_100,updated_at=excluded.updated_at').run(planId,input.overage.policy,input.overage.warning_80,input.overage.warning_100,stamp);
+  if(input.overage)db.prepare('INSERT INTO plan_overage_settings(plan_id,policy,warning_80,warning_100,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(plan_id) DO UPDATE SET policy=excluded.policy,warning_80=excluded.warning_80,warning_100=excluded.warning_100,updated_at=excluded.updated_at').run(planId,planId==='sample-basic'?'block':input.overage.policy,input.overage.warning_80,input.overage.warning_100,stamp);
 }
 app.get('/api/admin/plans/:id',requireAdmin,adminPermission('plans_read'),(req,res)=>{
   const plan=readAdminPlan(req.params.id);if(!plan)return sendError(res,404,'Plan not found.');
@@ -554,7 +555,7 @@ app.get('/api/admin/usage',requireAdmin,adminPermission('usage_read'),(req,res)=
   const items=db.prepare(`SELECT u.id,u.organization_id,o.name AS organization_name,u.site_id,u.event_type,u.provider,u.feature,u.quantity,u.unit,u.status,u.category,u.tokens_input,u.tokens_output,u.tokens_total,u.latency_ms,u.estimated,u.unit_cost_minor,u.unit_price_minor,u.cost_minor,u.price_minor,u.currency,u.model,u.created_at
     FROM usage_events u JOIN organizations o ON o.id=u.organization_id ${where} ORDER BY u.created_at DESC LIMIT ? OFFSET ?`).all(...args,limit,offset);
   const periodNow=now(),organizations=db.prepare(`SELECT o.id,o.name,s.plan_id,s.current_period_start,s.current_period_end,p.name AS plan_name,(SELECT COUNT(*) FROM workers w WHERE w.organization_id=o.id) AS workers,(SELECT COUNT(*) FROM sites si WHERE si.organization_id=o.id) AS sites FROM organizations o LEFT JOIN subscriptions s ON s.id=(SELECT s2.id FROM subscriptions s2 WHERE s2.organization_id=o.id ORDER BY s2.created_at DESC LIMIT 1) LEFT JOIN plans p ON p.id=s.plan_id WHERE NOT EXISTS (SELECT 1 FROM soft_delete_records sd WHERE sd.entity_type='organization' AND sd.entity_id=o.id) ORDER BY o.name`).all();
-  const organizationUsage=organizations.map(org=>{const from=org.current_period_start||Math.floor(Date.UTC(new Date(periodNow*1000).getUTCFullYear(),new Date(periodNow*1000).getUTCMonth(),1)/1000),to=org.current_period_end?Math.min(periodNow,org.current_period_end):periodNow,usage=Object.fromEntries(db.prepare('SELECT event_type,SUM(quantity) AS quantity,SUM(cost_minor) AS cost_minor FROM usage_events WHERE organization_id=? AND created_at>=? AND created_at<? GROUP BY event_type').all(org.id,from,to).map(row=>[row.event_type,{quantity:Number(row.quantity||0),cost_minor:Number(row.cost_minor||0)}])),limits=org.plan_id?Object.fromEntries(db.prepare('SELECT limit_key,value,unlimited FROM plan_limits WHERE plan_id=?').all(org.plan_id).map(row=>[row.limit_key,row.unlimited?null:Number(row.value)])):{};return {id:org.id,name:org.name,plan_name:org.plan_name||'Basic',workers:Number(org.workers),sites:Number(org.sites),usage,limits};});
+  const organizationUsage=organizations.map(org=>{const from=org.current_period_start||Math.floor(Date.UTC(new Date(periodNow*1000).getUTCFullYear(),new Date(periodNow*1000).getUTCMonth(),1)/1000),to=org.current_period_end?Math.min(periodNow,org.current_period_end):periodNow,usage=Object.fromEntries(db.prepare("SELECT event_type,SUM(quantity) AS quantity,SUM(cost_minor) AS cost_minor FROM usage_events WHERE organization_id=? AND created_at>=? AND created_at<? AND status IN ('queued','sent','delivered','success') GROUP BY event_type").all(org.id,from,to).map(row=>[row.event_type,{quantity:Number(row.quantity||0),cost_minor:Number(row.cost_minor||0)}])),limits=org.plan_id?Object.fromEntries(db.prepare('SELECT limit_key,value,unlimited FROM plan_limits WHERE plan_id=?').all(org.plan_id).map(row=>[row.limit_key,row.unlimited?null:Number(row.value)])):{};return {id:org.id,name:org.name,plan_name:org.plan_name||'Basic',workers:Number(org.workers),sites:Number(org.sites),usage,limits};});
   res.set('Cache-Control','no-store').json({items,total,limit,offset,organization_usage:organizationUsage});
 });
 app.get('/api/admin/rates',requireAdmin,adminPermission('billing_read'),(_req,res)=>{
@@ -627,7 +628,7 @@ app.get('/api/billing',requireUser,(req,res)=>{
   const resources={workers:Number(db.prepare('SELECT COUNT(*) AS n FROM workers WHERE organization_id=?').get(org).n),sites:Number(db.prepare('SELECT COUNT(*) AS n FROM sites WHERE organization_id=?').get(org).n)};
   const stamp=now(),monthStart=Math.floor(Date.UTC(new Date(stamp*1000).getUTCFullYear(),new Date(stamp*1000).getUTCMonth(),1)/1000),monthEnd=Math.floor(Date.UTC(new Date(stamp*1000).getUTCFullYear(),new Date(stamp*1000).getUTCMonth()+1,1)/1000);
   const usageStart=subscription?.current_period_start??monthStart,usageEnd=subscription?Math.min(stamp,subscription.current_period_end):stamp;
-  const usage=db.prepare('SELECT event_type,SUM(quantity) AS quantity,SUM(cost_minor) AS cost_minor,SUM(price_minor) AS price_minor FROM usage_events WHERE organization_id=? AND created_at>=? AND created_at<? GROUP BY event_type').all(org,usageStart,usageEnd);
+  const usage=db.prepare("SELECT event_type,SUM(quantity) AS quantity,SUM(cost_minor) AS cost_minor,SUM(price_minor) AS price_minor FROM usage_events WHERE organization_id=? AND created_at>=? AND created_at<? AND status IN ('queued','sent','delivered','success') GROUP BY event_type").all(org,usageStart,usageEnd);
   const entitlements=getOrganizationEntitlements(db,org,subscription&&['trialing','active','past_due','suspended'].includes(subscription.status)?subscription:null);
   let defaultPlan=null;
   if(!subscription){const plan=db.prepare("SELECT * FROM plans WHERE id='sample-basic'").get();if(plan){const price=db.prepare("SELECT amount_minor,currency FROM plan_prices WHERE plan_id=? AND billing_cycle='monthly' ORDER BY effective_from DESC LIMIT 1").get(plan.id);defaultPlan={name:plan.name,price_minor:Number(price?.amount_minor??99900),currency:price?.currency||'BDT',period_start:monthStart,period_end:monthEnd};for(const row of db.prepare('SELECT limit_key,value,unlimited FROM plan_limits WHERE plan_id=?').all(plan.id))entitlements.limits[row.limit_key]=row.unlimited?{unlimited:true,value:null}:{unlimited:false,value:row.value};}}
@@ -1030,7 +1031,7 @@ app.post('/api/auth/signup', csrfAndOrigin, async (req, res) => {
   if(!['monthly','yearly'].includes(billingCycle))return sendError(res,422,'Choose a valid billing cycle.');
   let selectedPlan;
   if(selectedSlug){selectedPlan=db.prepare("SELECT * FROM plans WHERE slug=? AND status='active' AND sample_values=0").get(selectedSlug);if(!selectedPlan)return sendError(res,422,'That plan is not currently available.');}
-  else{const defaultPlanId=String(billingSetting('default_plan_id','sample-basic'));selectedPlan=db.prepare('SELECT * FROM plans WHERE id=?').get(defaultPlanId)||db.prepare("SELECT * FROM plans WHERE id='sample-basic'").get();}
+  else{selectedPlan=db.prepare("SELECT * FROM plans WHERE id='sample-basic'").get();}
   const selectedPrice=db.prepare('SELECT amount_minor,currency FROM plan_prices WHERE plan_id=? AND billing_cycle=? ORDER BY effective_from DESC,version DESC LIMIT 1').get(selectedPlan.id,billingCycle);
   if(!selectedPrice)return sendError(res,422,'That plan does not have a price for the selected billing cycle.');
   const ids = token(18), organizationId = token(18), stamp = now(), { passwordHash, passwordSalt } = await hashPassword(password);
@@ -1416,6 +1417,7 @@ async function openMeteo(site, forecastDays = 1, organizationId = null) {
   const key=`${orgId||'public'}:${site.latitude}:${site.longitude}:${forecastDays}`,cached=OPEN_METEO_CACHE.get(key);
   if(cached&&cached.expires>Date.now())return cached.raw;
   if(OPEN_METEO_IN_FLIGHT.has(key))return OPEN_METEO_IN_FLIGHT.get(key);
+  if(orgId){const quota=checkUsageDispatch(db,{organizationId:orgId,eventType:'weather_api_call',quantity:1});if(!quota.allowed)throw Object.assign(new Error('Monthly weather check allowance reached for this plan.'),{code:'PLAN_USAGE_LIMIT'});}
   const request=(async()=>{
     const started=Date.now();let response;
     try{response=await fetch(`https://${host}/v1/forecast?${params}`, { signal: AbortSignal.timeout(15000), headers: { Accept: 'application/json', 'User-Agent': 'JibonGuard/1.0' } });}
@@ -1476,7 +1478,7 @@ app.get('/api/sites/:siteId/weather', requireUser, async (req, res) => {
     return res.json({site_id:site.id,weather:cached.value,cached:true,stale:true});
   }
   try { const result = shapeWeather(await openMeteo(site,1,req.user.organization_id)); WEATHER_CACHE.set(cacheKey, { expires:Date.now()+600000,value:result }); res.json({ site_id:site.id,weather:result,cached:false }); }
-  catch (error) { sendError(res, 502, error.message || "Could not reach Open-Meteo. Check the server's internet connection and try again."); }
+  catch (error) { sendError(res, error.code==='PLAN_USAGE_LIMIT'?402:502, error.message || "Could not reach Open-Meteo. Check the server's internet connection and try again."); }
 });
 app.get('/api/geocode/search', requireUser, async (req, res) => {
   const query = String(req.query.q || '').trim().replace(/\s+/g, ' ');
@@ -1516,6 +1518,8 @@ app.get('/api/geocode/reverse', requireUser, async (req, res) => {
 async function geminiGenerate(contents, instruction, jsonResponse = false, { organizationId = null, feature = 'chat' } = {}) {
   if (!GEMINI_API_KEY) throw new Error('Gemini is not configured. Set GEMINI_API_KEY in the server .env file.');
   const started=Date.now(),inputText=`${instruction}\n${JSON.stringify(contents)}`;
+  const quota=checkUsageDispatch(db,{organizationId,eventType:'ai_call',quantity:estimateGeminiTokens(inputText,'').inputTokens+700});
+  if(!quota.allowed)throw Object.assign(new Error('AI usage allowance reached for this plan.'),{code:'PLAN_USAGE_LIMIT'});
   const recordGemini=(status,usage,latency)=>metering.recordUsage({organizationId,eventType:'ai_call',provider:'gemini',feature,quantity:usage.inputTokens+usage.outputTokens,unit:'token',rateDivisor:1000000,tokensInput:usage.inputTokens,tokensOutput:usage.outputTokens,estimated:usage.estimated,status,model:GEMINI_MODEL,latencyMs:latency,metadata:{estimated:usage.estimated},idempotencyKey:`gemini:${token(16)}`});
   const generationConfig = { maxOutputTokens:700 };
   if (GEMINI_MODEL.startsWith('gemini-3')) generationConfig.thinkingConfig={thinkingLevel:GEMINI_MODEL==='gemini-3.5-flash-lite'?'minimal':'low'};
@@ -1561,17 +1565,18 @@ app.post('/api/ai/chat', csrfAndOrigin, requireUser, async (req,res) => {
     }
   }
   const instruction="You are JibonGuard's in-app assistant. Help organization administrators understand the dashboard, site weather, worker teams, break logs, and practical heat and weather safety. Be concise and clear. Do not claim to see private organization records or live weather unless supplied in the conversation. Never give a medical diagnosis or claim an emergency is safe; direct urgent situations to local emergency services and official instructions. Do not ask for passwords, API keys, or personal worker details.";
-  try { res.json({ reply:await geminiGenerate(contents,instruction,false,{organizationId:req.user.organization_id,feature:'chat'}) }); } catch(error) { sendError(res,503,error.message); }
+  try { res.json({ reply:await geminiGenerate(contents,instruction,false,{organizationId:req.user.organization_id,feature:'chat'}) }); } catch(error) { sendError(res,error.code==='PLAN_USAGE_LIMIT'?402:503,error.message); }
 });
 // Stream generated speech so the browser can begin playback as audio arrives.
 app.post('/api/ai/speech', csrfAndOrigin, requireUser, async (req,res) => {
+  if(!checkFeatureAccess(db,req.user.organization_id,'voice_alerts').allowed)return sendError(res,402,'AI speech is not included in your current plan.');
   if (!rateAllowed(req,'gemini-speech',30,3600)) return sendError(res,429,'Speech limit reached. Try again in a little while.');
   const text=typeof req.body.text==='string'?req.body.text.trim():'';
   const voice=String(req.body.voice||'Kore');
   if(!text||text.length>5000)return sendError(res,400,'Choose a reply with 1 to 5,000 characters to read aloud.');
   if(!['Kore','Puck','Charon','Aoede'].includes(voice))return sendError(res,400,'Choose one of the available assistant voices.');
   const started=Date.now(),estimatedInput=estimateGeminiTokens(text,'');
-  const quota=checkUsageDispatch(db,{organizationId:req.user.organization_id,eventType:'ai_call',quantity:estimatedInput.inputTokens});if(!quota.allowed)return sendError(res,402,'Speech generation is paused because this organization reached its plan limit or needs to restore its subscription.');
+  const quota=checkUsageDispatch(db,{organizationId:req.user.organization_id,eventType:'ai_call',quantity:estimatedInput.inputTokens+1000}),voiceSeconds=Math.ceil(text.length/10),voiceQuota=checkUsageDispatch(db,{organizationId:req.user.organization_id,eventType:'voice_seconds',quantity:voiceSeconds});if(!quota.allowed||!voiceQuota.allowed)return sendError(res,402,'Speech generation is paused because this organization reached its plan limit or needs to restore its subscription.');
   if(!GEMINI_API_KEY)return sendError(res,503,'Speech service is not configured. Set GEMINI_API_KEY in the server .env file.');
   let response;
   try{
@@ -1579,9 +1584,10 @@ app.post('/api/ai/speech', csrfAndOrigin, requireUser, async (req,res) => {
   }catch{metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:estimatedInput.inputTokens,unit:'token',rateDivisor:1000000,tokensInput:estimatedInput.inputTokens,tokensOutput:0,estimated:true,status:'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});return sendError(res,503,'Could not connect to the speech service. Check the server connection.');}
   if(!response.ok){const result=await response.json().catch(()=>({})),detail=String(result.error?.message||'').replace(/\s+/g,' ').slice(0,220);metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:estimatedInput.inputTokens,unit:'token',rateDivisor:1000000,tokensInput:estimatedInput.inputTokens,tokensOutput:0,estimated:true,status:'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});return sendError(res,503,`Speech service returned HTTP ${response.status}.${detail?' '+detail:' Check the TTS model and API quota.'}`);}
   if(!response.body)return sendError(res,503,'Speech service returned no audio stream.');
-  const reader=response.body.getReader(),decoder=new TextDecoder();let pending='',headersSent=false,hasAudio=false,usageMeta={};
-  const writeEvent=eventText=>{const data=eventText.split(/\r?\n/).filter(line=>line.startsWith('data:')).map(line=>line.slice(5).trim()).join('\n');if(!data||data==='[DONE]')return;let result;try{result=JSON.parse(data);}catch{return;}usageMeta=result.usageMetadata||usageMeta;for(const part of result.candidates?.[0]?.content?.parts||[]){const encoded=part.inlineData?.data;if(!encoded)continue;const audio=Buffer.from(encoded,'base64');if(!audio.length)continue;if(!headersSent){headersSent=true;res.status(200).set({'Content-Type':'audio/L16; rate=24000; channels=1','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.flushHeaders?.();}hasAudio=true;res.write(audio);}};
-  try{while(true){const{done,value}=await reader.read();pending+=decoder.decode(value||new Uint8Array(),{stream:!done});let boundary;while((boundary=pending.search(/\r?\n\r?\n/))>=0){const event=pending.slice(0,boundary);const separator=pending.slice(boundary).match(/^\r?\n\r?\n/)[0];pending=pending.slice(boundary+separator.length);writeEvent(event);}if(done)break;}if(pending.trim())writeEvent(pending);const tokensInput=Number.isSafeInteger(usageMeta.promptTokenCount)?usageMeta.promptTokenCount:estimatedInput.inputTokens,tokensOutput=Number.isSafeInteger(usageMeta.candidatesTokenCount)?usageMeta.candidatesTokenCount:0,estimated=!Number.isSafeInteger(usageMeta.promptTokenCount)||!Number.isSafeInteger(usageMeta.candidatesTokenCount);metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:tokensInput+tokensOutput,unit:'token',rateDivisor:1000000,tokensInput,tokensOutput,estimated,status:hasAudio?'success':'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});if(!hasAudio)return sendError(res,503,'Speech service returned no audio. Check TTS model access and try again.');res.end();}catch(error){metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:estimatedInput.inputTokens,unit:'token',rateDivisor:1000000,tokensInput:estimatedInput.inputTokens,tokensOutput:0,estimated:true,status:'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});if(headersSent)res.destroy(error);else sendError(res,503,'Could not read the speech stream from the server.');}
+  const reader=response.body.getReader(),decoder=new TextDecoder();let pending='',headersSent=false,hasAudio=false,audioBytes=0,voiceUsageRecorded=false,usageMeta={};
+  const recordVoiceUsage=()=>{if(!audioBytes||voiceUsageRecorded)return;voiceUsageRecorded=true;metering.recordUsage({organizationId:req.user.organization_id,eventType:'voice_seconds',provider:'gemini',feature:'speech',quantity:Math.ceil(audioBytes/48000),unit:'second',status:'success',model:GEMINI_TTS_MODEL,idempotencyKey:`voice:${token(16)}`});};
+  const writeEvent=eventText=>{const data=eventText.split(/\r?\n/).filter(line=>line.startsWith('data:')).map(line=>line.slice(5).trim()).join('\n');if(!data||data==='[DONE]')return;let result;try{result=JSON.parse(data);}catch{return;}usageMeta=result.usageMetadata||usageMeta;for(const part of result.candidates?.[0]?.content?.parts||[]){const encoded=part.inlineData?.data;if(!encoded)continue;const audio=Buffer.from(encoded,'base64');if(!audio.length)continue;if(!headersSent){headersSent=true;res.status(200).set({'Content-Type':'audio/L16; rate=24000; channels=1','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.flushHeaders?.();}hasAudio=true;audioBytes+=audio.length;res.write(audio);}};
+  try{while(true){const{done,value}=await reader.read();pending+=decoder.decode(value||new Uint8Array(),{stream:!done});let boundary;while((boundary=pending.search(/\r?\n\r?\n/))>=0){const event=pending.slice(0,boundary);const separator=pending.slice(boundary).match(/^\r?\n\r?\n/)[0];pending=pending.slice(boundary+separator.length);writeEvent(event);}if(done)break;}if(pending.trim())writeEvent(pending);const tokensInput=Number.isSafeInteger(usageMeta.promptTokenCount)?usageMeta.promptTokenCount:estimatedInput.inputTokens,tokensOutput=Number.isSafeInteger(usageMeta.candidatesTokenCount)?usageMeta.candidatesTokenCount:0,estimated=!Number.isSafeInteger(usageMeta.promptTokenCount)||!Number.isSafeInteger(usageMeta.candidatesTokenCount);metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:tokensInput+tokensOutput,unit:'token',rateDivisor:1000000,tokensInput,tokensOutput,estimated,status:hasAudio?'success':'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});recordVoiceUsage();if(!hasAudio)return sendError(res,503,'Speech service returned no audio. Check TTS model access and try again.');res.end();}catch(error){recordVoiceUsage();metering.recordUsage({organizationId:req.user.organization_id,eventType:'ai_call',provider:'gemini',feature:'speech',quantity:estimatedInput.inputTokens,unit:'token',rateDivisor:1000000,tokensInput:estimatedInput.inputTokens,tokensOutput:0,estimated:true,status:'failed',model:GEMINI_TTS_MODEL,latencyMs:Date.now()-started,idempotencyKey:`gemini-tts:${token(16)}`});if(headersSent)res.destroy(error);else sendError(res,503,'Could not read the speech stream from the server.');}
 });
 
 function saveOrganizationSms(organizationId,entries,status='queued'){
@@ -1995,7 +2001,7 @@ app.post('/api/breaks/ai-schedule',csrfAndOrigin,requireUser,async(req,res)=>{
       if(decision.action!=='schedule'||!['break','rain','storm'].includes(decision.alert_type))continue;
       const stamp=String(current.time||new Date().toISOString()).slice(0,16),localClock=new Date(`${stamp}:00Z`),scheduled=new Date(localClock);scheduled.setUTCMinutes(0,0,0);if(scheduled<=new Date(localClock.getTime()+1200000))scheduled.setUTCHours(scheduled.getUTCHours()+1);while(scheduled.getUTCHours()%2)scheduled.setUTCHours(scheduled.getUTCHours()+1);
       pending.push({site,title:BREAK_ALERTS[decision.alert_type],alert_type:decision.alert_type,duration:[10,15,20].includes(Number(decision.duration_minutes))?Number(decision.duration_minutes):15,rationale:String(decision.rationale||'Weather safety break recommended.').replace(/\s+/g,' ').slice(0,300),date:scheduled.toISOString().slice(0,10),time:`${String(scheduled.getUTCHours()).padStart(2,'0')}:${String(scheduled.getUTCMinutes()).padStart(2,'0')}`});
-    }catch(error){console.error(`AI schedule skipped ${site.id}: ${error.name}`);errors.push(error.message);}
+    }catch(error){if(error.code==='PLAN_USAGE_LIMIT')return sendError(res,402,error.message);console.error(`AI schedule skipped ${site.id}: ${error.name}`);errors.push(error.message);}
   }
   if (!pending.length) { if(errors.length)return sendError(res,502,errors[0]); return res.json({created:[],message:'AI found no suitable weather-based break to schedule, or weather/Gemini was unavailable.'}); }
   const created=[],sms=[];let already=0,workerCount=db.prepare('SELECT COUNT(*) AS count FROM workers WHERE organization_id=?').get(req.user.organization_id).count;
@@ -2021,11 +2027,17 @@ app.get('/api/cron/alert-automation',async(req,res)=>{
   if(result?.error)return sendError(res,502,'Alert automation cycle failed.');
   return res.json({ok:true,skipped:Boolean(result?.skipped)});
 });
+app.get('/api/cron/scheduled-break-sms',async(req,res)=>{
+  if(!requireCronSecret(req,res))return;
+  try{await dispatchScheduledBreakSms();return res.json({ok:true});}
+  catch(error){console.error(`Scheduled break SMS cron failed: ${error.name}`);return sendError(res,502,'Scheduled break SMS dispatch failed.');}
+});
 app.get('/api/cron/daily-maintenance',async(req,res)=>{
   if(!requireCronSecret(req,res))return;
   const inbound=await pollEmergencySms();
   const alerts=await runAlertAutomation();
-  const jobs={inboundSms:inbound?.error?'failed':inbound?.skipped?'skipped':'ok',alertAutomation:alerts?.error?'failed':alerts?.skipped?'skipped':'ok'};
+  await dispatchScheduledBreakSms();
+  const jobs={inboundSms:inbound?.error?'failed':inbound?.skipped?'skipped':'ok',alertAutomation:alerts?.error?'failed':alerts?.skipped?'skipped':'ok',scheduledBreakSms:'ok'};
   if(Object.values(jobs).includes('failed'))return res.status(502).json({ok:false,jobs});
   return res.json({ok:true,jobs});
 });

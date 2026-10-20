@@ -36,7 +36,8 @@ export function checkUsageDispatch(db,{organizationId,eventType,quantity,categor
   }
   const limitKey=USAGE_LIMITS[eventType],limit=limitKey?limits[limitKey]:null;
   if(!limit||limit.unlimited)return {allowed:true,unlimited:true};
-  const policy=db.prepare('SELECT policy FROM plan_overage_settings WHERE plan_id=?').get(subscription.plan_id)?.policy||'soft_warn';
+  const configuredPolicy=db.prepare('SELECT policy FROM plan_overage_settings WHERE plan_id=?').get(subscription.plan_id)?.policy||'soft_warn';
+  const policy=subscription.plan_id==='sample-basic'?'block':configuredPolicy;
   const periodStart=subscription.current_period_start,periodEnd=subscription.current_period_end;
   const used=Number(db.prepare("SELECT COALESCE(SUM(quantity),0) AS n FROM usage_events WHERE organization_id=? AND event_type=? AND status IN ('queued','sent','delivered','success') AND created_at>=? AND created_at<?").get(organizationId,eventType,periodStart,periodEnd).n||0);
   const scaledLimit=limitKey==='voice_minutes_month'?limit.value*60:limit.value;

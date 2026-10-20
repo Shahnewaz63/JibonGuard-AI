@@ -185,7 +185,21 @@ export function runMigrations(db, { databasePath, development = true, clock = ()
         const columns = db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name);
         if (!columns.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`);
       }
-      db.exec(migration.sql);
+      if (migration.version === 9) {
+        const hasColumns = (table, required) => {
+          const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name));
+          return required.every(column => columns.has(column));
+        };
+        for (const [table, columns, name, indexColumns] of [
+          ['workers', ['organization_id', 'site_id'], 'workers_org_site_idx', 'organization_id,site_id'],
+          ['automated_alerts', ['organization_id', 'worker_id', 'status', 'created_at'], 'automated_alerts_worker_history_idx', 'organization_id,worker_id,status,created_at DESC'],
+          ['automated_alerts', ['organization_id', 'site_id', 'status', 'scheduled_at'], 'automated_alerts_site_pending_idx', 'organization_id,site_id,status,scheduled_at'],
+          ['sms_messages', ['organization_id', 'direction', 'message_at'], 'sms_messages_org_direction_date_idx', 'organization_id,direction,message_at DESC'],
+        ]) {
+          if (!hasColumns(table, columns)) continue;
+          db.exec(`CREATE INDEX IF NOT EXISTS ${name} ON ${table}(${indexColumns})`);
+        }
+      } else db.exec(migration.sql);
       db.prepare("INSERT OR IGNORE INTO feature_flags(flag_key,env_name,default_enabled,description) VALUES('nowcast','NOWCAST_ENABLED',0,'Short-horizon local weather nowcast'),('break_planner','SMART_BREAK_SCHEDULER_ENABLED',0,'Safety-constrained crew break planning'),('triage','AI_TRIAGE_ENABLED',0,'Optional AI assistance for unclassified symptom SMS'),('reports','AI_SAFETY_REPORTS_ENABLED',0,'Daily and weekly aggregated safety reports')").run();
       db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)').run(migration.version, migration.name, clock());
       db.exec('COMMIT');

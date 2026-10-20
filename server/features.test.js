@@ -13,7 +13,7 @@ test('versioned migration is additive and idempotent', () => {
   db.exec('CREATE TABLE organizations(id TEXT PRIMARY KEY); INSERT INTO organizations(id) VALUES(\'org-legacy\'); CREATE TABLE workers(id TEXT PRIMARY KEY); CREATE TABLE sites(id TEXT PRIMARY KEY); CREATE TABLE official_advisories(id TEXT PRIMARY KEY); INSERT INTO official_advisories(id) VALUES(\'keep-me\');');
   runMigrations(db, { development: false, clock: () => 100 });
   runMigrations(db, { development: false, clock: () => 200 });
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get().n, 6);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get().n, 9);
   assert.equal(db.prepare('PRAGMA table_info(subscriptions)').all().some(row => row.name === 'features_override_json'), true);
   assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='payments_manual_reference_unique_idx'").get()?.name, 'payments_manual_reference_unique_idx');
   assert.equal(db.prepare('SELECT plan_id FROM subscriptions WHERE organization_id=?').get('org-legacy').plan_id, 'legacy-default');
@@ -85,4 +85,14 @@ test('shared Gemini client times out/falls back and logs only feature metadata',
   assert.equal(meterEvents[0].tokensOutput,3);
   assert.equal(meterEvents[0].estimated,false);
   assert.equal(meterEvents[0].eventType,'ai_call');
+});
+
+test('Gemini client applies an injected usage guard before requesting the model', async () => {
+  let modelCalls=0,guardInput;
+  const call=createGeminiClient({apiKey:'secret',usageGuard:input=>{guardInput=input;return {allowed:false};},fetchImpl:async()=>{modelCalls++;throw new Error('should not call model');}});
+  const result=await call({feature:'alert_decision',promptVersion:'v1',system:'Return JSON',payload:{safe:true},validate:()=>true,organizationId:'org-1',maxOutputTokens:12});
+  assert.equal(result.error,'plan_limit');
+  assert.equal(modelCalls,0);
+  assert.equal(guardInput.organizationId,'org-1');
+  assert.equal(guardInput.eventType,'ai_call');
 });

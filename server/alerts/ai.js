@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateAiOutput } from './decision.js';
 import { createGeminiClient } from '../ai/geminiClient.js';
+import { checkUsageDispatch } from '../billing/entitlements.js';
 
 const promptPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'ALERT_DECISION_PROMPT.md');
 let promptCache;
@@ -17,7 +18,7 @@ export async function callAlertAi(contexts, config, fetchImpl = fetch) {
     state: context.state, site: context.site, weather: context.weather,
     limits: context.limits,
   }));
-  const client = createGeminiClient({ apiKey: config.apiKey, model: config.model, db: config.db, meterUsage: config.meterUsage, fetchImpl, timeoutMs: config.timeoutMs, retries: config.retryCount });
+  const client = createGeminiClient({ apiKey: config.apiKey, model: config.model, db: config.db, meterUsage: config.meterUsage, usageGuard: config.db ? input => checkUsageDispatch(config.db, input) : null, fetchImpl, timeoutMs: config.timeoutMs, retries: config.retryCount });
   const response = await client({ feature: 'alert_decision', promptVersion: 'alert-decision-v2', system, payload: contents, organizationId: config.organizationId, maxOutputTokens: 8192, validate: parsed => {
     try { validateAiOutput(parsed, anonymousIds); return true; } catch { return false; }
   } });

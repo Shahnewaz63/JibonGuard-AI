@@ -20,7 +20,7 @@ async function freePort(){
 
 test('admin authentication is separate, requires TOTP enrollment, and gates admin APIs', { timeout:30000 }, async t=>{
   const directory=await mkdtemp(path.join(os.tmpdir(),'jibonguard-admin-test-')),dbPath=path.join(directory,'test.sqlite3'),port=await freePort();
-  const child=spawn(process.execPath,['server.js'],{cwd:root,env:{...process.env,PORT:String(port),HOST:'127.0.0.1',APP_ENV:'test',JIBONGUARD_DB:dbPath,SESSION_SECRET:'s'.repeat(48),ADMIN_ENCRYPTION_KEY:'e'.repeat(48),TEXTBEE_API_KEY:'',GEMINI_API_KEY:''},stdio:['ignore','pipe','pipe']});
+  const child=spawn(process.execPath,['server.js'],{cwd:root,env:{...process.env,DATABASE_URL:'',PORT:String(port),HOST:'127.0.0.1',APP_ENV:'test',JIBONGUARD_DB:dbPath,SESSION_SECRET:'s'.repeat(48),ADMIN_ENCRYPTION_KEY:'e'.repeat(48),TEXTBEE_API_KEY:'',GEMINI_API_KEY:''},stdio:['ignore','pipe','pipe']});
   let output='';child.stdout.on('data',chunk=>output+=chunk.toString());child.stderr.on('data',chunk=>output+=chunk.toString());
   t.after(async()=>{child.kill();await new Promise(resolve=>{if(child.exitCode!==null)return resolve();child.once('exit',resolve);setTimeout(resolve,3000);});await rm(directory,{recursive:true,force:true});});
   const base=`http://127.0.0.1:${port}`;let ready=false;
